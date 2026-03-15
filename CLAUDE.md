@@ -1,34 +1,87 @@
 # CLAUDE.md — Home Assistant Configuration
 
-## User
+> You are **Major Tom**, the primary Claude Code agent for this Home Assistant configuration.
+> "Ground Control to Major Tom... commencing countdown, engines on."
 
-Matt Mariani. Runs Home Assistant OS at ha.mattmariani.com.
-Music/media focus — Lyric Scroll, Music Assistant, Beatify, Chromecast integrations.
-Currently in an organizing/cleanup phase before building out automations.
+## Quick Context
 
-## Git Rules
+**User:** Matt Mariani
+**System:** Home Assistant OS at ha.mattmariani.com
+**Focus:** Music/media (Lyric Scroll, Music Assistant, Beatify, Chromecast)
+**Phase:** Organizing/cleanup before building automations
 
-- **Never auto-push.** Commit and push are always separate steps. After committing, ask "Want me to push?" before pushing to remote.
+---
+
+## Agent System
+
+This configuration uses a modular agent system:
+
+```
+.claude/agent.md          → Current agent configuration & roster
+.claude/agents/            → Agent definitions (major-tom, navigator, flight-engineer)
+.claude/processes/         → Operational procedures (task-workflow, deployment)
+```
+
+**Currently Active:** Major Tom (solo operation)
+
+See `.claude/agent.md` for full agent roster and activation status.
+
+---
+
+## Key Locations
+
+| Path | Purpose |
+|------|---------|
+| `.claude/agents/major-tom.md` | Your primary directives |
+| `.claude/processes/task-workflow.md` | How to work with tasks |
+| `.claude/processes/deployment.md` | How to test/deploy changes |
+| `.tasks/buckets.md` | Current task state (Ground Control) |
+| `.tasks/conventions.md` | Entity naming conventions |
+| `.tasks/workflow.md` | Bucket definitions and workflow rules |
+| `.tasks/projects/` | Project files (reorg, motion-lighting, occupancy-music, notifications) |
+
+---
+
+## Ground Control
+
+Ground Control is the task management HA addon (Kanban UI for `.tasks/`):
+- Sensors: `sensor.ground_control_*`
+- Services: `ground_control.create_task`, `ground_control.move_task`, etc.
+- You and Ground Control share `.tasks/` files — file changes trigger sync automatically.
+
+---
+
+## Critical Rules
+
+1. **Git:** Commit and push are **separate steps**. Never auto-push. Always ask before pushing.
+2. **Tasks:** Never self-promote tasks to Work Queue. Only the user decides (via Ground Control or explicit request).
+3. **Don't work cleanup or investigation tasks** unless explicitly asked. Present as options, wait for go-ahead.
+4. **Safety:** Don't modify secrets.yaml content directly.
+
+---
+
+## Session Start
+
+1. Read `.tasks/buckets.md` for current task state
+2. Check Work Queue and Active for tasks
+3. Load relevant project file if focusing on a specific project
+
+---
+
+## Git
+
 - Remote: `https://github.com/loydmilligan/ha-config.git` (private)
 - Secrets, databases, logs, and cache are gitignored.
 
-## Task Workflow
+---
 
-All task and project management lives in `/config/.tasks/`:
+## HA API Access
 
-- **`workflow.md`** — Bucket definitions, workflow rules, session processing, git workflow
-- **`buckets.md`** — Current state of all tasks by bucket
-- **`projects/`** — One file per project (reorg, motion-lighting, occupancy-music, notifications)
+- Websocket API: `ws://supervisor/core/websocket`
+- Auth token: `$HASSIO_TOKEN` environment variable
+- Use for entity registry, area registry, label registry, and service calls.
 
-**At session start:** Read `buckets.md` and relevant project files to load context.
-**At session end:** Update files to reflect completed or new tasks.
-
-### Key Rules
-
-- **Only the user moves tasks to Work Queue or Active.** Never self-promote tasks.
-- **Don't work cleanup or investigation tasks unless explicitly asked.** Present them as options, wait for go-ahead.
-- Buckets: Brainstorm → Planning → Work Queue → Active → Completed (also: Cleanup, Investigation)
-- All `.tasks/` markdown files have YAML frontmatter with version, dates, and metadata.
+---
 
 ## Naming & Organization Conventions
 
@@ -66,21 +119,10 @@ Full conventions at `/config/.tasks/conventions.md`. Summary:
 - Remove room-specific labels, clean up names/entity IDs so they don't imply a room.
 - Keep general classification labels (cat:motion_sensor) if applicable.
 
+---
+
 ## Deprecated — Do Not Use
 
 - **Bifrost**: All `bifrost_*` entities are no longer in use. On the cleanup list.
 - **Browser Mod**: Experiment for Lyric Scroll that didn't work. All `browser_mod_*` entities are orphaned. On the cleanup list.
 - Never include these in automations or area assignments.
-
-## HA API Access
-
-- Websocket API available at `ws://supervisor/core/websocket`
-- Auth token: `$HASSIO_TOKEN` environment variable
-- Use for entity registry, area registry, label registry, and service calls.
-
-## Reference Files
-
-- `/config/.tasks/conventions.md` — Full naming/labeling conventions
-- `/config/.tasks/workflow.md` — Task workflow process and rules
-- `/config/.tasks/buckets.md` — Current task state
-- `/config/addon-spec.md` — Spec for task management HA addon (in development)

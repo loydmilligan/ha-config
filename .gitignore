@@ -4,8 +4,11 @@ secrets.yaml
 # Cache
 .cache/
 
-# Claude Code
-.claude/
+# Claude Code (ignore local state, allow agent configs)
+.claude/*
+!.claude/agent.md
+!.claude/agents/
+!.claude/processes/
 
 # Lock files
 *.lock
