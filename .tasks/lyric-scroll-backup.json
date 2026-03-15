@@ -1,0 +1,26 @@
+{
+  "addon_slug": "0e93ca0c_lyric_scroll",
+  "addon_name": "Lyric Scroll",
+  "version": "0.5.16",
+  "repository": "0e93ca0c",
+  "original_repo_url": "https://github.com/loydmilligan/lyric-scroll",
+  "options": {
+    "media_players": [],
+    "sync_offset_ms": 600,
+    "display_mode": "scroll",
+    "theme": "oled",
+    "font_size": "large",
+    "cast_app_id": "76719249",
+    "lrc_export_enabled": true
+  },
+  "config": {
+    "boot": "auto",
+    "auto_update": true,
+    "ingress": true,
+    "ingress_port": 8099,
+    "ingress_entry": "/api/hassio_ingress/W3Gkhiynr_DalYc4ITtzE9e5BRVJEiIlC4fdqkmJDd4",
+    "network": {"8099/tcp": 8099},
+    "watchdog": false
+  },
+  "notes": "Backed up before repo rename from lyric-scroll to ha-addons. Addon data directory is inside the addon container and not accessible from the Claude terminal addon. If there is cached LRC data or settings.json inside the addon, it would need to be backed up from within the addon itself or via an HA backup."
+}
