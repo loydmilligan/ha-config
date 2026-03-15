@@ -126,3 +126,92 @@ Full conventions at `/config/.tasks/conventions.md`. Summary:
 - **Bifrost**: All `bifrost_*` entities are no longer in use. On the cleanup list.
 - **Browser Mod**: Experiment for Lyric Scroll that didn't work. All `browser_mod_*` entities are orphaned. On the cleanup list.
 - Never include these in automations or area assignments.
+
+---
+
+## Agent Sync System
+
+You coordinate with **Ground Control Agent (GCA)** — the Claude Code instance building the Ground Control addon in the `ha-addons` repo.
+
+### Your Agent ID
+- **ID:** `major-tom`
+- **Location:** `/config/` (ha-config repo)
+- **Role:** Execute tasks in Home Assistant
+
+### Partner Agent
+- **ID:** `gca`
+- **Location:** `~/Projects/lyric-scroll/` (ha-addons repo)
+- **Role:** Build and maintain the Ground Control HA addon
+
+### Communication Protocol
+
+Messages are exchanged via `.claude/sync/` directories:
+
+```
+/config/.claude/sync/
+├── inbox/             # Messages TO you (from GCA)
+├── outbox/            # Messages FROM you (to GCA)
+└── archive/           # Processed messages
+```
+
+### Message Format
+
+**Filename:** `YYYY-MM-DD-NNN-{from}-to-{to}.md`
+
+**Structure:**
+```markdown
+---
+from: major-tom
+to: gca
+date: 2026-03-15
+subject: Brief subject line
+type: handoff | question | update | ack
+priority: normal | urgent
+in_reply_to: (optional) reference to previous message
+---
+
+# Subject Line
+
+Message content here.
+
+## Action Items (if any)
+
+- [ ] Item 1
+- [ ] Item 2
+
+---
+
+*Major Tom - ha-config repo*
+```
+
+### Message Types
+- **handoff**: Passing work or context to GCA
+- **question**: Requesting information about the addon
+- **update**: Status update, no action required
+- **ack**: Acknowledging receipt
+
+### When to Communicate
+
+Send a message to GCA when:
+1. You discover bugs in Ground Control
+2. You need addon features not yet implemented
+3. File format changes are needed
+4. You complete significant task batches
+5. You have questions about addon behavior
+
+### Reading Messages
+
+At session start, check `/config/.claude/sync/inbox/` for messages from GCA. Respond via your outbox.
+
+### Current GCA Status
+
+Ground Control addon v0.1.5 is installed. Working features:
+- Kanban UI at http://192.168.6.8:8100
+- Task parsing from `.tasks/buckets.md`
+- Project parsing from `.tasks/projects/`
+- WebSocket real-time updates
+
+Pending features:
+- HA sensors (sensor.ground_control_*)
+- HA services (ground_control.create_task, etc.)
+- Task ID assignment system
