@@ -28,9 +28,9 @@
         data: {}
         target:
           entity_id:
-          - light.gallery_light_1
-          - light.gallery_light_2
-          - light.gallery_light_3
+          - light.family_room_gallery_e_s
+          - light.family_room_gallery_e_n
+          - light.family_room_gallery_n
     - conditions:
       - condition: trigger
         id:
@@ -41,8 +41,8 @@
         data: {}
         target:
           entity_id:
-          - light.fireplace_light_1
-          - light.fireplace_light_2
+          - light.family_room_fireplace_e
+          - light.family_room_fireplace_w
   mode: single
 - id: '1763440155306'
   alias: Office Lights
@@ -98,10 +98,10 @@
         data: {}
         target:
           entity_id:
-          - light.office_light_2
-          - light.office_light_3
-          - light.office_light_4
-          - light.office_light_1
+          - light.office_ceiling_ne
+          - light.office_ceiling_sw
+          - light.office_ceiling_nw
+          - light.office_ceiling_se
     - conditions:
       - condition: trigger
         id:
@@ -123,10 +123,10 @@
           brightness_step_pct: -8
         target:
           entity_id:
-          - light.office_light_2
-          - light.office_light_1
-          - light.office_light_4
-          - light.office_light_3
+          - light.office_ceiling_ne
+          - light.office_ceiling_se
+          - light.office_ceiling_nw
+          - light.office_ceiling_sw
     - conditions:
       - condition: trigger
         id:
@@ -138,10 +138,10 @@
           brightness_step_pct: 8
         target:
           entity_id:
-          - light.office_light_2
-          - light.office_light_1
-          - light.office_light_4
-          - light.office_light_3
+          - light.office_ceiling_ne
+          - light.office_ceiling_se
+          - light.office_ceiling_nw
+          - light.office_ceiling_sw
     - conditions:
       - condition: trigger
         id:
@@ -153,10 +153,10 @@
           transition: 4
         target:
           entity_id:
-          - light.office_light_2
-          - light.office_light_1
-          - light.office_light_4
-          - light.office_light_3
+          - light.office_ceiling_ne
+          - light.office_ceiling_se
+          - light.office_ceiling_nw
+          - light.office_ceiling_sw
   mode: single
 - id: '1763521696392'
   alias: Bedroom Headboard Lights
@@ -193,7 +193,7 @@
           transition: 3
           brightness_pct: 39
         target:
-          entity_id: light.headboard_light
+          entity_id: light.bedroom_headboard
     - conditions:
       - condition: trigger
         id:
@@ -204,7 +204,7 @@
         data:
           transition: 3
         target:
-          entity_id: light.headboard_light
+          entity_id: light.bedroom_headboard
   mode: single
 - id: '1765285365878'
   alias: Closet lights
@@ -366,7 +366,7 @@
       - action: light.toggle
         metadata: {}
         target:
-          entity_id: light.hall_light
+          entity_id: light.hallway_ceiling
         data: {}
     - conditions:
       - condition: trigger
@@ -376,7 +376,7 @@
       - action: light.turn_on
         metadata: {}
         target:
-          entity_id: light.hall_light
+          entity_id: light.hallway_ceiling
         data:
           transition: 2
     - conditions:
@@ -387,7 +387,7 @@
       - action: light.turn_off
         metadata: {}
         target:
-          entity_id: light.hall_light
+          entity_id: light.hallway_ceiling
         data:
           transition: 7
     - conditions:
@@ -410,10 +410,10 @@
         metadata: {}
         target:
           entity_id:
-          - light.office_light_1
-          - light.office_light_2
-          - light.office_light_3
-          - light.office_light_4
+          - light.office_ceiling_se
+          - light.office_ceiling_ne
+          - light.office_ceiling_sw
+          - light.office_ceiling_nw
         data: {}
     - conditions:
       - condition: trigger
@@ -425,7 +425,7 @@
         data: {}
         target:
           entity_id:
-          - light.bathroom_ceiling_light
+          - light.bathroom_ceiling
           - light.bathroom_switchbot
     - conditions:
       - condition: trigger
@@ -436,7 +436,7 @@
         metadata: {}
         data: {}
         target:
-          entity_id: light.family_lights
+          entity_id: light.family_room_ceiling
   mode: single
 - id: '1770232671725'
   alias: Play Local Music
