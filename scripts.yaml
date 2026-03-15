@@ -1,0 +1,65 @@
+get_now_playing_track_name:
+  mode: queued
+  alias: Get Now Playing Track Name
+  sequence:
+  - action: music_assistant.get_queue
+    data:
+      entity_id: media_player.old_chromecast_2
+    response_variable: queue_info
+  - data:
+      entity_id: input_text.now_playing
+      value: '{{ queue_info[''media_player.old_chromecast_2''].current_item.name }}'
+    action: input_text.set_value
+  description: ''
+get_next_up_tracks:
+  mode: queued
+  alias: Get Next Up Tracks
+  sequence:
+  - action: music_assistant.get_queue
+    data:
+      entity_id: media_player.old_chromecast_2
+    response_variable: queue_info
+  - variables:
+      q: '{{ queue_info[''media_player.old_chromecast_2''] }}'
+      next_item: '{{ q.next_item if q.next_item is defined else None }}'
+      next_text: "{% if next_item %}\n  {{ next_item.media_item.name }}\n  {% if next_item.media_item.artists
+        is defined\n        and next_item.media_item.artists|length > 0 %}\n    -
+        {{ next_item.media_item.artists[0].name }}\n  {% endif %}\n{% else %}\n  No
+        upcoming items in queue.\n{% endif %}\n"
+  - data:
+      entity_id: input_text.next_up
+      value: '{{ next_text | trim }}'
+    action: input_text.set_value
+cast_lyrics_dashboard:
+  alias: Cast Lyrics Dashboard
+  description: Mutes Chromecast, casts the lyrics dashboard, then unmutes
+  sequence:
+  - action: media_player.volume_mute
+    data:
+      is_volume_muted: true
+      entity_id: media_player.chromecast_device
+  - action: media_player.turn_on
+    data: {}
+    target:
+      device_id: fff6ca4338ea53153995aa1ceff94bbe
+  - delay: 00:00:02
+  - action: cast.show_lovelace_view
+    data:
+      entity_id: media_player.old_chromecast
+      dashboard_path: dashboard-lyrics
+      view_path: music
+  - delay: 00:00:10
+  - action: media_player.volume_mute
+    data:
+      is_volume_muted: false
+    target:
+      device_id: fff6ca4338ea53153995aa1ceff94bbe
+  
+
+play_to_lyric_scroll:
+      alias: "Play to Lyric Scroll"
+      sequence:
+        - service: rest_command.lyric_scroll_play
+          data:
+            track: "{{ track }}"
+            player: "media_player.old_chromecast"

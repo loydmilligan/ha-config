@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "games": [],
+  "playlists": {},
+  "all_time": {
+    "games_played": 0,
+    "highest_avg_score": 0.0,
+    "highest_avg_game_id": null
+  },
+  "songs": {
+    "spotify_track_33iv3wnGMrrDugd7GBso1z": {
+      "times_played": 1,
+      "correct_guesses": 1,
+      "total_guesses": 2,
+      "total_years_off": 4,
+      "exact_matches": 1,
+      "close_matches": 0,
+      "title": "My Own Worst Enemy",
+      "artist": "Lit",
+      "year": 1999,
+      "playlists": {
+        "/Config/Beatify/Playlists/Pure Pop Punk": 1
+      },
+      "last_played": 1770436814
+    },
+    "spotify_track_5EuWYcCiqOaf9jkWBauDFN": {
+      "times_played": 1,
+      "correct_guesses": 1,
+      "total_guesses": 1,
+      "total_years_off": 1,
+      "exact_matches": 0,
+      "close_matches": 1,
+      "title": "Want You Bad",
+      "artist": "The Offspring",
+      "year": 2000,
+      "playlists": {
+        "/Config/Beatify/Playlists/Pure Pop Punk": 1
+      },
+      "last_played": 1770436936
+    }
+  }
+}

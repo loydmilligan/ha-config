@@ -1,0 +1,76 @@
+
+# Loads default set of integrations. Do not remove.
+default_config:
+
+# Load frontend themes from the themes folder
+frontend:
+  themes: !include_dir_merge_named themes
+
+automation: !include automations.yaml
+script: !include scripts.yaml
+scene: !include scenes.yaml
+http:
+  use_x_forwarded_for: true
+  trusted_proxies:
+    - 127.0.0.1
+    - ::1
+    - 172.30.32.0/23
+    - 192.168.4.0/22
+    - 172.30.232.0/23
+#amcrest:
+#  - host: 192.168.4.196
+#    stream_source: rtsp
+#    username: admin
+#    password: !secret amcrest_password
+#    port: 8554
+homeassistant:
+  external_url: https://ha.mattmariani.com
+  internal_url: http://192.168.6.8:8123
+#  auth_providers:
+#    - type: trusted_networks
+#      trusted_networks:
+#        - 192.168.5.187/32   # Living Room Display
+#        - 192.168.4.105/32   # Kitchen Hub
+#      trusted_users:
+#        192.168.5.187: 037e6c277ce1476b9b15bebab084cfd1
+#        192.168.4.105: 037e6c277ce1476b9b15bebab084cfd1
+#      allow_bypass_login: true
+#    - type: homeassistant    # Keep normal login for other devices
+
+rest_command:
+    lyric_scroll_play:
+      url: "http://lyric-scroll.mattmariani.com/api/ma/play"
+      method: POST
+      content_type: "application/json"
+      payload: '{"track": "{{ track }}", "player": "{{ player }}"}'
+
+media_player:
+    - platform: universal
+      name: Lyric Scroll Old Chromecast
+      unique_id: lyric_scroll_old_chromecast
+      commands:
+        play_media:
+          service: mqtt.publish
+          data:
+            topic: "lyric_scroll/old_chromecast/command"
+            payload: '{"command": "play_media", "media_content_id": "{{ media_content_id }}",
+  "media_content_type": "{{ media_content_type }}"}'
+        media_play:
+          service: mqtt.publish
+          data:
+            topic: "lyric_scroll/old_chromecast/command"
+            payload: '{"command": "play"}'
+        media_pause:
+          service: mqtt.publish
+          data:
+            topic: "lyric_scroll/old_chromecast/command"
+            payload: '{"command": "pause"}'
+        media_stop:
+          service: mqtt.publish
+          data:
+            topic: "lyric_scroll/old_chromecast/command"
+            payload: '{"command": "stop"}'
+      attributes:
+        state: sensor.lyric_scroll_old_chromecast_state
+        media_title: sensor.lyric_scroll_old_chromecast_title
+        media_artist: sensor.lyric_scroll_old_chromecast_artist

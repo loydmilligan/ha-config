@@ -1,0 +1,42 @@
+# Secrets
+secrets.yaml
+
+# Cache
+.cache/
+
+# Claude Code
+.claude/
+
+# Lock files
+*.lock
+.ha_run.lock
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+*.log
+*.log.*
+
+# Storage
+.storage/
+.cloud/
+
+# Dependencies
+deps/
+
+# TTS cache
+tts/
+
+# ESPHome build artifacts
+esphome/.esphome/
+
+# HACS
+custom_components/hacs/
+
+# OS/editor files
+.HA_VERSION
+__pycache__/
+*.pyc

@@ -1,0 +1,629 @@
+- id: '1763439103953'
+  alias: Family Room Lights
+  description: Left switch toggles Gallery and right switch toggles fireplace
+  triggers:
+  - domain: mqtt
+    device_id: e7bb18844ab765c105dc30a13d1033b4
+    type: action
+    subtype: left_press
+    metadata: {}
+    trigger: device
+    id: Left
+  - domain: mqtt
+    device_id: e7bb18844ab765c105dc30a13d1033b4
+    type: action
+    subtype: right_press
+    trigger: device
+    id: right
+  conditions: []
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id:
+        - Left
+      sequence:
+      - action: light.toggle
+        metadata: {}
+        data: {}
+        target:
+          entity_id:
+          - light.gallery_light_1
+          - light.gallery_light_2
+          - light.gallery_light_3
+    - conditions:
+      - condition: trigger
+        id:
+        - right
+      sequence:
+      - action: light.toggle
+        metadata: {}
+        data: {}
+        target:
+          entity_id:
+          - light.fireplace_light_1
+          - light.fireplace_light_2
+  mode: single
+- id: '1763440155306'
+  alias: Office Lights
+  description: 'on : on
+
+    off : off
+
+    up : +8%
+
+    down : -8%'
+  triggers:
+  - domain: mqtt
+    device_id: 38afe12bf7761bc469e5ccb38e8c6fb0
+    type: action
+    subtype: on_press
+    metadata: {}
+    trigger: device
+    id: 'on'
+  - domain: mqtt
+    device_id: 38afe12bf7761bc469e5ccb38e8c6fb0
+    type: action
+    subtype: on_hold
+    trigger: device
+    id: on_hold
+  - domain: mqtt
+    device_id: 38afe12bf7761bc469e5ccb38e8c6fb0
+    type: action
+    subtype: off_press
+    trigger: device
+    id: 'off'
+  - domain: mqtt
+    device_id: 38afe12bf7761bc469e5ccb38e8c6fb0
+    type: action
+    subtype: up_press
+    trigger: device
+    id: up
+  - domain: mqtt
+    device_id: 38afe12bf7761bc469e5ccb38e8c6fb0
+    type: action
+    subtype: down_press
+    trigger: device
+    id: down
+  conditions: []
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id:
+        - 'on'
+      sequence:
+      - action: light.turn_on
+        metadata: {}
+        data: {}
+        target:
+          entity_id:
+          - light.office_light_2
+          - light.office_light_3
+          - light.office_light_4
+          - light.office_light_1
+    - conditions:
+      - condition: trigger
+        id:
+        - on_hold
+      sequence:
+      - action: light.toggle
+        metadata: {}
+        data: {}
+        target:
+          entity_id: light.kitchen_downlights
+    - conditions:
+      - condition: trigger
+        id:
+        - down
+      sequence:
+      - action: light.turn_on
+        metadata: {}
+        data:
+          brightness_step_pct: -8
+        target:
+          entity_id:
+          - light.office_light_2
+          - light.office_light_1
+          - light.office_light_4
+          - light.office_light_3
+    - conditions:
+      - condition: trigger
+        id:
+        - up
+      sequence:
+      - action: light.turn_on
+        metadata: {}
+        data:
+          brightness_step_pct: 8
+        target:
+          entity_id:
+          - light.office_light_2
+          - light.office_light_1
+          - light.office_light_4
+          - light.office_light_3
+    - conditions:
+      - condition: trigger
+        id:
+        - 'off'
+      sequence:
+      - action: light.turn_off
+        metadata: {}
+        data:
+          transition: 4
+        target:
+          entity_id:
+          - light.office_light_2
+          - light.office_light_1
+          - light.office_light_4
+          - light.office_light_3
+  mode: single
+- id: '1763521696392'
+  alias: Bedroom Headboard Lights
+  description: ''
+  triggers:
+  - domain: mqtt
+    device_id: df62391347873a487414acb07247c442
+    type: action
+    subtype: single
+    metadata: {}
+    trigger: device
+    id: single
+  - domain: mqtt
+    device_id: df62391347873a487414acb07247c442
+    type: action
+    subtype: double
+    trigger: device
+    id: double
+  conditions: []
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id:
+        - double
+      sequence:
+      - action: light.turn_on
+        metadata: {}
+        data:
+          rgb_color:
+          - 255
+          - 82
+          - 241
+          transition: 3
+          brightness_pct: 39
+        target:
+          entity_id: light.headboard_light
+    - conditions:
+      - condition: trigger
+        id:
+        - single
+      sequence:
+      - action: light.turn_off
+        metadata: {}
+        data:
+          transition: 3
+        target:
+          entity_id: light.headboard_light
+  mode: single
+- id: '1765285365878'
+  alias: Closet lights
+  description: ''
+  triggers:
+  - type: opened
+    device_id: d2ea7345dcb65983a35b708d81fca215
+    entity_id: 9ee575d5c6e094e1b0dee7774e4fde6d
+    domain: binary_sensor
+    metadata:
+      secondary: false
+    trigger: device
+    id: open
+  - type: not_opened
+    device_id: d2ea7345dcb65983a35b708d81fca215
+    entity_id: 9ee575d5c6e094e1b0dee7774e4fde6d
+    domain: binary_sensor
+    trigger: device
+    id: closed
+  conditions: []
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id:
+        - open
+      sequence:
+      - action: light.turn_on
+        metadata: {}
+        target:
+          entity_id: light.luggage_room_light
+        data:
+          brightness_pct: 68
+    - conditions:
+      - condition: trigger
+        id:
+        - closed
+      sequence:
+      - action: light.turn_off
+        metadata: {}
+        target:
+          entity_id: light.luggage_room_light
+        data:
+          transition: 5
+  mode: single
+- id: '1766097325575'
+  alias: Aqara_Gray_Button
+  description: Single - kasablanca fan toggle
+  triggers:
+  - domain: mqtt
+    device_id: 24286ef82d2444b54df694b8f9f03f0b
+    type: action
+    subtype: release
+    trigger: device
+    id: release_hold
+  - domain: mqtt
+    device_id: 24286ef82d2444b54df694b8f9f03f0b
+    type: action
+    subtype: hold
+    trigger: device
+    id: hold
+  - domain: mqtt
+    device_id: 24286ef82d2444b54df694b8f9f03f0b
+    type: action
+    subtype: double
+    trigger: device
+    id: double
+  - domain: mqtt
+    device_id: 24286ef82d2444b54df694b8f9f03f0b
+    type: action
+    subtype: single
+    metadata: {}
+    trigger: device
+    id: single
+  conditions: []
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id:
+        - double
+      sequence:
+      - action: fan.toggle
+        metadata: {}
+        target:
+          entity_id: fan.air_purifier_f28a
+        data: {}
+    - conditions:
+      - condition: trigger
+        id:
+        - single
+      sequence:
+      - action: light.toggle
+        metadata: {}
+        target:
+          entity_id: light.kitchen_downlights
+        data: {}
+  mode: single
+- id: '1770171751479'
+  alias: Hue tap dial controls
+  description: ''
+  triggers:
+  - type: motion
+    device_id: b2f777fc0f774dc185f23e56a4873ac6
+    entity_id: 40c1395cbd398ca90128f0ccc2d4978b
+    domain: binary_sensor
+    metadata:
+      secondary: false
+    trigger: device
+    id: hall_motion_detected
+  - type: no_motion
+    device_id: b2f777fc0f774dc185f23e56a4873ac6
+    entity_id: 40c1395cbd398ca90128f0ccc2d4978b
+    domain: binary_sensor
+    trigger: device
+    id: hall_motion_cleared
+    for:
+      hours: 0
+      minutes: 0
+      seconds: 15
+  - domain: mqtt
+    device_id: 8531efeed28e09ad07ff53f5b4f8b195
+    type: action
+    subtype: button_1_press
+    trigger: device
+    id: press_1
+  - domain: mqtt
+    device_id: 8531efeed28e09ad07ff53f5b4f8b195
+    type: action
+    subtype: button_2_press
+    trigger: device
+    id: press_2
+  - domain: mqtt
+    device_id: 8531efeed28e09ad07ff53f5b4f8b195
+    type: action
+    subtype: button_3_press
+    trigger: device
+    id: press_3
+  - domain: mqtt
+    device_id: 8531efeed28e09ad07ff53f5b4f8b195
+    type: action
+    subtype: button_4_press
+    trigger: device
+    id: press_4
+  - domain: mqtt
+    device_id: 544d1022ec14d15b3d84ffee8b173845
+    type: action
+    subtype: single
+    trigger: device
+    id: kitch_button_single
+  conditions: []
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id:
+        - press_1
+      sequence:
+      - action: light.toggle
+        metadata: {}
+        target:
+          entity_id: light.hall_light
+        data: {}
+    - conditions:
+      - condition: trigger
+        id:
+        - hall_motion_detected
+      sequence:
+      - action: light.turn_on
+        metadata: {}
+        target:
+          entity_id: light.hall_light
+        data:
+          transition: 2
+    - conditions:
+      - condition: trigger
+        id:
+        - hall_motion_cleared
+      sequence:
+      - action: light.turn_off
+        metadata: {}
+        target:
+          entity_id: light.hall_light
+        data:
+          transition: 7
+    - conditions:
+      - condition: trigger
+        id:
+        - kitch_button_single
+      sequence:
+      - action: light.toggle
+        metadata: {}
+        target:
+          entity_id:
+          - light.kitchen_downlights
+        data: {}
+    - conditions:
+      - condition: trigger
+        id:
+        - press_3
+      sequence:
+      - action: light.toggle
+        metadata: {}
+        target:
+          entity_id:
+          - light.office_light_1
+          - light.office_light_2
+          - light.office_light_3
+          - light.office_light_4
+        data: {}
+    - conditions:
+      - condition: trigger
+        id:
+        - press_2
+      sequence:
+      - action: light.toggle
+        metadata: {}
+        data: {}
+        target:
+          entity_id:
+          - light.bathroom_ceiling_light
+          - light.bathroom_switchbot
+    - conditions:
+      - condition: trigger
+        id:
+        - press_4
+      sequence:
+      - action: light.toggle
+        metadata: {}
+        data: {}
+        target:
+          entity_id: light.family_lights
+  mode: single
+- id: '1770232671725'
+  alias: Play Local Music
+  description: Plays music from local library through Music Assistant
+  triggers:
+  - event_type: call_play_local_music
+    trigger: event
+  actions:
+  - target:
+      entity_id: media_player.office
+    data:
+      media_id: Your Music Title
+      enqueue: replace
+      media_type: track
+    action: mass.play_media
+- id: '1770232705130'
+  alias: Play Specific Track
+  description: Plays specific track from local library
+  triggers:
+  - event_type: call_play_specific_track
+    trigger: event
+  actions:
+  - target:
+      entity_id: media_player.old_chromecast_2
+    data:
+      media_type: track
+      media_id: '{{ states(''input_text.song_name'') }}'
+      artist: '{{ states(''input_text.artist_name'') }}'
+    action: music_assistant.play_media
+- id: '1770232773499'
+  alias: Queue Multiple Tracks
+  description: Adds multiple tracks to queue
+  triggers:
+  - trigger: event
+    event_type: call_queue_tracks
+  actions:
+  - variables:
+      tracks: '{{ states(''input_text.song_name'').split('','') }}'
+  - repeat:
+      for_each: '{{ tracks }}'
+      sequence:
+      - action: music_assistant.play_media
+        target:
+          entity_id: media_player.old_chromecast_2
+        data:
+          media_id: '{{ repeat.item | trim }}'
+          enqueue: add
+          media_type: track
+- id: '1770232792127'
+  alias: Play From Filesystem
+  description: Plays music from specific filesystem location
+  triggers:
+  - event_type: call_play_filesystem
+    trigger: event
+  actions:
+  - target:
+      entity_id: media_player.office
+    data:
+      media_id: filesystem_smb://folder/YourMusicFolder
+      media_type: folder
+      enqueue: replace
+    action: mass.play_media
+- id: '1772013296271'
+  alias: Bedtime
+  description: ''
+  triggers:
+  - trigger: state
+    entity_id:
+    - binary_sensor.sleepy_time
+    id: sleepy
+    to:
+    - 'on'
+  conditions: []
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id:
+        - sleepy
+      sequence:
+      - action: input_boolean.turn_on
+        metadata: {}
+        target:
+          entity_id: input_boolean.bedtime
+        data: {}
+  mode: single
+- id: '1773191560137'
+  alias: Cast Lyrics to TV
+  description: Cast the lyrics dashboard when toggle is turned on
+  triggers:
+  - entity_id: input_boolean.cast_lyrics
+    to: 'on'
+    trigger: state
+  - trigger: state
+    entity_id:
+    - input_button.lyrics_cast_btn
+    to:
+  actions:
+  - action: cast.show_lovelace_view
+    data:
+      entity_id: media_player.old_chromecast
+      view_path: music
+  mode: single
+- id: '1773341161259'
+  alias: Sleep Schedule to bedtime boolean
+  description: ''
+  triggers:
+  - trigger: state
+    entity_id:
+    - binary_sensor.bed_schedule
+    id: bed_time
+    to:
+    - 'on'
+  - trigger: state
+    entity_id:
+    - binary_sensor.bed_schedule
+    id: wake_up_time
+    to:
+    - 'off'
+  conditions: []
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id:
+        - wake_up_time
+      sequence:
+      - action: input_boolean.turn_off
+        metadata: {}
+        data: {}
+        target:
+          entity_id: input_boolean.bedtime
+    - conditions:
+      - condition: trigger
+        id:
+        - bed_time
+      sequence:
+      - action: input_boolean.turn_on
+        metadata: {}
+        target:
+          entity_id: input_boolean.bedtime
+        data: {}
+  mode: single
+- id: '1773343730024'
+  alias: Cast Lyrics to Chromecast when Office plays music
+  description: Casts the lyrics dashboard to Old Chromecast when music starts on Office
+    2
+  triggers:
+  - entity_id: media_player.office_2
+    to: playing
+    trigger: state
+  conditions:
+  - condition: state
+    entity_id: input_boolean.bedtime
+    state: 'off'
+  actions:
+  - data:
+      entity_id: media_player.old_chromecast
+      dashboard_path: dashboard-lyrics
+      view_path: lyrics-with-audio
+    action: cast.show_lovelace_view
+  mode: single
+- id: '1773343766460'
+  alias: Stop Lyrics Cast when Office stops
+  description: Turns off Chromecast when Office 2 stops playing
+  triggers:
+  - entity_id:
+    - media_player.office_2
+    from:
+    - playing
+    trigger: state
+    to:
+    - 'off'
+    - paused
+    - standby
+    - idle
+    for:
+      hours: 0
+      minutes: 0
+      seconds: 10
+  conditions:
+  - condition: state
+    entity_id: input_boolean.bedtime
+    state: 'off'
+  actions:
+  - target:
+      entity_id: media_player.old_chromecast
+    action: media_player.turn_off
+    data: {}
+  mode: single

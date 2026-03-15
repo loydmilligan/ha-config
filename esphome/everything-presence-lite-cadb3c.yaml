@@ -1,0 +1,17 @@
+substitutions:
+  name: everything-presence-lite-cadb3c
+  friendly_name: Everything Presence Lite cadb3c
+packages:
+  EverythingSmartTechnology.Everything Presence Lite: github://everythingsmarthome/everything-presence-lite/everything-presence-lite-ha-co2.yaml@main
+esphome:
+  name: ${name}
+  name_add_mac_suffix: false
+  friendly_name: ${friendly_name}
+api:
+  encryption:
+    key: fxLv2ZHDNeUQfZa7ZpGs1DIoVXfta9Uqs6CyJ5+J8ZY=
+
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password

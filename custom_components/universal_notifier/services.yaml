@@ -1,0 +1,104 @@
+# /config/custom_components/universal_notifier/services.yaml
+
+send:
+  name: Send Universal Notification
+  description: Sends messages to multiple targets with Smart logic (Greetings, Time, DND, Priority).
+
+  fields:
+    message:
+      name: Message
+      description: The message text or command.
+      required: true
+      selector:
+        text:
+      example: "The washing machine has finished its cycle."
+
+    title:
+      name: Title
+      description: Notification title.
+      required: false
+      selector:
+        text:
+      example: "Laundry Alert"
+
+    targets:
+      name: Targets
+      description: List of channel aliases defined in configuration.yaml.
+      required: true
+      selector:
+        object:
+      example:
+        - gh_entryway
+        - mobile_app_user
+
+    data:
+      name: General Data
+      description: Generic extra data applied to all targets.
+      required: false
+      selector:
+        object:
+      example:
+        # Esempio di dati per Mobile App/Alexa
+        data:
+          ttl: 0
+          tag: "alert"
+
+    target_data:
+      name: Target Specific Data
+      description: >
+        Specific payload for a single target. 
+        You can use the 'message' key here to override the main message only for this target.
+      required: false
+      selector:
+        object:
+      example:
+        # Override per Telegram
+        telegram_admin:
+          message: "Intrusion detected! Check the live feed."
+          type: photo
+          url: "http://camera_ip/snapshot.jpg"
+
+    # --- OVERRIDES & FLAGS ---
+    priority:
+      name: Priority Message
+      description: If active (true), bypasses DND and sets the volume to 90% for voice assistants.
+      required: false
+      default: false
+      selector:
+        boolean:
+
+    assistant_name:
+      name: Assistant Name Override
+      description: Overrides the assistant's name in visual prefixes (e.g., "[My Smart Home - 10:00]").
+      required: false
+      selector:
+        text:
+
+    bold_prefix:
+      name: Bold Prefix
+      description: If active, the assistant name and time will be bolded in visual notifications (supports HTML/Markdown).
+      required: false
+      default: false
+      selector:
+        boolean:
+
+    skip_greeting:
+      name: Skip Greeting
+      description: If active, does not add the time-based greeting (e.g., Good Morning).
+      required: false
+      selector:
+        boolean:
+
+    include_time:
+      name: Include Time
+      description: If disabled, omits the time in the visual prefix.
+      required: false
+      selector:
+        boolean:
+
+    override_greetings:
+      name: Override Greetings
+      description: Dictionary to override the default greetings for a specific time slot.
+      required: false
+      selector:
+        object:

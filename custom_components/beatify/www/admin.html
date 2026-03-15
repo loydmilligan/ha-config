@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title data-i18n="admin.title">Beatify Admin</title>
+    <!-- Preconnect for faster font loading (Story 9.8) -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@700;900&display=swap" rel="stylesheet">
+    <!-- Story 18.4: Use minified CSS in production -->
+    <link rel="stylesheet" href="/beatify/static/css/styles.css?v=2.2.1">
+</head>
+<body class="theme-dark">
+    <header class="admin-header">
+        <h1 class="wordmark"><span class="wordmark-beat">Beat</span><span class="wordmark-gradient">ify</span></h1>
+        <!-- Analytics Link (Story 19.2, updated 19.13) -->
+        <a href="/beatify/analytics" class="analytics-icon-link" id="analytics-link" aria-label="Analytics Dashboard">
+            <span aria-hidden="true">📊</span>
+        </a>
+    </header>
+
+    <main class="admin-content">
+        <!-- Media Player Section - Collapsible with last-used memory -->
+        <section id="media-players" class="section-collapsible" aria-labelledby="media-players-heading">
+            <button type="button" class="section-header-collapsible" id="media-players-toggle" aria-expanded="true" aria-controls="media-players-content">
+                <span class="section-icon" aria-hidden="true">🔊</span>
+                <span data-i18n="admin.mediaPlayers">Media Players</span>
+                <span class="section-summary" id="media-player-summary">Select...</span>
+                <span class="section-toggle" aria-hidden="true">▼</span>
+            </button>
+            <div class="section-content" id="media-players-content">
+                <div id="media-players-list" data-i18n="common.loading">Loading...</div>
+                <p class="supported-players-hint">
+                    Supported: Music Assistant, Sonos, and Alexa players.
+                    <a href="https://music-assistant.io/" target="_blank" rel="noopener">Use Music Assistant</a> for Chromecast/Nest devices.
+                </p>
+            </div>
+        </section>
+
+        <!-- Music Service Section - Dynamic based on selected speaker -->
+        <section id="music-service" class="card-section hidden">
+            <h2 class="section-header">
+                <span class="section-icon" aria-hidden="true">🎵</span>
+                <span data-i18n="admin.musicService">Music Service</span>
+            </h2>
+            <div class="chip-group provider-chips" role="group" aria-label="Music service">
+                <button type="button" class="chip chip--active" data-provider="spotify">
+                    <svg class="provider-icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                        <path fill="#1DB954" d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z"/>
+                    </svg>
+                    Spotify
+                </button>
+                <button type="button" class="chip" data-provider="apple_music">
+                    <svg class="provider-icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                        <path fill="#FA243C" d="M23.994 6.124a9.23 9.23 0 0 0-.24-2.19c-.317-1.31-1.062-2.31-2.18-3.043a5.022 5.022 0 0 0-1.877-.726 10.496 10.496 0 0 0-1.564-.15c-.04-.003-.083-.01-.124-.013H5.986c-.152.01-.303.017-.455.026-.747.043-1.49.123-2.193.4-1.336.53-2.3 1.452-2.865 2.78-.192.448-.292.925-.363 1.408-.056.392-.088.785-.1 1.18 0 .032-.007.062-.01.093v12.223c.01.14.017.283.027.424.05.815.154 1.624.497 2.373.65 1.42 1.738 2.353 3.234 2.802.42.127.856.187 1.293.228.555.053 1.11.06 1.667.06h11.03c.525 0 1.048-.034 1.57-.1.823-.106 1.597-.35 2.296-.81.84-.553 1.472-1.287 1.88-2.208.186-.42.293-.87.37-1.324.113-.675.138-1.358.137-2.04-.002-3.8 0-7.595-.003-11.393zm-6.423 3.99v5.712c0 .417-.058.827-.244 1.206-.29.59-.76.962-1.388 1.14-.35.1-.706.157-1.07.173-.95.042-1.785-.455-2.105-1.392-.227-.665-.063-1.39.477-1.89.39-.36.87-.54 1.39-.612.292-.04.59-.058.885-.094.39-.048.63-.27.678-.66.006-.065.007-.13.007-.194V9.95c0-.19-.058-.32-.25-.378-.187-.056-.38-.097-.574-.126-.56-.084-1.123-.155-1.685-.232l-2.36-.32c-.063-.01-.127-.012-.19-.026-.18-.04-.29.02-.334.2-.01.05-.017.1-.017.15-.002 2.395 0 4.79-.003 7.185 0 .46-.056.91-.252 1.327-.29.617-.77 1.01-1.42 1.193-.34.095-.69.147-1.043.163-.935.04-1.762-.44-2.076-1.35-.256-.74-.07-1.507.5-2.03.39-.36.87-.53 1.39-.605.315-.046.633-.072.95-.11.315-.04.525-.24.575-.556.01-.067.013-.135.013-.2v-7.5c0-.147.022-.29.068-.43.077-.23.243-.378.482-.42.2-.038.4-.062.602-.092l2.835-.39 2.712-.372c.428-.058.858-.112 1.287-.17.193-.026.387-.05.58-.074.086-.01.125.02.14.11.006.03.01.06.01.09v5.62z"/>
+                    </svg>
+                    Apple Music
+                </button>
+                <button type="button" class="chip" data-provider="youtube_music">
+                    <svg class="provider-icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                        <path fill="#FF0000" d="M12 0C5.376 0 0 5.376 0 12s5.376 12 12 12 12-5.376 12-12S18.624 0 12 0zm0 19.104c-3.924 0-7.104-3.18-7.104-7.104S8.076 4.896 12 4.896s7.104 3.18 7.104 7.104-3.18 7.104-7.104 7.104zm0-13.332c-3.432 0-6.228 2.796-6.228 6.228S8.568 18.228 12 18.228 18.228 15.432 18.228 12 15.432 5.772 12 5.772zM9.684 15.54V8.46L15.816 12l-6.132 3.54z"/>
+                    </svg>
+                    YouTube Music
+                </button>
+                <button type="button" class="chip" data-provider="tidal">
+                    <svg class="provider-icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                        <path fill="#000000" d="M12.012 3.992L8.008 7.996 12.012 12l4.004-4.004zM4.004 3.992L0 7.996 4.004 12l4.004-4.004zM12.012 12.008L8.008 16.012 12.012 20.016l4.004-4.004zM20.02 3.992L16.016 7.996 20.02 12l4.004-4.004z"/>
+                    </svg>
+                    Tidal
+                </button>
+            </div>
+            <p id="provider-hint" class="hint-text hidden"></p>
+            <div id="provider-warning" class="warning-box hidden"></div>
+        </section>
+
+        <!-- Playlists Section - Always expanded -->
+        <section id="playlists" class="card-section">
+            <h2 class="section-header"><span class="section-icon" aria-hidden="true">🎵</span><span data-i18n="admin.playlists">Playlists</span></h2>
+            <!-- Tag Filter Bar (Issue #70) -->
+            <div id="playlist-filter-bar" class="playlist-filter-bar hidden">
+                <button type="button" class="filter-tag active" data-tag="all" data-i18n="admin.filterAll">All</button>
+            </div>
+            <div id="playlists-list" data-i18n="common.loading">Loading...</div>
+            <div id="playlist-summary" class="selection-summary hidden">
+                <span data-i18n="admin.selected">Selected:</span> <span id="selected-count">0</span> <span data-i18n="admin.playlistsLabel">playlists,</span>
+                <span id="total-songs">0</span> <span data-i18n="admin.songsLabel">songs</span>
+            </div>
+        </section>
+
+        <!-- My Requested Playlists Section (Story 44.3) -->
+        <section id="my-requests" class="section-collapsible hidden" aria-labelledby="my-requests-heading">
+            <button type="button" class="section-header-collapsible" id="my-requests-toggle" aria-expanded="true" aria-controls="my-requests-content">
+                <span class="section-icon" aria-hidden="true">📋</span>
+                <span data-i18n="admin.myRequests">My Requested Playlists</span>
+                <span class="section-summary" id="my-requests-summary">0</span>
+                <span class="section-toggle" aria-hidden="true">▼</span>
+            </button>
+            <div class="section-content" id="my-requests-content">
+                <div id="my-requests-list" class="requests-list">
+                    <!-- Rendered dynamically -->
+                </div>
+                <p id="my-requests-empty" class="empty-state-inline hidden">
+                    <span aria-hidden="true">📭</span>
+                    <span data-i18n="admin.noRequests">No playlist requests yet</span>
+                </p>
+                <button type="button" id="request-playlist-btn" class="btn btn-secondary btn-full-width request-btn">
+                    <span aria-hidden="true">➕</span>
+                    <span data-i18n="admin.requestPlaylist">Request Custom Playlist</span>
+                </button>
+            </div>
+        </section>
+
+        <!-- Game Settings Section - Collapsible with all settings -->
+        <section id="game-settings" class="section-collapsible collapsed" aria-labelledby="game-settings-heading">
+            <button type="button" class="section-header-collapsible" id="game-settings-toggle" aria-expanded="false" aria-controls="game-settings-content">
+                <span class="section-icon" aria-hidden="true">⚙️</span>
+                <span data-i18n="admin.gameSettings">Game Settings</span>
+                <span class="section-summary" id="game-settings-summary">Normal • 45s • EN</span>
+                <span class="section-toggle" aria-hidden="true">▼</span>
+            </button>
+            <div class="section-content" id="game-settings-content">
+                <!-- Language - Compact chips -->
+                <div class="setting-row">
+                    <span class="setting-label">
+                        <span class="setting-icon" aria-hidden="true">🌐</span>
+                        <span data-i18n="admin.language">Language</span>
+                    </span>
+                    <div class="chip-group" role="group" aria-label="Game language">
+                        <button type="button" id="lang-en" class="chip chip--active" data-lang="en">EN</button>
+                        <button type="button" id="lang-de" class="chip" data-lang="de">DE</button>
+                        <button type="button" id="lang-es" class="chip" data-lang="es">ES</button>
+                        <button type="button" id="lang-fr" class="chip" data-lang="fr">FR</button>
+                    </div>
+                </div>
+
+                <!-- Timer - Compact chips -->
+                <div class="setting-row">
+                    <span class="setting-label">
+                        <span class="setting-icon" aria-hidden="true">⏱️</span>
+                        <span data-i18n="admin.timer">Timer</span>
+                    </span>
+                    <div class="chip-group" role="group" aria-label="Round timer">
+                        <button type="button" id="timer-quick" class="chip" data-duration="30">30s</button>
+                        <button type="button" id="timer-normal" class="chip chip--active" data-duration="45">45s</button>
+                        <button type="button" id="timer-relaxed" class="chip" data-duration="60">60s</button>
+                    </div>
+                </div>
+
+                <!-- Difficulty - Compact chips -->
+                <div class="setting-row">
+                    <span class="setting-label">
+                        <span class="setting-icon" aria-hidden="true">🎯</span>
+                        <span data-i18n="admin.difficulty">Difficulty</span>
+                    </span>
+                    <div class="chip-group" role="group" aria-label="Difficulty">
+                        <button type="button" class="chip" data-difficulty="easy" data-i18n="admin.easy">Easy</button>
+                        <button type="button" class="chip chip--active" data-difficulty="normal" data-i18n="admin.normal">Normal</button>
+                        <button type="button" class="chip" data-difficulty="hard" data-i18n="admin.hard">Hard</button>
+                    </div>
+                </div>
+
+                <!-- Artist Challenge - Inline toggle -->
+                <div class="setting-row">
+                    <span class="setting-label">
+                        <span class="setting-icon" aria-hidden="true">🎤</span>
+                        <span data-i18n="admin.artistChallenge">Artist Challenge</span>
+                    </span>
+                    <label class="toggle-compact">
+                        <input type="checkbox" id="artist-challenge-toggle" checked>
+                        <span class="toggle-switch-compact"></span>
+                    </label>
+                </div>
+            </div>
+        </section>
+
+        <!-- Validation messages and Start button -->
+        <div class="admin-actions">
+            <p id="media-player-validation-msg" class="status-error hidden" data-i18n="admin.selectMediaPlayerHint">Select a media player</p>
+            <p id="playlist-validation-msg" class="status-error hidden" data-i18n="admin.selectPlaylistHint">Select at least one playlist</p>
+            <button id="start-game" class="btn btn-primary btn-large btn-full-width hidden" disabled data-i18n="admin.startGame">Start Game</button>
+        </div>
+
+        <!-- Lobby view (Story 2.3, mobile-optimized compact layout) -->
+        <div id="lobby-section" class="lobby-view-wrapper hidden">
+            <div class="lobby-container lobby-container--compact">
+                <!-- Header with inline stat badges -->
+                <div class="lobby-header-compact">
+                    <h2 class="section-header section-header--inline">
+                        <span class="section-icon" aria-hidden="true">🎮</span>
+                        <span data-i18n="lobby.gameLobby">Game Lobby</span>
+                    </h2>
+                    <div class="stat-badge-bar" aria-live="polite">
+                        <span class="stat-badge">
+                            <span class="stat-badge-icon" aria-hidden="true">👥</span>
+                            <span id="lobby-player-count" class="stat-badge-value">0</span>
+                        </span>
+                        <!-- Difficulty Badge -->
+                        <span id="lobby-difficulty-badge" class="stat-badge stat-badge--difficulty"></span>
+                    </div>
+                </div>
+
+                <!-- Invite Friends Section - Expanded by default for admin -->
+                <section class="section-collapsible" id="qr-section">
+                    <button type="button" class="section-header-collapsible" aria-expanded="true" aria-controls="qr-content">
+                        <span class="section-icon" aria-hidden="true">📲</span>
+                        <span data-i18n="lobby.inviteFriends">Invite Friends</span>
+                        <span class="section-toggle" aria-hidden="true">▼</span>
+                    </button>
+                    <div class="section-content" id="qr-content">
+                        <div class="qr-section qr-section--compact">
+                            <div class="qr-container" id="admin-qr-container" role="button" tabindex="0"
+                                 aria-label="Tap to enlarge QR code">
+                                <div id="qr-code"></div>
+                            </div>
+                            <p id="join-url" class="qr-url-display qr-url-display--compact"></p>
+                            <!-- Inline dashboard link -->
+                            <a href="#" id="admin-dashboard-url" class="dashboard-link" target="_blank">
+                                <span aria-hidden="true">📺</span>
+                                <span data-i18n="dashboard.castToTv">Cast to TV</span>
+                                <span class="dashboard-link-arrow" aria-hidden="true">→</span>
+                            </a>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Players Section - Collapsible -->
+                <section class="section-collapsible" id="admin-players-section">
+                    <button type="button" class="section-header-collapsible" aria-expanded="true" aria-controls="admin-players-content">
+                        <span class="section-icon" aria-hidden="true">👥</span>
+                        <span data-i18n="lobby.playersInLobby">Players in Lobby</span>
+                        <span class="section-summary" id="admin-players-summary">0</span>
+                        <span class="section-toggle" aria-hidden="true">▼</span>
+                    </button>
+                    <div class="section-content" id="admin-players-content">
+                        <div id="lobby-players" class="player-cards-grid" aria-live="polite" aria-label="Player list">
+                            <!-- Rendered dynamically by renderLobbyPlayers() -->
+                        </div>
+                        <p id="lobby-players-empty" class="empty-state-inline">
+                            <span aria-hidden="true">👥</span>
+                            <span data-i18n="lobby.waitingForPlayers">Waiting for players to join...</span>
+                        </p>
+                    </div>
+                </section>
+
+                <!-- Sticky Lobby Actions -->
+                <div class="lobby-actions lobby-actions--sticky">
+                    <button id="participate-btn" class="btn btn-primary btn-large btn-full-width">
+                        <span class="btn-icon" aria-hidden="true">🎮</span>
+                        <span data-i18n="admin.joinAsPlayer">Join as Player</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Existing game view (Story 2.3) -->
+        <section id="existing-game-section" class="card-section hidden">
+            <h2 class="section-header"><span class="section-icon" aria-hidden="true">▶️</span><span data-i18n="admin.gameInProgress">Game In Progress</span></h2>
+            <div class="game-info">
+                <p><strong data-i18n="admin.gameId">Game ID:</strong> <span id="existing-game-id"></span></p>
+                <p><strong data-i18n="admin.phase">Phase:</strong> <span id="existing-game-phase"></span></p>
+                <p><strong data-i18n="admin.players">Players:</strong> <span id="existing-game-players"></span></p>
+            </div>
+            <div class="game-controls-bar">
+                <button id="rejoin-game" class="btn btn-primary" data-i18n="admin.rejoinGame">Rejoin Game</button>
+                <button id="end-game-existing" class="btn btn-danger" data-i18n="admin.endGame">End Game</button>
+            </div>
+        </section>
+    </main>
+
+    <!-- Admin join modal -->
+    <div id="admin-join-modal" class="modal hidden">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <h2 data-i18n="admin.joinTheGame">Join the Game</h2>
+            <p data-i18n="admin.enterDisplayName">Enter your display name to join as a player with admin controls.</p>
+            <div class="form-group">
+                <input type="text" id="admin-name-input" class="name-input"
+                       data-i18n-placeholder="join.namePlaceholder"
+                       placeholder="Your name" maxlength="20"
+                       autocomplete="off" autocapitalize="words">
+                <p id="admin-name-error" class="validation-msg hidden"></p>
+            </div>
+            <div class="modal-actions">
+                <button id="admin-join-btn" class="btn btn-primary" disabled data-i18n="join.joinButton">Join</button>
+                <button id="admin-cancel-btn" class="btn btn-secondary" data-i18n="common.cancel">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- End Game confirmation modal (Story 9.10) -->
+    <div id="end-game-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="end-game-modal-title">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <h2 id="end-game-modal-title" data-i18n="admin.endGameConfirm">End Game?</h2>
+            <p data-i18n="admin.endGameWarning">All players will be disconnected.</p>
+            <div class="modal-actions">
+                <button id="end-game-confirm-btn" class="btn btn-primary" data-i18n="admin.endGame">End Game</button>
+                <button id="end-game-cancel-btn" class="btn btn-secondary" data-i18n="common.cancel">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- QR Modal (tap to enlarge) -->
+    <div id="qr-modal" class="qr-modal hidden" role="dialog" aria-modal="true"
+         aria-labelledby="qr-modal-title">
+        <div class="qr-modal-backdrop"></div>
+        <div class="qr-modal-content">
+            <h2 id="qr-modal-title" class="sr-only" data-i18n="lobby.joinGameQr">Join Game QR Code</h2>
+            <div id="qr-modal-code" class="qr-modal-code">
+                <!-- Large QR code rendered here -->
+            </div>
+            <p class="qr-modal-label" data-i18n="lobby.scanToJoin">Scan to join the game</p>
+            <button id="qr-modal-close" class="btn btn-secondary qr-modal-close"
+                    aria-label="Close QR code" data-i18n="common.close">Close</button>
+        </div>
+    </div>
+
+    <!-- Playlist Request Modal (Story 44.2) -->
+    <div id="request-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="request-modal-title">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <h2 id="request-modal-title" data-i18n="admin.requestPlaylistTitle">Request Custom Playlist</h2>
+            <div class="form-group">
+                <label for="spotify-url-input" data-i18n="admin.spotifyUrl">Spotify Playlist URL</label>
+                <input type="url" id="spotify-url-input" class="text-input"
+                       data-i18n-placeholder="admin.spotifyUrlPlaceholder"
+                       placeholder="https://open.spotify.com/playlist/..."
+                       autocomplete="off" autocapitalize="off" spellcheck="false">
+                <p id="spotify-url-error" class="validation-msg hidden" data-i18n="admin.spotifyUrlInvalid">Please enter a valid Spotify playlist URL</p>
+            </div>
+            <div class="info-box">
+                <p class="info-box-title" data-i18n="admin.howItWorks">How it works:</p>
+                <ol class="info-box-list">
+                    <li data-i18n="admin.howItWorks1">We'll receive your request</li>
+                    <li data-i18n="admin.howItWorks2">Playlist is created within 24-48 hours</li>
+                    <li data-i18n="admin.howItWorks3">Update Beatify to get the new playlist</li>
+                </ol>
+                <p class="info-box-note" data-i18n="admin.playlistCriteria"><strong>Note:</strong> We only accept targeted playlists (e.g. "Best 80s Hits", "Dutch All-Time Greatest") — not broad ones like "My Favorites"</p>
+            </div>
+            <div class="modal-actions">
+                <button id="request-cancel-btn" class="btn btn-secondary" data-i18n="common.cancel">Cancel</button>
+                <button id="request-submit-btn" class="btn btn-primary" disabled data-i18n="admin.submitRequest">Submit Request</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Playlist Request Success Modal (Story 44.2) -->
+    <div id="request-success-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="request-success-title">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content modal-content--success">
+            <div class="success-icon" aria-hidden="true">✅</div>
+            <h2 id="request-success-title" data-i18n="admin.requestSubmitted">Request Submitted!</h2>
+            <p id="request-success-name" class="success-playlist-name"></p>
+            <p class="success-estimate" data-i18n="admin.requestEstimate">Estimated: 24-48 hours</p>
+            <div class="modal-actions">
+                <button id="request-success-close-btn" class="btn btn-primary" data-i18n="common.close">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <footer>
+        <p>Beatify <span id="app-version">v...</span></p>
+    </footer>
+
+    <script src="/beatify/static/js/vendor/qrcode.min.js"></script>
+    <!-- Story 18.4: Use minified JS in production with fallback to source -->
+    <!-- Version query strings prevent browser caching issues -->
+    <script src="/beatify/static/js/i18n.min.js?v=1.7.0" onerror="var s=document.createElement('script');s.src='/beatify/static/js/i18n.js?v=1.7.0';document.head.appendChild(s);"></script>
+    <script src="/beatify/static/js/utils.min.js?v=1.7.0" onerror="var s=document.createElement('script');s.src='/beatify/static/js/utils.js?v=1.7.0';document.head.appendChild(s);"></script>
+    <!-- Story 44.1: Playlist requests module -->
+    <script src="/beatify/static/js/playlist-requests.js?v=2.2.1"></script>
+    <script src="/beatify/static/js/admin.js?v=2.2.1"></script>
+</body>
+</html>

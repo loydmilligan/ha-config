@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title data-i18n="launcher.title">Beatify</title>
+    <style>
+        :root {
+            --color-bg-primary: #0a0a12;
+            --color-accent-primary: #ff2d6a;
+            --color-accent-secondary: #00f5ff;
+            --color-text-primary: #ffffff;
+            --color-text-muted: #8b8b9e;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background: var(--color-bg-primary);
+            color: var(--color-text-primary);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            padding: 24px;
+        }
+
+        .logo {
+            font-size: 48px;
+            font-weight: 700;
+            margin-bottom: 24px;
+        }
+
+        .logo .beat {
+            color: var(--color-text-primary);
+        }
+
+        .logo .ify {
+            background: linear-gradient(135deg, var(--color-accent-primary), var(--color-accent-secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .message {
+            font-size: 18px;
+            color: var(--color-text-muted);
+            margin-bottom: 32px;
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 16px 32px;
+            background: var(--color-accent-primary);
+            color: white;
+            text-decoration: none;
+            border-radius: 12px;
+            font-size: 16px;
+            font-weight: 600;
+            transition: transform 0.15s ease, box-shadow 0.15s ease;
+            cursor: pointer;
+            border: none;
+        }
+
+        .btn:hover {
+            transform: scale(1.02);
+            box-shadow: 0 0 20px var(--color-accent-primary);
+        }
+
+        .btn:active {
+            transform: scale(0.98);
+        }
+
+        .hint {
+            margin-top: 24px;
+            font-size: 14px;
+            color: var(--color-text-muted);
+        }
+    </style>
+</head>
+<body>
+    <div class="logo">
+        <span class="beat">Beat</span><span class="ify">ify</span>
+    </div>
+    <p class="message" id="message" data-i18n="launcher.openingInNewTab">Opening Beatify in a new tab...</p>
+    <button class="btn" id="openBtn" onclick="openBeatify()" data-i18n="launcher.openBeatify">Open Beatify</button>
+    <p class="hint" id="hint"></p>
+
+    <script src="/beatify/static/js/i18n.js"></script>
+    <script>
+        function openBeatify() {
+            var adminUrl = window.location.origin + '/beatify/admin';
+            var newWindow = window.open(adminUrl, '_blank', 'noopener,noreferrer');
+
+            var messageEl = document.getElementById('message');
+            var hintEl = document.getElementById('hint');
+
+            if (newWindow) {
+                messageEl.textContent = BeatifyI18n.t('launcher.openedInNewTab');
+                hintEl.textContent = BeatifyI18n.t('launcher.clickToOpenAnother');
+            } else {
+                messageEl.textContent = BeatifyI18n.t('launcher.popupBlocked');
+                hintEl.textContent = BeatifyI18n.t('launcher.allowPopups');
+            }
+        }
+
+        // Initialize i18n and auto-open
+        window.addEventListener('load', async function() {
+            await BeatifyI18n.init();
+            BeatifyI18n.initPageTranslations();
+            // Small delay to ensure the page is fully rendered
+            setTimeout(openBeatify, 100);
+        });
+    </script>
+</body>
+</html>

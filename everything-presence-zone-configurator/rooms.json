@@ -1,0 +1,225 @@
+[
+  {
+    "id": "05ee6a1c-b977-49c0-a899-5e9c033baced",
+    "name": "Bedroom",
+    "deviceId": "d408be5a21970c61af3c39499829a02e",
+    "profileId": "everything_presence_lite",
+    "units": "metric",
+    "zones": [
+      {
+        "id": "Zone 1",
+        "type": "regular",
+        "x": -1030,
+        "y": 680,
+        "width": 1360,
+        "height": 2020
+      },
+      {
+        "id": "Exclusion 1",
+        "type": "exclusion",
+        "x": -5200,
+        "y": -1460,
+        "width": 400,
+        "height": 100
+      }
+    ],
+    "entityMappings": {
+      "discoveredAt": "2026-02-03T08:39:25.089Z",
+      "autoMatchedCount": 92,
+      "manuallyMappedCount": 0,
+      "presenceEntity": "binary_sensor.everything_presence_lite_cadb3c_occupancy",
+      "co2Entity": "sensor.everything_presence_lite_cadb3c_co2",
+      "zoneConfigEntities": {
+        "zone1": {
+          "beginX": "number.everything_presence_lite_cadb3c_zone_1_begin_x",
+          "endX": "number.everything_presence_lite_cadb3c_zone_1_end_x",
+          "beginY": "number.everything_presence_lite_cadb3c_zone_1_begin_y",
+          "endY": "number.everything_presence_lite_cadb3c_zone_1_end_y"
+        },
+        "zone2": {
+          "beginX": "number.everything_presence_lite_cadb3c_zone_2_begin_x",
+          "endX": "number.everything_presence_lite_cadb3c_zone_2_end_x",
+          "beginY": "number.everything_presence_lite_cadb3c_zone_2_begin_y",
+          "endY": "number.everything_presence_lite_cadb3c_zone_2_end_y"
+        },
+        "zone3": {
+          "beginX": "number.everything_presence_lite_cadb3c_zone_3_begin_x",
+          "endX": "number.everything_presence_lite_cadb3c_zone_3_end_x",
+          "beginY": "number.everything_presence_lite_cadb3c_zone_3_begin_y",
+          "endY": "number.everything_presence_lite_cadb3c_zone_3_end_y"
+        },
+        "zone4": {
+          "beginX": "number.everything_presence_lite_cadb3c_zone_4_begin_x",
+          "endX": "number.everything_presence_lite_cadb3c_zone_4_end_x",
+          "beginY": "number.everything_presence_lite_cadb3c_zone_4_begin_y",
+          "endY": "number.everything_presence_lite_cadb3c_zone_4_end_y"
+        }
+      },
+      "exclusionZoneConfigEntities": {
+        "exclusion1": {
+          "beginX": "number.everything_presence_lite_cadb3c_occupancy_mask_1_begin_x",
+          "endX": "number.everything_presence_lite_cadb3c_occupancy_mask_1_end_x",
+          "beginY": "number.everything_presence_lite_cadb3c_occupancy_mask_1_begin_y",
+          "endY": "number.everything_presence_lite_cadb3c_occupancy_mask_1_end_y"
+        },
+        "exclusion2": {
+          "beginX": "number.everything_presence_lite_cadb3c_occupancy_mask_2_begin_x",
+          "endX": "number.everything_presence_lite_cadb3c_occupancy_mask_2_end_x",
+          "beginY": "number.everything_presence_lite_cadb3c_occupancy_mask_2_begin_y",
+          "endY": "number.everything_presence_lite_cadb3c_occupancy_mask_2_end_y"
+        }
+      },
+      "entryZoneConfigEntities": {
+        "entry1": {
+          "beginX": "number.everything_presence_lite_cadb3c_entry_zone_1_begin_x",
+          "endX": "number.everything_presence_lite_cadb3c_entry_zone_1_end_x",
+          "beginY": "number.everything_presence_lite_cadb3c_entry_zone_1_begin_y",
+          "endY": "number.everything_presence_lite_cadb3c_entry_zone_1_end_y"
+        },
+        "entry2": {
+          "beginX": "number.everything_presence_lite_cadb3c_entry_zone_2_begin_x",
+          "endX": "number.everything_presence_lite_cadb3c_entry_zone_2_end_x",
+          "beginY": "number.everything_presence_lite_cadb3c_entry_zone_2_begin_y",
+          "endY": "number.everything_presence_lite_cadb3c_entry_zone_2_end_y"
+        }
+      },
+      "polygonZoneEntities": {
+        "zone1": "text.everything_presence_lite_cadb3c_polygon_zone_1",
+        "zone2": "text.everything_presence_lite_cadb3c_polygon_zone_2",
+        "zone3": "text.everything_presence_lite_cadb3c_polygon_zone_3",
+        "zone4": "text.everything_presence_lite_cadb3c_polygon_zone_4"
+      },
+      "polygonExclusionEntities": {
+        "exclusion1": "text.everything_presence_lite_cadb3c_polygon_exclusion_1",
+        "exclusion2": "text.everything_presence_lite_cadb3c_polygon_exclusion_2"
+      },
+      "polygonEntryEntities": {
+        "entry1": "text.everything_presence_lite_cadb3c_polygon_entry_1",
+        "entry2": "text.everything_presence_lite_cadb3c_polygon_entry_2"
+      },
+      "trackingTargets": {
+        "target1": {
+          "x": "sensor.everything_presence_lite_cadb3c_target_1_x",
+          "y": "sensor.everything_presence_lite_cadb3c_target_1_y",
+          "speed": "sensor.everything_presence_lite_cadb3c_target_1_speed",
+          "resolution": "sensor.everything_presence_lite_cadb3c_target_1_resolution",
+          "angle": "sensor.everything_presence_lite_cadb3c_target_1_angle",
+          "distance": "sensor.everything_presence_lite_cadb3c_target_1_distance",
+          "active": "binary_sensor.everything_presence_lite_cadb3c_target_1_active"
+        },
+        "target2": {
+          "x": "sensor.everything_presence_lite_cadb3c_target_2_x",
+          "y": "sensor.everything_presence_lite_cadb3c_target_2_y",
+          "speed": "sensor.everything_presence_lite_cadb3c_target_2_speed",
+          "resolution": "sensor.everything_presence_lite_cadb3c_target_2_resolution",
+          "angle": "sensor.everything_presence_lite_cadb3c_target_2_angle",
+          "distance": "sensor.everything_presence_lite_cadb3c_target_2_distance",
+          "active": "binary_sensor.everything_presence_lite_cadb3c_target_2_active"
+        },
+        "target3": {
+          "x": "sensor.everything_presence_lite_cadb3c_target_3_x",
+          "y": "sensor.everything_presence_lite_cadb3c_target_3_y",
+          "speed": "sensor.everything_presence_lite_cadb3c_target_3_speed",
+          "resolution": "sensor.everything_presence_lite_cadb3c_target_3_resolution",
+          "angle": "sensor.everything_presence_lite_cadb3c_target_3_angle",
+          "distance": "sensor.everything_presence_lite_cadb3c_target_3_distance",
+          "active": "binary_sensor.everything_presence_lite_cadb3c_target_3_active"
+        }
+      }
+    },
+    "entityNamePrefix": "everything_presence_lite_cadb3c",
+    "roomShell": {
+      "points": [
+        {
+          "x": 700,
+          "y": -1200
+        },
+        {
+          "x": 700,
+          "y": 3100
+        },
+        {
+          "x": -3400,
+          "y": 3100
+        },
+        {
+          "x": -3400,
+          "y": -1200
+        }
+      ]
+    },
+    "devicePlacement": {
+      "x": 200,
+      "y": 0,
+      "rotationDeg": 0
+    },
+    "furniture": [
+      {
+        "id": "f478a7f6-5244-4f2a-a8b2-c77eb775097f",
+        "typeId": "bed-king",
+        "x": -304.8837217158594,
+        "y": 1397.2500471524224,
+        "width": 1800,
+        "depth": 2000,
+        "height": 500,
+        "rotationDeg": 90,
+        "aspectRatioLocked": true
+      },
+      {
+        "id": "fbd96fde-d8ce-43be-b411-c49091f7afb6",
+        "typeId": "dresser",
+        "x": -2991.763946526362,
+        "y": 1297.2596745407168,
+        "width": 1936.4789690290181,
+        "depth": 806.8662370954243,
+        "height": 900,
+        "rotationDeg": 90,
+        "aspectRatioLocked": true
+      },
+      {
+        "id": "693783e7-aac0-4a1a-91b6-59ec3ed59c1b",
+        "typeId": "nightstand",
+        "x": 300,
+        "y": 2600,
+        "width": 450,
+        "depth": 450,
+        "height": 500,
+        "rotationDeg": 90,
+        "aspectRatioLocked": true
+      },
+      {
+        "id": "5d4fe252-1fd8-4245-89b2-e89447c2d01f",
+        "typeId": "nightstand",
+        "x": 300,
+        "y": 200,
+        "width": 450,
+        "depth": 450,
+        "height": 500,
+        "rotationDeg": 90,
+        "aspectRatioLocked": true
+      },
+      {
+        "id": "367e1230-76dc-455b-b78f-50b1cd446707",
+        "typeId": "storage-bench",
+        "x": 455.2734465057847,
+        "y": -596.4644660940672,
+        "width": 1080.552673339844,
+        "depth": 432.2210693359376,
+        "height": 450,
+        "rotationDeg": 90,
+        "aspectRatioLocked": true
+      }
+    ],
+    "doors": [
+      {
+        "id": "3d50654e-696d-4671-9701-15916ea728ce",
+        "segmentIndex": 2,
+        "positionOnSegment": 0.8519148715706759,
+        "widthMm": 800,
+        "swingDirection": "out",
+        "swingSide": "right"
+      }
+    ],
+    "metadata": {}
+  }
+]
