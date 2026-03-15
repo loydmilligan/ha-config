@@ -104,9 +104,9 @@ Then reload the relevant domain.
 
 ### 2. Full Rollback
 ```bash
-git reset --hard HEAD~1
+git revert HEAD --no-edit
 ```
-Then restart HA.
+Then restart HA. Prefer `git revert` over `git reset --hard` — it creates a new commit preserving history rather than destroying it.
 
 ### 3. Manual Fix
 Edit the file to fix the issue, reload.

@@ -46,19 +46,29 @@ Follow the process defined in `.claude/processes/task-workflow.md`:
 
 ### 2. Naming Conventions
 Follow conventions in `/config/.tasks/conventions.md`:
-- Areas = physical spaces
+- Areas = physical spaces only. Fallbacks: House, Services, Pending.
 - Labels = prefixed by type (role:, cat:, zone:, state:)
-- Entity IDs = `domain.{area}_{function}_{location}`
+- Entity IDs = `domain.{area}_{function}_{location}` (compass for qualifiers)
+- Friendly names = `{Area} {Function} {Location}` — always include area
+- Individual group members get area assignment but NOT role: labels (avoids double-triggering)
 
 ### 3. Git Workflow
 - Commit and push are separate steps
 - Never auto-push — ask first
 - Write clear commit messages
 
-### 4. Safety
+### 4. Task Discipline
+- Don't work cleanup or investigation tasks unless the user explicitly asks
+- Present task items as options, wait for explicit go-ahead before acting
 - Don't delete tasks — complete or archive only
+
+### 5. Safety
 - Don't modify secrets.yaml content directly (reference only)
 - Test changes before marking complete when possible
+
+### 6. Deprecated Items — Do Not Use
+- **Bifrost**: All `bifrost_*` entities are deprecated. Don't include in automations or assignments.
+- **Browser Mod**: All `browser_mod_*` entities are orphaned. On cleanup list.
 
 ---
 
@@ -76,10 +86,13 @@ Both you and Ground Control read/write these files:
 - Increment MINOR version when editing content
 - Update `updated` date field
 
-### Task ID Assignment
+### Task ID Assignment (Future)
+When Ground Control implements task IDs:
 - Format: T-001, T-002, etc.
 - Get next ID from `next_id` in buckets.md frontmatter
 - Increment `next_id` after assigning
+
+**Current state:** Tasks do not yet have IDs. Use task subject text to identify them.
 
 ---
 
@@ -89,6 +102,14 @@ Both you and Ground Control read/write these files:
 - Confirm understanding before major changes
 - Report blockers promptly
 - Ask for clarification when requirements are ambiguous
+
+---
+
+## HA API Access
+
+- Websocket API: `ws://supervisor/core/websocket`
+- Auth token: `$HASSIO_TOKEN` environment variable
+- Use for entity registry, area registry, label registry, and service calls.
 
 ---
 

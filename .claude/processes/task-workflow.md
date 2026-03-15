@@ -43,7 +43,7 @@ Execute what the task describes.
 ### 3. Complete the Task
 Move from Active → Completed:
 - Move task line to `## Completed`
-- Add date prefix: `- **YYYY-MM-DD**: [T-XXX] Subject...`
+- Add date prefix: `- **YYYY-MM-DD**: Subject (project: slug)`
 - Increment `version`
 - Update `updated` date
 - Update `task_count` in frontmatter
@@ -52,20 +52,37 @@ Move from Active → Completed:
 
 ## Task Line Format
 
+### Current Format (no task IDs yet)
+
 **Standard task:**
 ```markdown
-- [T-001] Task subject here (project: reorg)
+- Task subject here (project: reorg)
 ```
 
 **Blocked task:**
 ```markdown
-- [T-002] Task subject (project: reorg) (blocked by: T-001)
+- Task subject (project: reorg) (blocked by: other task description)
 ```
 
 **Completed task:**
 ```markdown
+- **2026-03-15**: Task subject (project: reorg)
+```
+
+**Empty bucket:**
+```markdown
+— empty —
+```
+
+### Future Format (when Ground Control implements task IDs)
+
+Task IDs (T-001, T-002, etc.) will be added by Ground Control. Format will become:
+```markdown
+- [T-001] Task subject here (project: reorg)
 - **2026-03-15**: [T-001] Task subject (project: reorg)
 ```
+
+Until then, use subject text to identify tasks.
 
 ---
 
@@ -83,10 +100,8 @@ A task lives in exactly one bucket. Move it cleanly.
 Found something new while working? Add it to Brainstorm:
 ```markdown
 ## Brainstorm
-- [T-XXX] New thing discovered during work (project: relevant-project)
+- New thing discovered during work (project: relevant-project)
 ```
-
-Assign the next available ID from `next_id` in frontmatter.
 
 ### Blocked Tasks Can't Progress
 Tasks with `(blocked by: T-XXX)` cannot move to Work Queue or Active until the blocker is resolved.
