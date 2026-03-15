@@ -9,6 +9,7 @@ secrets.yaml
 !.claude/agent.md
 !.claude/agents/
 !.claude/processes/
+!.claude/sync/
 
 # Lock files
 *.lock
