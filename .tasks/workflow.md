@@ -1,10 +1,10 @@
 ---
 title: Task Workflow & Processing
 type: workflow
-version: 1.0.0
+version: 1.1.0
 created: 2026-03-15
 updated: 2026-03-15
-description: Defines buckets, workflow rules, and session processing for task management
+description: Defines buckets, workflow rules, session processing, and git workflow for task management
 ---
 
 # Task Workflow & Processing
@@ -79,3 +79,13 @@ When ending a session, ensure any completed or new tasks are reflected in the fi
 4. Do the work
 5. Mark completed or return to Work Queue if paused
 6. Update project files and memories as needed
+
+## Git Workflow
+
+Committing and pushing are **separate steps**. Never auto-push after a commit.
+
+1. **Commit** — stage and commit changes locally. This is safe and reversible.
+2. **Confirm push** — always ask the user before pushing to remote. Never assume a commit should be pushed.
+3. **Push** — only after explicit user confirmation.
+
+This applies to all commits, no exceptions.
