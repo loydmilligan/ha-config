@@ -1,3 +1,17 @@
+---
+title: "Project: Occupancy-Based Music"
+type: project
+slug: occupancy-music
+version: 1.0.0
+created: 2026-03-15
+updated: 2026-03-15
+status: not_started
+goal: Music follows occupancy — plays in rooms where people are, stops where they aren't
+task_count:
+  completed: 0
+  backlog: 5
+---
+
 # Project: Occupancy-Based Music
 
 **Status:** Not Started

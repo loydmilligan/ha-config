@@ -1,3 +1,17 @@
+---
+title: "Project: Motion-Activated Lighting"
+type: project
+slug: motion-lighting
+version: 1.0.0
+created: 2026-03-15
+updated: 2026-03-15
+status: not_started
+goal: Lights turn on/off automatically based on presence detection in every room
+task_count:
+  completed: 0
+  backlog: 5
+---
+
 # Project: Motion-Activated Lighting
 
 **Status:** Not Started

@@ -1,3 +1,17 @@
+---
+title: "Project: HA Reorganization"
+type: project
+slug: reorg
+version: 1.2.0
+created: 2026-03-15
+updated: 2026-03-15
+status: in_progress
+goal: Every entity has a correct area, meaningful name, consistent naming convention, and appropriate labels
+task_count:
+  completed: 17
+  backlog: 12
+---
+
 # Project: HA Reorganization
 
 **Status:** In Progress

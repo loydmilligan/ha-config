@@ -1,3 +1,17 @@
+---
+title: "Project: Notification System"
+type: project
+slug: notifications
+version: 1.0.0
+created: 2026-03-15
+updated: 2026-03-15
+status: not_started
+goal: The right notification goes to the right person on the right device at the right urgency level
+task_count:
+  completed: 0
+  backlog: 5
+---
+
 # Project: Notification System
 
 **Status:** Not Started

@@ -1,3 +1,12 @@
+---
+title: Task Workflow & Processing
+type: workflow
+version: 1.0.0
+created: 2026-03-15
+updated: 2026-03-15
+description: Defines buckets, workflow rules, and session processing for task management
+---
+
 # Task Workflow & Processing
 
 ## Overview

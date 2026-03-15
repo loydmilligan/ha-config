@@ -1,3 +1,12 @@
+---
+title: Naming & Organization Conventions
+type: reference
+version: 1.0.0
+created: 2026-03-15
+updated: 2026-03-15
+description: Entity ID, friendly name, area, and label conventions for HA configuration
+---
+
 # Naming & Organization Conventions
 
 ## Areas

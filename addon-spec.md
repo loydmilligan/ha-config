@@ -189,14 +189,93 @@ A project groups related tasks toward a goal. Properties:
 
 ### 1. Parse Existing Files
 
-The addon must be able to read the current markdown format of `buckets.md` and `projects/*.md`. The format is described above in "Current File Formats."
+The addon must be able to read the current markdown format of `buckets.md` and `projects/*.md`. All files include **YAML frontmatter** (delimited by `---`) followed by markdown content.
 
-Key parsing rules:
+#### YAML Frontmatter Schema
+
+Every `.tasks/` markdown file has YAML frontmatter with these common fields:
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `title` | string | Yes | Document title |
+| `type` | enum | Yes | One of: `workflow`, `reference`, `buckets`, `project` |
+| `version` | string | Yes | Semantic version (MAJOR.MINOR.PATCH) — increment MINOR for content changes, MAJOR for structural changes |
+| `created` | date | Yes | Date the file was first created (YYYY-MM-DD) |
+| `updated` | date | Yes | Date of last modification (YYYY-MM-DD) |
+| `description` | string | Yes | One-line summary of the document's purpose |
+
+**Additional fields by type:**
+
+**`type: buckets`** (buckets.md):
+| Field | Type | Description |
+|---|---|---|
+| `task_count` | object | Keys are bucket names, values are integer counts. Kept in sync with content. |
+
+**`type: project`** (projects/*.md):
+| Field | Type | Description |
+|---|---|---|
+| `slug` | string | URL-safe project identifier (e.g., `reorg`) |
+| `status` | enum | `not_started`, `in_progress`, `complete` |
+| `goal` | string | What "done" looks like |
+| `task_count` | object | Keys: `completed`, `backlog` — integer counts |
+
+#### Example Frontmatter — buckets.md
+
+```yaml
+---
+title: Task Buckets
+type: buckets
+version: 1.2.0
+created: 2026-03-15
+updated: 2026-03-15
+description: Current state of all tasks organized by workflow bucket
+task_count:
+  active: 0
+  work_queue: 0
+  completed: 17
+  cleanup: 2
+  investigation: 4
+  planning: 9
+  brainstorm: 5
+---
+```
+
+#### Example Frontmatter — project file
+
+```yaml
+---
+title: "Project: HA Reorganization"
+type: project
+slug: reorg
+version: 1.2.0
+created: 2026-03-15
+updated: 2026-03-15
+status: in_progress
+goal: Every entity has a correct area, meaningful name, consistent naming convention...
+task_count:
+  completed: 17
+  backlog: 12
+---
+```
+
+#### Versioning Rules
+
+- **PATCH** (0.0.x): Typo fixes, wording clarifications, no functional change
+- **MINOR** (0.x.0): Task added/removed/moved, counts updated, content changes
+- **MAJOR** (x.0.0): Structural changes to the file format, new sections, schema changes
+- The addon should update `version` and `updated` when writing changes
+- The addon can use `version` to detect external changes (compare cached version vs file version)
+
+#### Markdown Content Parsing Rules
+
+After the frontmatter:
 - `buckets.md` sections are `## Bucket Name` headers
 - Tasks are `- ` prefixed lines under each section
-- Completed tasks have `**YYYY-MM-DD**: ` prefix
-- Project association is `(project: slug)` suffix
-- Project files have `**Status:**`, `**Goal:**` metadata lines
+- Completed tasks have `**YYYY-MM-DD**: ` prefix before the description
+- Project association is `(project: slug)` suffix on task lines
+- `— empty —` indicates an empty bucket
+- Project files have `## Completed` and `## Backlog` sections
+- Completed items use `- [x]` prefix, backlog items use `- [ ]` prefix
 - Backlog items have `(bucket: BucketName)` suffix
 
 ### 2. Write Back to Files

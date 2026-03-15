@@ -1,3 +1,20 @@
+---
+title: Task Buckets
+type: buckets
+version: 1.2.0
+created: 2026-03-15
+updated: 2026-03-15
+description: Current state of all tasks organized by workflow bucket
+task_count:
+  active: 0
+  work_queue: 0
+  completed: 17
+  cleanup: 2
+  investigation: 4
+  planning: 9
+  brainstorm: 5
+---
+
 # Task Buckets
 
 ## Active
