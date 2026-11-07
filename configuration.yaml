@@ -1,3 +1,4 @@
+# Managed via git: edit in ~/Projects/ha-config on mash-ubie, deploy with `ha-config deploy`
 
 # Loads default set of integrations. Do not remove.
 default_config:
