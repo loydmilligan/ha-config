@@ -3,14 +3,14 @@
   description: Left switch toggles Gallery and right switch toggles fireplace
   triggers:
   - domain: mqtt
-    device_id: e7bb18844ab765c105dc30a13d1033b4
+    device_id: 5142f430bf2b4dc7408b721fdd29e47f
     type: action
     subtype: left_press
     metadata: {}
     trigger: device
     id: Left
   - domain: mqtt
-    device_id: e7bb18844ab765c105dc30a13d1033b4
+    device_id: 5142f430bf2b4dc7408b721fdd29e47f
     type: action
     subtype: right_press
     trigger: device
@@ -28,9 +28,9 @@
         data: {}
         target:
           entity_id:
-          - light.family_room_gallery_e_s
-          - light.family_room_gallery_e_n
-          - light.family_room_gallery_n
+          - light.gallery_light_1
+          - light.gallery_light_2
+          - light.gallery_light_3
     - conditions:
       - condition: trigger
         id:
@@ -41,8 +41,8 @@
         data: {}
         target:
           entity_id:
-          - light.family_room_fireplace_e
-          - light.family_room_fireplace_w
+          - light.fireplace_light_1
+          - light.fireplace_light_2
   mode: single
 - id: '1763440155306'
   alias: Office Lights
@@ -55,36 +55,41 @@
     down : -8%'
   triggers:
   - domain: mqtt
-    device_id: 38afe12bf7761bc469e5ccb38e8c6fb0
+    device_id: 3bcc850b54ab75cc43a03f53d49d20ac
     type: action
     subtype: on_press
     metadata: {}
     trigger: device
     id: 'on'
   - domain: mqtt
-    device_id: 38afe12bf7761bc469e5ccb38e8c6fb0
+    device_id: 3bcc850b54ab75cc43a03f53d49d20ac
     type: action
     subtype: on_hold
     trigger: device
     id: on_hold
   - domain: mqtt
-    device_id: 38afe12bf7761bc469e5ccb38e8c6fb0
+    device_id: 3bcc850b54ab75cc43a03f53d49d20ac
     type: action
     subtype: off_press
     trigger: device
     id: 'off'
   - domain: mqtt
-    device_id: 38afe12bf7761bc469e5ccb38e8c6fb0
+    device_id: 3bcc850b54ab75cc43a03f53d49d20ac
     type: action
     subtype: up_press
     trigger: device
     id: up
   - domain: mqtt
-    device_id: 38afe12bf7761bc469e5ccb38e8c6fb0
+    device_id: 3bcc850b54ab75cc43a03f53d49d20ac
     type: action
     subtype: down_press
     trigger: device
     id: down
+  - domain: mqtt
+    device_id: 3bcc850b54ab75cc43a03f53d49d20ac
+    type: action
+    subtype: on_press
+    trigger: device
   conditions: []
   actions:
   - choose:
@@ -98,10 +103,10 @@
         data: {}
         target:
           entity_id:
-          - light.office_ceiling_ne
-          - light.office_ceiling_sw
-          - light.office_ceiling_nw
-          - light.office_ceiling_se
+          - light.office_light_1
+          - light.office_light_2
+          - light.office_light_3
+          - light.office_light_4
     - conditions:
       - condition: trigger
         id:
@@ -112,6 +117,7 @@
         data: {}
         target:
           entity_id: light.kitchen_downlights
+        enabled: false
     - conditions:
       - condition: trigger
         id:
@@ -123,10 +129,10 @@
           brightness_step_pct: -8
         target:
           entity_id:
-          - light.office_ceiling_ne
-          - light.office_ceiling_se
-          - light.office_ceiling_nw
-          - light.office_ceiling_sw
+          - light.office_light_1
+          - light.office_light_2
+          - light.office_light_3
+          - light.office_light_4
     - conditions:
       - condition: trigger
         id:
@@ -138,10 +144,10 @@
           brightness_step_pct: 8
         target:
           entity_id:
-          - light.office_ceiling_ne
-          - light.office_ceiling_se
-          - light.office_ceiling_nw
-          - light.office_ceiling_sw
+          - light.office_light_1
+          - light.office_light_2
+          - light.office_light_3
+          - light.office_light_4
     - conditions:
       - condition: trigger
         id:
@@ -153,28 +159,33 @@
           transition: 4
         target:
           entity_id:
-          - light.office_ceiling_ne
-          - light.office_ceiling_se
-          - light.office_ceiling_nw
-          - light.office_ceiling_sw
+          - light.office_light_1
+          - light.office_light_2
+          - light.office_light_3
+          - light.office_light_4
   mode: single
 - id: '1763521696392'
   alias: Bedroom Headboard Lights
   description: ''
   triggers:
   - domain: mqtt
-    device_id: df62391347873a487414acb07247c442
+    device_id: 14dec868d1886a7d7e05f7658e44f8c1
     type: action
     subtype: single
     metadata: {}
     trigger: device
     id: single
   - domain: mqtt
-    device_id: df62391347873a487414acb07247c442
+    device_id: 14dec868d1886a7d7e05f7658e44f8c1
     type: action
     subtype: double
     trigger: device
     id: double
+  - domain: mqtt
+    device_id: 14dec868d1886a7d7e05f7658e44f8c1
+    type: action
+    subtype: single
+    trigger: device
   conditions: []
   actions:
   - choose:
@@ -193,7 +204,8 @@
           transition: 3
           brightness_pct: 39
         target:
-          entity_id: light.bedroom_headboard
+          entity_id:
+          - light.headboard_light
     - conditions:
       - condition: trigger
         id:
@@ -204,7 +216,8 @@
         data:
           transition: 3
         target:
-          entity_id: light.bedroom_headboard
+          entity_id:
+          - light.headboard_light
   mode: single
 - id: '1765285365878'
   alias: Closet lights

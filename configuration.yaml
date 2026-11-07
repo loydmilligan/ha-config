@@ -25,7 +25,7 @@ http:
 #    port: 8554
 homeassistant:
   external_url: https://ha.mattmariani.com
-  internal_url: http://192.168.6.8:8123
+  internal_url: http://192.168.6.38:8123
 #  auth_providers:
 #    - type: trusted_networks
 #      trusted_networks:
@@ -74,3 +74,22 @@ media_player:
         state: sensor.lyric_scroll_old_chromecast_state
         media_title: sensor.lyric_scroll_old_chromecast_title
         media_artist: sensor.lyric_scroll_old_chromecast_artist
+mqtt:
+    sensor:
+    - name: "Laptop Thermal Object"
+      unique_id: "laptop_thermal_object"
+      state_topic: "sensors/laptop_thermal/mlx90614"
+      value_template: "{{ value_json.object_temp_c }}"
+      unit_of_measurement: "°C"
+      device_class: temperature
+      state_class: measurement
+      json_attributes_topic: "sensors/laptop_thermal"
+
+    - name: "Laptop Thermal Ambient"
+      unique_id: "laptop_thermal_ambient"
+      state_topic: "sensors/laptop_thermal/mlx90614"
+      value_template: "{{ value_json.ambient_temp_c }}"
+      unit_of_measurement: "°C"
+      device_class: temperature
+      state_class: measurement
+      json_attributes_topic: "sensors/laptop_thermal"
