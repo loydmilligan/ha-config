@@ -643,9 +643,10 @@
 - id: 'pocket_sign_phone_battery_low'
   alias: Pocket Sign - phone battery low
   description: >-
-    When Matt's phone drops below 20% and isn't charging, add a card to the
-    Office TV sign rotation (updated in place as it drops). Remove it once the
-    phone is charging or full. Needs Pocket Sign 0.5.0 (level/key).
+    When Matt's phone drops below 20% and isn't charging, show a note on the
+    Office TV sign (updated in place as it drops). The first drop below 20%
+    also takes over the Chromecast; later updates don't. Remove the note once
+    the phone is charging or full. Needs Pocket Sign 0.5.0 (level/key).
   triggers:
   - trigger: state
     entity_id: sensor.pixel_11_pro_battery_level
@@ -684,6 +685,7 @@
           display: 027YiRhj
           text: "Matt's phone battery {{ states('sensor.pixel_11_pro_battery_level') }}%"
           duration: 0
-          level: rotation
+          level: note
           key: phone-battery
+          cast: "{{ trigger.from_state is not none and (trigger.from_state.state | float(0)) >= 20 }}"
   mode: queued

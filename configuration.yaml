@@ -50,7 +50,8 @@ rest_command:
     # ("Bearer <API_TOKEN>", set with `ha-config secret pocket_sign_bearer`).
     # sign_message: display, text; optional duration (seconds, default 60, 0 = until
     # cleared), level (interrupt|note|rotation), key (e.g. doorbell, now-playing).
-    # level and key need Pocket Sign 0.5.0; leave them out on older servers.
+    # level and key need Pocket Sign 0.5.0. cast: true also takes over the
+    # display's Chromecast (interrupts whatever is playing), so use it sparingly.
     sign_message:
       url: "https://sign.dogbelly.app/api/v1/displays/{{ display }}/message"
       method: POST
@@ -63,6 +64,7 @@ rest_command:
         {% if secs > 0 %}{% set p = dict(p, durationSec=secs) %}{% endif %}
         {% if level is defined %}{% set p = dict(p, level=level) %}{% endif %}
         {% if key is defined %}{% set p = dict(p, key=key) %}{% endif %}
+        {% if cast is defined and (cast | string | lower) == 'true' %}{% set p = dict(p, cast=true) %}{% endif %}
         {{ p | tojson }}
     # sign_clear: display, key. Removes that keyed item (Pocket Sign 0.5.0+).
     sign_clear:
