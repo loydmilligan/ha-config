@@ -38,6 +38,11 @@ homeassistant:
 #      allow_bypass_login: true
 #    - type: homeassistant    # Keep normal login for other devices
 
+input_boolean:
+  pocket_sign_battery_test:
+    name: Battery warning test mode
+    icon: mdi:battery-alert-variant-outline
+
 rest_command:
     lyric_scroll_play:
       url: "http://lyric-scroll.mattmariani.com/api/ma/play"
