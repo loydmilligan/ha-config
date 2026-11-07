@@ -45,6 +45,32 @@ rest_command:
       content_type: "application/json"
       payload: '{"track": "{{ track }}", "player": "{{ player }}"}'
 
+    # Pocket Sign (sign.dogbelly.app). Display ids: Office TV 027YiRhj,
+    # Matts-phone 5UpAsYTj, Pixel 11 MRaS5WKg. Token: !secret pocket_sign_bearer
+    # ("Bearer <API_TOKEN>", set with `ha-config secret pocket_sign_bearer`).
+    # sign_message: display, text; optional duration (seconds, default 60, 0 = until
+    # cleared), level (interrupt|note|rotation), key (e.g. doorbell, now-playing).
+    # level and key need Pocket Sign 0.5.0; leave them out on older servers.
+    sign_message:
+      url: "https://sign.dogbelly.app/api/v1/displays/{{ display }}/message"
+      method: POST
+      headers:
+        Authorization: !secret pocket_sign_bearer
+      content_type: "application/json"
+      payload: >-
+        {% set secs = (duration | default(60)) | int %}
+        {% set p = {'text': text} %}
+        {% if secs > 0 %}{% set p = dict(p, durationSec=secs) %}{% endif %}
+        {% if level is defined %}{% set p = dict(p, level=level) %}{% endif %}
+        {% if key is defined %}{% set p = dict(p, key=key) %}{% endif %}
+        {{ p | tojson }}
+    # sign_clear: display, key. Removes that keyed item (Pocket Sign 0.5.0+).
+    sign_clear:
+      url: "https://sign.dogbelly.app/api/v1/displays/{{ display }}/keys/{{ key }}"
+      method: DELETE
+      headers:
+        Authorization: !secret pocket_sign_bearer
+
 media_player:
     - platform: universal
       name: Lyric Scroll Old Chromecast
