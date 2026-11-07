@@ -44,3 +44,7 @@ custom_components/hacs/
 .HA_VERSION
 __pycache__/
 *.pyc
+
+# HA backups (full config archives) never go in git
+backups/
+*.tar
