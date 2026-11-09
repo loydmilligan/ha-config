@@ -35,7 +35,7 @@ DEFAULTS = {
     "provider": "openrouter",
     "model": "anthropic/claude-haiku-5.5",
     "request_timeout_seconds": 20,
-    "max_output_tokens": 150,
+    "max_output_tokens": 200,
     "image": {"max_dimension": 512, "jpeg_quality": 70, "max_age_seconds": 20},
     "classification": {"detect_dog": True, "detect_characteristics": True, "household_matching": True},
     "change_detection": {"enabled": True, "pixel_delta": 18, "min_changed_fraction": 0.02, "max_reuse_seconds": 60},
@@ -111,7 +111,7 @@ def build_prompt(cfg):
     if c["detect_dog"]:
         text += ", determine whether a dog is present"
     if c["detect_characteristics"]:
-        text += ", and report visible characteristics of each person"
+        text += ", and report visible characteristics of each person (clothing: main color, one word)"
     return text + ". Return only structured JSON. Use unknown when uncertain. Do not infer identity."
 
 
@@ -122,7 +122,7 @@ def build_schema(cfg):
         "properties": {
             "hair": {"type": "string", "enum": list(HAIR)},
             "height": {"type": "string", "enum": list(HEIGHT)},
-            "clothing": {"type": "string"},
+            "clothing": {"type": "string", "description": "main color, one word"},
         },
         "required": ["hair", "height", "clothing"],
         "additionalProperties": False,
@@ -190,10 +190,11 @@ def call_model(cfg, model, jpeg, key, post=http_post):
     content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
     if content.startswith("```"):
         content = content.strip("`").removeprefix("json").strip()
+    finish = (data.get("choices") or [{}])[0].get("finish_reason")
     try:
         return validate_response(json.loads(content), cfg), usage, duration
     except ValueError as err:
-        raise InvalidResponse(str(err), usage, duration) from None
+        raise InvalidResponse(f"{err}; finish={finish}", usage, duration) from None
 
 
 class InvalidResponse(Exception):
@@ -401,7 +402,7 @@ def _classify(cfg, image, camera, source, now, post, profiles, key, fetch):
         key = key if key is not None else api_key(cfg)
         obs, usage, duration = call_model(cfg, cfg["model"], jpeg, key, post)
     except InvalidResponse as err:
-        return _failed(store, base, "invalid_response", "AI returned an invalid answer", now, err.usage, err.duration, fetch)
+        return _failed(store, base, "invalid_response", f"AI returned an invalid answer ({str(err)[:80]})", now, err.usage, err.duration, fetch)
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, IndexError, TypeError, AttributeError) as err:
         code = getattr(err, "code", None)
         message = f"AI call failed (HTTP {code})" if code else f"AI call failed ({type(err).__name__})"
