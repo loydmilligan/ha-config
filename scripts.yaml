@@ -65,11 +65,32 @@ play_to_lyric_scroll:
             player: "media_player.old_chromecast"
 office_presence_check:
   alias: Office presence check (AI)
-  description: Sends one office camera snapshot to the AI and returns whether a person is in the room.
+  description: Sends one office camera snapshot to the AI, records the answer for the Office Debug dashboard, and returns whether a person is in the room.
   icon: mdi:account-search
   mode: parallel
+  fields:
+    source:
+      description: What asked for this check (shown on the dashboard).
+      example: motion check 1 of 12
   sequence:
+  - action: input_select.select_option
+    target:
+      entity_id: input_select.office_ai_last_answer
+    data:
+      option: checking
+  - action: input_text.set_value
+    target:
+      entity_id: input_text.office_ai_last_source
+    data:
+      value: "{{ (source | default('manual'))[:100] }}"
+  - action: camera.snapshot
+    continue_on_error: true
+    target:
+      entity_id: camera.office_camera
+    data:
+      filename: /media/office_debug/last.jpg
   - action: ai_task.generate_data
+    continue_on_error: true
     data:
       task_name: Office presence check
       entity_id: ai_task.anthropic_claude_haiku_5_5
@@ -93,6 +114,38 @@ office_presence_check:
       - media_content_id: media-source://camera/camera.office_camera
         media_content_type: image/jpeg
     response_variable: result
+  - if:
+    - condition: template
+      value_template: '{{ result is not defined or result.data is not defined or result.data.person_present is not defined }}'
+    then:
+    - action: input_select.select_option
+      target:
+        entity_id: input_select.office_ai_last_answer
+      data:
+        option: error
+    - action: input_text.set_value
+      target:
+        entity_id: input_text.office_ai_last_reason
+      data:
+        value: The AI call failed or returned no answer. Check the Home Assistant log.
+    - action: counter.increment
+      target:
+        entity_id: counter.office_ai_checks_error
+    - stop: AI call failed
+      error: true
+  - action: input_text.set_value
+    target:
+      entity_id: input_text.office_ai_last_reason
+    data:
+      value: '{{ (result.data.reason | string)[:250] }}'
+  - action: input_select.select_option
+    target:
+      entity_id: input_select.office_ai_last_answer
+    data:
+      option: "{{ 'person' if result.data.person_present else 'empty' }}"
+  - action: counter.increment
+    target:
+      entity_id: "{{ 'counter.office_ai_checks_person' if result.data.person_present else 'counter.office_ai_checks_empty' }}"
   - variables:
       out:
         person_present: '{{ result.data.person_present }}'

@@ -51,6 +51,39 @@ input_boolean:
     name: Office lights last turned off automatically
     icon: mdi:lightbulb-auto-outline
 
+# Debug record of the office AI presence check (shown on the Office Debug dashboard).
+input_select:
+  office_ai_last_answer:
+    name: Office AI last answer
+    icon: mdi:robot-outline
+    options:
+      - waiting
+      - checking
+      - person
+      - empty
+      - error
+
+input_text:
+  office_ai_last_reason:
+    name: Office AI last reason
+    icon: mdi:comment-text-outline
+    max: 255
+  office_ai_last_source:
+    name: Office AI last check source
+    icon: mdi:source-branch
+    max: 100
+
+counter:
+  office_ai_checks_person:
+    name: Office AI answers - person
+    icon: mdi:account-check
+  office_ai_checks_empty:
+    name: Office AI answers - empty
+    icon: mdi:account-off
+  office_ai_checks_error:
+    name: Office AI answers - failed
+    icon: mdi:alert-circle
+
 rest_command:
     lyric_scroll_play:
       url: "http://lyric-scroll.mattmariani.com/api/ma/play"
