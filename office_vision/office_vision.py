@@ -36,6 +36,7 @@ DEFAULTS = {
     "model": "anthropic/claude-haiku-5.5",
     "request_timeout_seconds": 20,
     "max_output_tokens": 200,
+    "disable_reasoning_for": ["anthropic/claude-haiku-5.5"],
     "image": {"max_dimension": 512, "jpeg_quality": 70, "max_age_seconds": 20},
     "classification": {"detect_dog": True, "detect_characteristics": True, "household_matching": True},
     "change_detection": {"enabled": True, "pixel_delta": 18, "min_changed_fraction": 0.02, "max_reuse_seconds": 60},
@@ -107,7 +108,7 @@ def scene_changed(old, new, pixel_delta, min_changed_fraction):
 
 def build_prompt(cfg):
     c = cfg["classification"]
-    text = "Analyze this camera image. Count real visible people (0-2, use 2 for more; ignore screens and photos)"
+    text = "Analyze this camera image. Count real visible people (0-2, use 2 for more; ignore screens and photos; include anyone seated, still or partly visible)"
     if c["detect_dog"]:
         text += ", determine whether a dog is present"
     if c["detect_characteristics"]:
@@ -182,6 +183,8 @@ def call_model(cfg, model, jpeg, key, post=http_post):
             {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()}},
         ]}],
     }
+    if model in cfg.get("disable_reasoning_for", []):
+        body["reasoning"] = {"enabled": False}
     headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json", "User-Agent": USER_AGENT, "X-Title": "HA Office Vision"}
     start = time.monotonic()
     data = post(API_URL, body, headers, cfg["request_timeout_seconds"])

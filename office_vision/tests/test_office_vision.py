@@ -210,6 +210,13 @@ class ClassifyTests(Base):
         self.assertTrue(body["response_format"]["json_schema"]["strict"])
         self.assertTrue(body["provider"]["require_parameters"])
         self.assertNotIn("temperature", body)  # with require_parameters, it leaves no usable endpoint
+        self.assertEqual(body["reasoning"], {"enabled": False})
+
+    def test_reasoning_left_alone_for_other_models(self):
+        cfg = ov.merge(self.cfg, {"model": "other/model"})
+        post = reply(GOOD)
+        self.run_it(post, cfg=cfg)
+        self.assertNotIn("reasoning", post.bodies[0])
 
 
 class TotalsTests(Base):
