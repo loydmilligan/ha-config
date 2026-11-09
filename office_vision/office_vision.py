@@ -173,7 +173,6 @@ def call_model(cfg, model, jpeg, key, post=http_post):
     """Return (validated observation, usage dict, duration ms). Raises on failure."""
     body = {
         "model": model,
-        "temperature": 0,
         "max_tokens": cfg["max_output_tokens"],
         "usage": {"include": True},
         "provider": {"data_collection": "deny", "require_parameters": True},

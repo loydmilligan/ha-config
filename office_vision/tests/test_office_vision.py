@@ -208,6 +208,8 @@ class ClassifyTests(Base):
         body = post.bodies[0]
         self.assertEqual(body["provider"]["data_collection"], "deny")
         self.assertTrue(body["response_format"]["json_schema"]["strict"])
+        self.assertTrue(body["provider"]["require_parameters"])
+        self.assertNotIn("temperature", body)  # with require_parameters, it leaves no usable endpoint
 
 
 class TotalsTests(Base):
