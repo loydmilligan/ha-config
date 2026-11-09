@@ -698,3 +698,118 @@
           key: phone-battery
           cast: "{{ crossed }}"
   mode: queued
+- id: office_lights_ai
+  alias: Office Lights by AI Camera
+  description: 'Motion plus an AI snapshot check turns the lights on. While they are
+    on, the AI rechecks every 5 minutes; two "no person" answers two minutes apart
+    turn them off. Ignores motion for 20 seconds after the lights go off. If a person
+    turned them off, stays off for 30 minutes.'
+  triggers:
+  - trigger: state
+    entity_id: binary_sensor.office_camera_motion_detected
+    to: 'on'
+    id: motion
+  - trigger: time_pattern
+    minutes: /5
+    id: recheck
+  conditions: []
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id: motion
+      - condition: state
+        entity_id:
+        - light.office_light_1
+        - light.office_light_2
+        - light.office_light_3
+        - light.office_light_4
+        state: 'off'
+        for: 00:00:20
+      - condition: or
+        conditions:
+        - condition: state
+          entity_id: input_boolean.office_lights_auto_off
+          state: 'on'
+        - condition: state
+          entity_id:
+          - light.office_light_1
+          - light.office_light_2
+          - light.office_light_3
+          - light.office_light_4
+          state: 'off'
+          for: 00:30:00
+      sequence:
+      - action: script.office_presence_check
+        response_variable: first
+        continue_on_error: true
+      - if:
+        - condition: template
+          value_template: '{{ first is defined and first.person_present == true }}'
+        then:
+        - action: light.turn_on
+          target:
+            entity_id:
+            - light.office_light_1
+            - light.office_light_2
+            - light.office_light_3
+            - light.office_light_4
+      - delay: 00:01:00
+    - conditions:
+      - condition: trigger
+        id: recheck
+      - condition: state
+        entity_id:
+        - light.office_light_1
+        - light.office_light_2
+        - light.office_light_3
+        - light.office_light_4
+        state: 'on'
+        match: any
+      sequence:
+      - action: script.office_presence_check
+        response_variable: first
+        continue_on_error: true
+      - if:
+        - condition: template
+          value_template: '{{ first is defined and first.person_present == false }}'
+        then:
+        - delay: 00:02:00
+        - action: script.office_presence_check
+          response_variable: second
+          continue_on_error: true
+        - if:
+          - condition: template
+            value_template: '{{ second is defined and second.person_present == false
+              }}'
+          then:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.office_lights_auto_off
+          - action: light.turn_off
+            target:
+              entity_id:
+              - light.office_light_1
+              - light.office_light_2
+              - light.office_light_3
+              - light.office_light_4
+  mode: single
+  max_exceeded: silent
+- id: office_lights_ai_mark_on
+  alias: Office Lights by AI Camera - clear auto-off flag
+  description: Any time the office lights come on, forget that they were last turned off automatically.
+  triggers:
+  - trigger: state
+    entity_id:
+    - light.office_light_1
+    - light.office_light_2
+    - light.office_light_3
+    - light.office_light_4
+    to: 'on'
+  conditions: []
+  actions:
+  - action: input_boolean.turn_off
+    target:
+      entity_id: input_boolean.office_lights_auto_off
+  mode: single
+  max_exceeded: silent

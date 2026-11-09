@@ -63,3 +63,39 @@ play_to_lyric_scroll:
           data:
             track: "{{ track }}"
             player: "media_player.old_chromecast"
+office_presence_check:
+  alias: Office presence check (AI)
+  description: Sends one office camera snapshot to the AI and returns whether a person is in the room.
+  icon: mdi:account-search
+  mode: parallel
+  sequence:
+  - action: ai_task.generate_data
+    data:
+      task_name: Office presence check
+      entity_id: ai_task.anthropic_claude_haiku_5_5
+      instructions: This is a snapshot from a fixed camera in a home office. It may
+        be a night-vision image. Is at least one real person physically present in
+        the room right now? Count someone sitting still or partly visible. Do not
+        count people shown on screens, posters, or photos. Do not describe or identify
+        anyone. In reason, say in under 15 words what supports your answer.
+      structure:
+        person_present:
+          description: True if a real person is in the room
+          required: true
+          selector:
+            boolean: {}
+        reason:
+          description: Under 15 words
+          required: true
+          selector:
+            text: {}
+      attachments:
+      - media_content_id: media-source://camera/camera.office_camera
+        media_content_type: image/jpeg
+    response_variable: result
+  - variables:
+      out:
+        person_present: '{{ result.data.person_present }}'
+        reason: '{{ result.data.reason }}'
+  - stop: Done
+    response_variable: out
