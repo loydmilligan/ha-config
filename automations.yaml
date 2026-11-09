@@ -740,21 +740,30 @@
           state: 'off'
           for: 00:30:00
       sequence:
-      - action: script.office_presence_check
-        response_variable: first
-        continue_on_error: true
-      - if:
-        - condition: template
-          value_template: '{{ first is defined and first.person_present == true }}'
-        then:
-        - action: light.turn_on
-          target:
-            entity_id:
-            - light.office_light_1
-            - light.office_light_2
-            - light.office_light_3
-            - light.office_light_4
-      - delay: 00:01:00
+      - repeat:
+          while:
+          - condition: template
+            value_template: '{{ repeat.index <= 12 and is_state(''binary_sensor.office_camera_motion_detected'',
+              ''on'') }}'
+          sequence:
+          - delay: 00:00:02
+          - action: script.office_presence_check
+            response_variable: first
+            continue_on_error: true
+          - if:
+            - condition: template
+              value_template: '{{ first is defined and first.person_present == true
+                }}'
+            then:
+            - action: light.turn_on
+              target:
+                entity_id:
+                - light.office_light_1
+                - light.office_light_2
+                - light.office_light_3
+                - light.office_light_4
+            - stop: Person found
+          - delay: 00:00:02
     - conditions:
       - condition: trigger
         id: recheck
