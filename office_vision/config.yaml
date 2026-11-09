@@ -1,0 +1,36 @@
+# Office camera vision classifier. Runtime switches that you may want to change
+# from the dashboard (on/off, poll interval, absence confirmations) are Home
+# Assistant helpers; everything else lives here. No secrets in this file: the
+# API key comes from `openrouter_api_key` in secrets.yaml.
+vision:
+  provider: openrouter
+  model: anthropic/claude-haiku-5.5   # interim: the only model tested on real frames so far
+  request_timeout_seconds: 20
+  max_output_tokens: 150
+
+  image:
+    max_dimension: 512
+    jpeg_quality: 70
+    max_age_seconds: 20     # an older file means the camera snapshot failed
+
+  classification:
+    detect_dog: true
+    detect_characteristics: true
+    household_matching: true
+
+  change_detection:
+    enabled: true
+    pixel_delta: 18              # 0-255 brightness change that counts for one cell
+    min_changed_fraction: 0.02   # share of cells that must change
+    max_reuse_seconds: 60        # similarity alone never extends presence beyond this
+
+  cost:
+    daily_limit_usd: 0.25
+
+  backoff:
+    base_seconds: 30
+    max_seconds: 600
+
+  matching:
+    min_score: 1
+    min_margin: 1

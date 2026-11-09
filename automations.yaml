@@ -770,6 +770,9 @@
       - condition: trigger
         id: recheck
       - condition: state
+        entity_id: input_boolean.office_vision_enabled
+        state: 'off'
+      - condition: state
         entity_id:
         - light.office_light_1
         - light.office_light_2
@@ -827,4 +830,117 @@
     target:
       entity_id: input_boolean.office_lights_auto_off
   mode: single
+  max_exceeded: silent
+- id: office_vision_poll
+  alias: Office Vision Poll
+  description: While the lights are on and motion has stopped, checks the room at the configured interval. Only valid empty answers count toward turning the lights off; a failed check never does.
+  trace:
+    stored_traces: 20
+  triggers:
+  - trigger: time_pattern
+    seconds: /10
+    id: tick
+  - trigger: state
+    entity_id: binary_sensor.office_camera_motion_detected
+    to: 'on'
+    id: motion
+  conditions:
+  - condition: state
+    entity_id: input_boolean.office_vision_enabled
+    state: 'on'
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id: motion
+      sequence:
+      - action: counter.reset
+        target:
+          entity_id: counter.office_vision_absent_streak
+      - action: input_select.select_option
+        target:
+          entity_id: input_select.office_presence_state
+        data:
+          option: motion
+    - conditions:
+      - condition: trigger
+        id: tick
+      - condition: state
+        entity_id: binary_sensor.office_camera_motion_detected
+        state: 'off'
+      - condition: state
+        entity_id:
+        - light.office_light_1
+        - light.office_light_2
+        - light.office_light_3
+        - light.office_light_4
+        state: 'on'
+        match: any
+      - condition: template
+        value_template: "{{ as_timestamp(now()) - as_timestamp(states('input_datetime.office_vision_last_poll'), 0) >= states('input_number.office_vision_poll_seconds') | float(30) - 2 }}"
+      sequence:
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.office_vision_last_poll
+        data:
+          timestamp: "{{ now().timestamp() }}"
+      - action: script.office_vision_check
+        data:
+          source: "{{ states('input_number.office_vision_poll_seconds') | int(30) }}-second check"
+        response_variable: check
+        continue_on_error: true
+      - choose:
+        - conditions:
+          - condition: template
+            value_template: "{{ check is defined and check.person_present == true }}"
+          sequence:
+          - action: counter.reset
+            target:
+              entity_id: counter.office_vision_absent_streak
+          - action: input_select.select_option
+            target:
+              entity_id: input_select.office_presence_state
+            data:
+              option: vision_present
+        - conditions:
+          - condition: template
+            value_template: "{{ check is defined and check.person_present == false and check.reused != true }}"
+          sequence:
+          - action: counter.increment
+            target:
+              entity_id: counter.office_vision_absent_streak
+          - if:
+            - condition: template
+              value_template: "{{ states('counter.office_vision_absent_streak') | int(0) >= states('input_number.office_vision_absences_required') | int(2) and is_state('binary_sensor.office_camera_motion_detected', 'off') }}"
+            then:
+            - action: input_boolean.turn_on
+              target:
+                entity_id: input_boolean.office_lights_auto_off
+            - action: light.turn_off
+              target:
+                entity_id:
+                - light.office_light_1
+                - light.office_light_2
+                - light.office_light_3
+                - light.office_light_4
+            - action: counter.reset
+              target:
+                entity_id: counter.office_vision_absent_streak
+            - action: input_select.select_option
+              target:
+                entity_id: input_select.office_presence_state
+              data:
+                option: vision_absent
+        - conditions:
+          - condition: template
+            value_template: "{{ check is defined and check.person_present == false }}"
+          sequence: []
+        default:
+        - action: input_select.select_option
+          target:
+            entity_id: input_select.office_presence_state
+          data:
+            option: unknown
+  mode: queued
+  max: 5
   max_exceeded: silent

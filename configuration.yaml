@@ -50,9 +50,42 @@ input_boolean:
   office_lights_auto_off:
     name: Office lights last turned off automatically
     icon: mdi:lightbulb-auto-outline
+  # Off = the original ai_task check with its 5-minute recheck.
+  office_vision_enabled:
+    name: Office vision classifier
+    icon: mdi:eye-check-outline
+
+input_number:
+  office_vision_poll_seconds:
+    name: Office vision poll interval
+    icon: mdi:timer-outline
+    min: 10
+    max: 600
+    step: 5
+    unit_of_measurement: s
+  office_vision_absences_required:
+    name: Office vision empty checks before lights off
+    icon: mdi:counter
+    min: 1
+    max: 10
+    step: 1
+
+input_datetime:
+  office_vision_last_poll:
+    name: Office vision last poll
+    has_date: true
+    has_time: true
 
 # Debug record of the office AI presence check (shown on the Office Debug dashboard).
 input_select:
+  office_presence_state:
+    name: Office presence state
+    icon: mdi:account-question
+    options:
+      - unknown
+      - motion
+      - vision_present
+      - vision_absent
   office_ai_last_answer:
     name: Office AI last answer
     icon: mdi:robot-outline
@@ -83,6 +116,50 @@ counter:
   office_ai_checks_error:
     name: Office AI answers - failed
     icon: mdi:alert-circle
+  office_vision_absent_streak:
+    name: Office vision empty checks in a row
+    icon: mdi:account-off-outline
+    restore: false
+
+shell_command:
+  office_vision_classify: "python3 /config/office_vision/office_vision.py classify --image /media/office_debug/last.jpg --camera office --source '{{ source }}'"
+
+command_line:
+  - sensor:
+      name: Office Vision Cost
+      unique_id: office_vision_cost
+      icon: mdi:currency-usd
+      command: python3 /config/office_vision/office_vision.py totals
+      command_timeout: 20
+      scan_interval: 300
+      unit_of_measurement: USD
+      value_template: "{{ '%.6f' | format(value_json.today | float(0)) }}"
+      json_attributes:
+        - today
+        - week
+        - month
+        - today_calls
+        - week_calls
+        - month_calls
+        - today_reused
+        - daily_limit
+        - failures
+        - configured_model
+        - latest_status
+        - latest_summary
+        - last_cost
+        - last_cost_source
+        - last_model
+        - last_ts
+        - last_input_tokens
+        - last_output_tokens
+        - last_duration_ms
+        - last_width
+        - last_height
+        - people
+        - dog
+        - member
+        - uncertainty
 
 rest_command:
     lyric_scroll_play:

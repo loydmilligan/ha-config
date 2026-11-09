@@ -1,0 +1,11 @@
+# Copy to household.yaml (gitignored, because the repo is public) and describe
+# the two people. Illustrative values only. Use unknown for anything unreliable.
+# hair: short | medium | long | unknown
+# relative_height: taller | shorter | unknown
+household:
+  member_a:
+    hair: unknown
+    relative_height: unknown
+  member_b:
+    hair: unknown
+    relative_height: unknown

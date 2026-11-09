@@ -73,6 +73,17 @@ office_presence_check:
       description: What asked for this check (shown on the dashboard).
       example: motion check 1 of 12
   sequence:
+  - if:
+    - condition: state
+      entity_id: input_boolean.office_vision_enabled
+      state: 'on'
+    then:
+    - action: script.office_vision_check
+      data:
+        source: "{{ source | default('manual') }}"
+      response_variable: vision_result
+    - stop: Answered by the vision classifier
+      response_variable: vision_result
   - action: input_select.select_option
     target:
       entity_id: input_select.office_ai_last_answer
@@ -150,5 +161,70 @@ office_presence_check:
       out:
         person_present: '{{ result.data.person_present }}'
         reason: '{{ result.data.reason }}'
+  - stop: Done
+    response_variable: out
+office_vision_check:
+  alias: Office vision check
+  description: Snapshot, classify through office_vision.py, record the result. person_present is null on any failure.
+  icon: mdi:eye-check-outline
+  mode: parallel
+  fields:
+    source:
+      description: What asked for this check (shown on the dashboard).
+      example: 30-second check
+  sequence:
+  - action: input_select.select_option
+    target:
+      entity_id: input_select.office_ai_last_answer
+    data:
+      option: checking
+  - action: input_text.set_value
+    target:
+      entity_id: input_text.office_ai_last_source
+    data:
+      value: "{{ (source | default('manual'))[:100] }}"
+  - action: camera.snapshot
+    continue_on_error: true
+    target:
+      entity_id: camera.office_camera
+    data:
+      filename: /media/office_debug/last.jpg
+  - action: shell_command.office_vision_classify
+    continue_on_error: true
+    data:
+      source: "{{ (source | default('manual')) | replace(\"'\", '') }}"
+    response_variable: shell
+  - variables:
+      vision: "{{ (shell.stdout if shell is defined and shell.stdout is defined else '') | from_json(default={}) }}"
+      status: "{{ vision.get('status', 'internal_error') }}"
+      present: "{{ vision.get('person_present') }}"
+      failed: "{{ vision.get('person_present') not in [true, false] }}"
+  - action: input_text.set_value
+    target:
+      entity_id: input_text.office_ai_last_reason
+    data:
+      value: "{{ (vision.get('summary', 'The classifier returned nothing. Check the Home Assistant log.') | string)[:250] }}"
+  - action: input_select.select_option
+    target:
+      entity_id: input_select.office_ai_last_answer
+    data:
+      option: "{{ 'error' if failed else ('person' if present else 'empty') }}"
+  - if:
+    - condition: template
+      value_template: "{{ status not in ['backoff', 'busy', 'budget_exhausted', 'reused'] }}"
+    then:
+    - action: counter.increment
+      target:
+        entity_id: "{{ 'counter.office_ai_checks_error' if failed else ('counter.office_ai_checks_person' if present else 'counter.office_ai_checks_empty') }}"
+  - action: homeassistant.update_entity
+    continue_on_error: true
+    target:
+      entity_id: sensor.office_vision_cost
+  - variables:
+      out:
+        person_present: "{{ vision.get('person_present') }}"
+        status: "{{ status }}"
+        reused: "{{ vision.get('reused', false) }}"
+        summary: "{{ vision.get('summary', '') }}"
   - stop: Done
     response_variable: out

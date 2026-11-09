@@ -48,3 +48,8 @@ __pycache__/
 # HA backups (full config archives) never go in git
 backups/
 *.tar
+
+# Office vision: household description stays private (public repo)
+office_vision/household.yaml
+*.db-journal
+__pycache__/
