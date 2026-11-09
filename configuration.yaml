@@ -18,12 +18,16 @@ http:
     - 172.30.32.0/23
     - 192.168.4.0/22
     - 172.30.232.0/23
-#amcrest:
-#  - host: 192.168.4.196
-#    stream_source: rtsp
-#    username: admin
-#    password: !secret amcrest_password
-#    port: 8554
+amcrest:
+  - host: 192.168.4.196
+    name: Office Camera
+    username: admin
+    password: !secret amcrest_password
+    port: 80
+    stream_source: rtsp
+    binary_sensors:
+      - motion_detected
+      - online
 homeassistant:
   external_url: https://ha.mattmariani.com
   internal_url: http://192.168.6.38:8123
@@ -42,6 +46,10 @@ input_boolean:
   pocket_sign_battery_test:
     name: Battery warning test mode
     icon: mdi:battery-alert-variant-outline
+  # On = the camera automation (not a person) last turned the office lights off.
+  office_lights_auto_off:
+    name: Office lights last turned off automatically
+    icon: mdi:lightbulb-auto-outline
 
 rest_command:
     lyric_scroll_play:
