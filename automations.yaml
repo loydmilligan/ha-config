@@ -697,6 +697,9 @@
           level: note
           key: phone-battery
           cast: "{{ crossed }}"
+          theme: neon
+          mode: bounce
+          bounce: perfect
   mode: queued
 - id: office_lights_ai
   alias: Office Lights by AI Camera
