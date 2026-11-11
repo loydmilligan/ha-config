@@ -43,6 +43,13 @@ homeassistant:
 #    - type: homeassistant    # Keep normal login for other devices
 
 input_boolean:
+  # Doorbell AI: which of /media/doorbell/a.jpg or b.jpg holds the newest 5-minute frame.
+  doorbell_frame_slot:
+    name: Doorbell frame slot B
+    icon: mdi:swap-horizontal
+  doorbell_change_detected:
+    name: Doorbell scene changed
+    icon: mdi:compare
   pocket_sign_battery_test:
     name: Battery warning test mode
     icon: mdi:battery-alert-variant-outline
@@ -71,6 +78,14 @@ input_number:
     step: 1
 
 input_datetime:
+  doorbell_last_check:
+    name: Doorbell last change check
+    has_date: true
+    has_time: true
+  doorbell_last_change:
+    name: Doorbell last change seen
+    has_date: true
+    has_time: true
   office_vision_last_poll:
     name: Office vision last poll
     has_date: true
@@ -97,6 +112,14 @@ input_select:
       - error
 
 input_text:
+  doorbell_change_summary:
+    name: Doorbell what changed
+    icon: mdi:text-box-search-outline
+    max: 255
+  doorbell_ring_description:
+    name: Doorbell last visitor
+    icon: mdi:doorbell
+    max: 255
   office_ai_last_reason:
     name: Office AI last reason
     icon: mdi:comment-text-outline
@@ -122,6 +145,8 @@ counter:
     restore: false
 
 shell_command:
+  # Frame from the wired Nest doorbell via go2rtc on CM4 (~/docker/go2rtc, loopback 127.0.0.1:1984).
+  doorbell_frame: "sh -c 'mkdir -p /media/doorbell && for t in 50 8; do curl -sf -m $t -o /media/doorbell/.new.jpg \"http://127.0.0.1:1984/api/frame.jpeg?src=doorbell\" && mv /media/doorbell/.new.jpg /media/doorbell/{{ name }}.jpg && cp /media/doorbell/{{ name }}.jpg /media/doorbell/latest.jpg && exit 0; done; exit 1'"
   office_vision_classify: "python3 /config/office_vision/office_vision.py classify --image /media/office_debug/last.jpg --camera office --source '{{ source }}'"
 
 command_line:

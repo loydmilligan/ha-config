@@ -228,3 +228,48 @@ office_vision_check:
         summary: "{{ vision.get('summary', '') }}"
   - stop: Done
     response_variable: out
+doorbell_describe_visitor:
+  alias: Doorbell describe visitor
+  description: Grabs a doorbell frame and asks the AI who or what is at the door. Returns description, or nothing if the frame or AI call fails.
+  icon: mdi:doorbell-video
+  mode: single
+  sequence:
+  - variables:
+      empty:
+        description: ""
+  - action: shell_command.doorbell_frame
+    data:
+      name: ring
+    response_variable: frame
+    continue_on_error: true
+  - if:
+    - condition: template
+      value_template: "{{ frame is not defined or frame.returncode != 0 }}"
+    then:
+    - stop: No doorbell frame
+      response_variable: empty
+  - action: ai_task.generate_data
+    continue_on_error: true
+    data:
+      task_name: Doorbell visitor
+      entity_id: ai_task.anthropic_claude_haiku_5_5
+      instructions: This snapshot is from a front-door doorbell camera, taken seconds
+        after the bell rang. It may be an infrared night image. In under 10 words,
+        say who or what is at the door, for example "delivery driver with a package"
+        or "two people waiting". Describe, do not identify anyone. If nobody is visible,
+        say so.
+      structure:
+        description:
+          description: Under 10 words
+          required: true
+          selector:
+            text: {}
+      attachments:
+      - media_content_id: media-source://media_source/local/doorbell/ring.jpg
+        media_content_type: image/jpeg
+    response_variable: ai
+  - variables:
+      out:
+        description: "{{ ai.data.description if ai is defined and ai.data is defined else '' }}"
+  - stop: Done
+    response_variable: out

@@ -978,5 +978,113 @@
         level: warning
         logger: doorbell_ring_pocket_sign
         message: "Pocket Sign did not accept the doorbell message (HTTP {{ sign.status if sign is defined else 'none' }})"
+  - action: script.doorbell_describe_visitor
+    response_variable: visitor
+    continue_on_error: true
+  - if:
+    - condition: template
+      value_template: "{{ visitor is defined and (visitor.description | default('')) | length > 0 }}"
+    then:
+    - action: input_text.set_value
+      target:
+        entity_id: input_text.doorbell_ring_description
+      data:
+        value: "{{ now().strftime('%-I:%M %p') }}: {{ visitor.description[:200] }}"
+    - action: rest_command.sign_message
+      data:
+        display: 027YiRhj
+        text: "Doorbell: {{ visitor.description[:60] }}"
+        duration: 120
+        level: interrupt
+        key: doorbell
+      continue_on_error: true
+  mode: single
+  max_exceeded: silent
+- id: doorbell_change_check
+  alias: Doorbell change check
+  description: Every 5 minutes, compares a new doorbell frame with the one from 5 minutes earlier and records what changed, for the Home Assistant update screen.
+  triggers:
+  - trigger: time_pattern
+    minutes: /5
+  conditions: []
+  actions:
+  - variables:
+      current: "{{ 'b' if is_state('input_boolean.doorbell_frame_slot', 'off') else 'a' }}"
+      previous: "{{ 'a' if current == 'b' else 'b' }}"
+      last: "{{ states('input_datetime.doorbell_last_check') }}"
+      have_previous: "{{ last not in ['unknown', 'unavailable', ''] and (as_timestamp(now()) - as_timestamp(last, 0)) < 900 }}"
+  - action: shell_command.doorbell_frame
+    data:
+      name: "{{ current }}"
+    response_variable: frame
+    continue_on_error: true
+  - if:
+    - condition: template
+      value_template: "{{ frame is not defined or frame.returncode != 0 }}"
+    then:
+    - stop: No doorbell frame this time
+  - action: input_boolean.toggle
+    target:
+      entity_id: input_boolean.doorbell_frame_slot
+  - action: input_datetime.set_datetime
+    target:
+      entity_id: input_datetime.doorbell_last_check
+    data:
+      timestamp: "{{ now().timestamp() }}"
+  - if:
+    - condition: template
+      value_template: "{{ not have_previous }}"
+    then:
+    - stop: First frame; nothing to compare yet
+  - action: ai_task.generate_data
+    continue_on_error: true
+    data:
+      task_name: Doorbell change check
+      entity_id: ai_task.anthropic_claude_haiku_5_5
+      instructions: Two snapshots from the same fixed front-door doorbell camera,
+        about five minutes apart. The first image is earlier and the second is now.
+        Has anything meaningfully changed, such as people, animals, packages, vehicles,
+        or objects added, removed or moved? Ignore lighting, shadows, day or night and
+        infrared switching, weather, image noise and compression. Describe, do not identify
+        anyone. In summary, say in under 20 words what changed, or "No change".
+      structure:
+        changed:
+          description: True only for a meaningful change
+          required: true
+          selector:
+            boolean: {}
+        summary:
+          description: Under 20 words
+          required: true
+          selector:
+            text: {}
+      attachments:
+      - media_content_id: "media-source://media_source/local/doorbell/{{ previous }}.jpg"
+        media_content_type: image/jpeg
+      - media_content_id: "media-source://media_source/local/doorbell/{{ current }}.jpg"
+        media_content_type: image/jpeg
+    response_variable: ai
+  - if:
+    - condition: template
+      value_template: "{{ ai is not defined or ai.data is not defined or ai.data.changed is not defined }}"
+    then:
+    - stop: AI check failed
+  - action: "input_boolean.turn_{{ 'on' if ai.data.changed else 'off' }}"
+    target:
+      entity_id: input_boolean.doorbell_change_detected
+  - action: input_text.set_value
+    target:
+      entity_id: input_text.doorbell_change_summary
+    data:
+      value: "{{ (ai.data.summary | string)[:250] }}"
+  - if:
+    - condition: template
+      value_template: "{{ ai.data.changed }}"
+    then:
+    - action: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.doorbell_last_change
+      data:
+        timestamp: "{{ now().timestamp() }}"
   mode: single
   max_exceeded: silent
