@@ -947,3 +947,36 @@
   mode: queued
   max: 5
   max_exceeded: silent
+- id: doorbell_ring_pocket_sign
+  alias: Doorbell ring to Pocket Sign
+  description: When the Nest doorbell rings, show it on the Office TV right away, taking over the TV's Chromecast.
+  triggers:
+  - trigger: state
+    entity_id: event.doorbell_chime
+    not_from: unavailable
+    not_to: unavailable
+  conditions:
+  - condition: template
+    value_template: "{{ trigger.to_state.attributes.event_type == 'ring' }}"
+  actions:
+  - action: rest_command.sign_message
+    data:
+      display: 027YiRhj
+      text: "Doorbell · {{ now().strftime('%-I:%M %p') }}"
+      duration: 120
+      level: interrupt
+      key: doorbell
+      cast: true
+    response_variable: sign
+    continue_on_error: true
+  - if:
+    - condition: template
+      value_template: "{{ sign is not defined or sign.status | int(0) >= 300 }}"
+    then:
+    - action: system_log.write
+      data:
+        level: warning
+        logger: doorbell_ring_pocket_sign
+        message: "Pocket Sign did not accept the doorbell message (HTTP {{ sign.status if sign is defined else 'none' }})"
+  mode: single
+  max_exceeded: silent
