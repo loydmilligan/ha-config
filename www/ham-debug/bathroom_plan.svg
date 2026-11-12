@@ -1,0 +1,26 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1000 640' font-family='Segoe UI,Roboto,Helvetica,Arial,sans-serif'>
+<rect width='1000' height='640' rx='18' fill='#1c2330'/>
+<!-- floor -->
+<rect x='60' y='60' width='880' height='520' fill='#232c3b'/>
+<!-- shower -->
+<rect x='640' y='60' width='300' height='250' fill='#1f3348' stroke='#4da3ff' stroke-width='3' stroke-dasharray='12 8'/>
+<text x='790' y='100' text-anchor='middle' fill='#4da3ff' font-size='24' font-weight='600'>SHOWER</text>
+<!-- motion cone from the Hue sensor (top-left corner) -->
+<path d='M110 110 L600 200 A520 520 0 0 1 330 560 Z' fill='#ffd54f' opacity='0.06' stroke='#ffd54f' stroke-opacity='0.35' stroke-dasharray='6 6'/>
+<!-- walls with door gap on the bottom wall (x 130..280) -->
+<path d='M130 580 L60 580 L60 60 L940 60 L940 580 L280 580' fill='none' stroke='#c9d1dc' stroke-width='12' stroke-linejoin='round'/>
+<!-- door leaf + swing -->
+<line x1='280' y1='580' x2='280' y2='440' stroke='#c9d1dc' stroke-width='6'/>
+<path d='M280 440 A140 140 0 0 0 140 580' fill='none' stroke='#8a96a8' stroke-width='2' stroke-dasharray='6 6'/>
+<text x='205' y='625' text-anchor='middle' fill='#8a96a8' font-size='20'>door</text>
+<!-- labels (icons are live overlays) -->
+<g fill='#e6ebf2' font-size='18' text-anchor='middle'>
+<text x='110' y='170'>Hue motion</text><text x='110' y='192' fill='#8a96a8' font-size='15'>sensor</text>
+<text x='420' y='395'>Hue ceiling bulb</text>
+<text x='560' y='245'>Exhaust fan + light</text><text x='560' y='267' fill='#8a96a8' font-size='15'>via SwitchBot</text>
+<text x='585' y='395'>Humidity meter</text><text x='585' y='417' fill='#8a96a8' font-size='15'>97C8</text>
+<text x='330' y='540'>Door contact</text>
+<text x='130' y='420'>Hue tap</text><text x='130' y='442' fill='#8a96a8' font-size='15'>4 buttons</text>
+</g>
+<text x='930' y='615' text-anchor='end' fill='#8a96a8' font-size='14'>schematic, positions approximate</text>
+</svg>

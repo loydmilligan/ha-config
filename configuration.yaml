@@ -399,6 +399,26 @@ template:
             {% elif trigger.id in ['motion', 'door_closed_settled'] and motion and closed_45s %}true
             {% else %}{{ this.attributes.get('someone_inside', false) if this.attributes is defined else false }}{% endif %}
 
+  # Debug only (Debug dashboard > Bathroom): which step of the two bathroom automations we're
+  # in, as "<occupancy>.<fan>" (e.g. "inside.running"); picks the highlighted flow diagram.
+  - sensor:
+      - name: Bathroom automation phase
+        unique_id: bathroom_automation_phase
+        icon: mdi:state-machine
+        state: >-
+          {% set occ = states('binary_sensor.bathroom_occupied') %}
+          {% set o = 'unknown' if occ not in ['on', 'off'] else ('vacant' if occ == 'off' else
+             ('inside' if state_attr('binary_sensor.bathroom_occupied', 'someone_inside') else 'occupied')) %}
+          {% set fan = states('switch.bathroom') %}
+          {% set f = 'unknown' if fan not in ['on', 'off'] else ('off' if fan == 'off' else
+             ('running' if is_state('binary_sensor.bathroom_shower', 'on') else 'on_no_shower')) %}
+          {{ o }}.{{ f }}
+        attributes:
+          label: >-
+            {% set occ = states('binary_sensor.bathroom_occupied') %}
+            {% set fan = states('switch.bathroom') %}
+            {% if occ not in ['on', 'off'] %}Occupancy unknown{% elif occ == 'off' %}Vacant{% elif state_attr('binary_sensor.bathroom_occupied', 'someone_inside') %}Someone inside (door closed){% else %}Occupied (door open){% endif %} · {% if fan not in ['on', 'off'] %}fan unknown{% elif fan == 'off' %}fan off{% elif is_state('binary_sensor.bathroom_shower', 'on') %}shower, fan running{% else %}fan on, no shower{% endif %}
+
 sensor:
   # Recent "normal" bathroom humidity: 20th percentile of the last 3 h, robust to showers.
   - platform: statistics
