@@ -43,6 +43,9 @@ homeassistant:
 #    - type: homeassistant    # Keep normal login for other devices
 
 input_boolean:
+  office_dashboard_details:
+    name: Office dashboard - show details
+    icon: mdi:chevron-down-box-outline
   # Doorbell AI: which of /media/doorbell/a.jpg or b.jpg holds the newest 5-minute frame.
   doorbell_frame_slot:
     name: Doorbell frame slot B
