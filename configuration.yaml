@@ -230,6 +230,23 @@ rest_command:
       headers:
         Authorization: !secret pocket_sign_bearer
 
+# HA Manager phone approvals: the emoji to tap in the ntfy approval push. Pulled (read-only)
+# from the ham-approvals service on mash-ubie; HA never writes to it. State is e.g. "#19 🦊"
+# or "none". Token: !secret ham_challenge_bearer ("Bearer <HAM_CHALLENGE_TOKEN>").
+rest:
+  - resource: http://192.168.4.217:8840/challenge
+    headers:
+      Authorization: !secret ham_challenge_bearer
+    scan_interval: 15
+    timeout: 5
+    sensor:
+      - name: HAM approval challenge
+        unique_id: ham_approval_challenge
+        icon: mdi:shield-check-outline
+        value_template: "{{ value_json.state }}"
+        json_attributes:
+          - pending
+
 media_player:
     - platform: universal
       name: Lyric Scroll Old Chromecast
