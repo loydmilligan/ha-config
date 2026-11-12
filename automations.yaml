@@ -1144,3 +1144,184 @@
           - light.office_light_3
           - light.office_light_4
   mode: queued
+- id: 'ham_bathroom_lights_occupancy'
+  alias: Bathroom lights by occupancy
+  description: >-
+    ha-manager #19. Occupied: Hue bulb on at the house light level (or the SwitchBot
+    light+fan if the bulb is unpowered). Vacant 1 min: Hue bulb off.
+  triggers:
+  - trigger: state
+    entity_id: binary_sensor.bathroom_occupied
+    to: 'on'
+    id: occupied
+  - trigger: state
+    entity_id: binary_sensor.bathroom_occupied
+    to: 'off'
+    for:
+      minutes: 1
+    id: vacant
+  conditions: []
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id: occupied
+      sequence:
+      - if:
+        - condition: state
+          entity_id: light.bathroom_ceiling_light
+          state: unavailable
+        then:
+        - action: switch.turn_on
+          target:
+            entity_id: switch.bathroom
+        else:
+        - condition: state
+          entity_id: light.bathroom_ceiling_light
+          state: 'off'
+        - action: light.turn_on
+          target:
+            entity_id: light.bathroom_ceiling_light
+          data:
+            brightness_pct: "{{ states('sensor.house_light_level') | int(30) }}"
+            transition: 1
+    - conditions:
+      - condition: trigger
+        id: vacant
+      sequence:
+      - action: light.turn_off
+        target:
+          entity_id: light.bathroom_ceiling_light
+        data:
+          transition: 3
+  mode: restart
+- id: 'ham_bathroom_fan_humidity'
+  alias: Bathroom fan by humidity
+  description: >-
+    ha-manager #19. Shower detected: SwitchBot (light + exhaust fan) on. It turns off once
+    humidity is back near baseline AND the room has been vacant 10 min; safety off after
+    90 min if vacant.
+  triggers:
+  - trigger: state
+    entity_id: binary_sensor.bathroom_shower
+    to: 'on'
+    id: shower_on
+  - trigger: state
+    entity_id: binary_sensor.bathroom_shower
+    to: 'off'
+    id: check_off
+  - trigger: state
+    entity_id: binary_sensor.bathroom_occupied
+    to: 'off'
+    for:
+      minutes: 10
+    id: check_off
+  - trigger: state
+    entity_id: switch.bathroom
+    to: 'on'
+    for:
+      minutes: 90
+    id: safety
+  conditions: []
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id: shower_on
+      sequence:
+      - action: switch.turn_on
+        target:
+          entity_id: switch.bathroom
+    - conditions:
+      - condition: trigger
+        id: check_off
+      - condition: state
+        entity_id: binary_sensor.bathroom_shower
+        state: 'off'
+      - condition: state
+        entity_id: binary_sensor.bathroom_occupied
+        state: 'off'
+        for:
+          minutes: 10
+      - condition: state
+        entity_id: switch.bathroom
+        state: 'on'
+      sequence:
+      - action: switch.turn_off
+        target:
+          entity_id: switch.bathroom
+    - conditions:
+      - condition: trigger
+        id: safety
+      - condition: state
+        entity_id: binary_sensor.bathroom_occupied
+        state: 'off'
+      sequence:
+      - action: switch.turn_off
+        target:
+          entity_id: switch.bathroom
+  mode: queued
+- id: 'ham_bathroom_hue_tap'
+  alias: Bathroom Hue tap
+  description: >-
+    ha-manager #19. 1: both lights on/off together, 2: Hue bulb, 3: SwitchBot light+fan,
+    4: all off.
+  triggers:
+  - trigger: state
+    entity_id: event.4_button_circular_smart_button_action
+    not_from:
+    - unavailable
+    - unknown
+    not_to:
+    - unavailable
+    - unknown
+  conditions: []
+  actions:
+  - variables:
+      button: "{{ trigger.to_state.attributes.event_type }}"
+      any_on: "{{ is_state('light.bathroom_ceiling_light', 'on') or is_state('switch.bathroom', 'on') }}"
+  - choose:
+    - conditions: "{{ button == 'press_1' and any_on }}"
+      sequence:
+      - action: light.turn_off
+        target:
+          entity_id: light.bathroom_ceiling_light
+      - action: switch.turn_off
+        target:
+          entity_id: switch.bathroom
+    - conditions: "{{ button == 'press_1' }}"
+      sequence:
+      - action: light.turn_on
+        target:
+          entity_id: light.bathroom_ceiling_light
+        data:
+          brightness_pct: "{{ states('sensor.house_light_level') | int(30) }}"
+      - action: switch.turn_on
+        target:
+          entity_id: switch.bathroom
+    - conditions: "{{ button == 'press_2' and is_state('light.bathroom_ceiling_light', 'on') }}"
+      sequence:
+      - action: light.turn_off
+        target:
+          entity_id: light.bathroom_ceiling_light
+    - conditions: "{{ button == 'press_2' }}"
+      sequence:
+      - action: light.turn_on
+        target:
+          entity_id: light.bathroom_ceiling_light
+        data:
+          brightness_pct: "{{ states('sensor.house_light_level') | int(30) }}"
+    - conditions: "{{ button == 'press_3' }}"
+      sequence:
+      - action: switch.toggle
+        target:
+          entity_id: switch.bathroom
+    - conditions: "{{ button == 'press_4' }}"
+      sequence:
+      - action: light.turn_off
+        target:
+          entity_id: light.bathroom_ceiling_light
+      - action: switch.turn_off
+        target:
+          entity_id: switch.bathroom
+  mode: queued

@@ -64,6 +64,11 @@ input_boolean:
   office_vision_enabled:
     name: Office vision classifier
     icon: mdi:eye-check-outline
+  # Sleep mode: manual for now; the household-state observer (ha-manager task #22) will
+  # learn bedtimes and later drive it. Read by sensor.house_light_level (sleep = very dim).
+  sleep_mode:
+    name: Sleep mode
+    icon: mdi:sleep
 
 input_number:
   office_vision_poll_seconds:
@@ -308,3 +313,101 @@ template:
           {{ is_state('binary_sensor.everything_presence_lite_cadb3c_zone_3_occupancy', 'on')
              or is_state('binary_sensor.everything_presence_lite_cadb3c_zone_1_occupancy', 'on')
              or is_state('binary_sensor.sonoff_mmwave_occupancy', 'on') }}
+
+  # --- House light level (ha-manager task #20) --------------------------------------
+  # One brightness target (%) for every automatic light. Interim levels; to be revised
+  # after research on healthy light levels (biased dim).
+  - sensor:
+      - name: House light level
+        unique_id: house_light_level
+        unit_of_measurement: "%"
+        icon: mdi:brightness-auto
+        state: >-
+          {% if is_state('input_boolean.sleep_mode', 'on') %}3
+          {% else %}
+            {% set elev = state_attr('sun.sun', 'elevation') | float(-90) %}
+            {% if elev > 6 %}100{% elif elev > -6 %}60{% else %}30{% endif %}
+          {% endif %}
+
+  # --- Bathroom (ha-manager task #19) -------------------------------------------------
+  # Shower: humidity well above its recent baseline (SwitchBot meter 97C8 in the bathroom).
+  # Hysteresis: on at baseline + 8 points, off once back within 3 points.
+  - triggers:
+      - trigger: state
+        entity_id:
+          - sensor.indoor_outdoor_meter_97c8_humidity
+          - sensor.bathroom_humidity_baseline
+    binary_sensor:
+      - name: Bathroom shower
+        unique_id: bathroom_shower
+        device_class: moisture
+        state: >-
+          {% set h = states('sensor.indoor_outdoor_meter_97c8_humidity') | float(none) %}
+          {% set b = states('sensor.bathroom_humidity_baseline') | float(none) %}
+          {% if h is none or b is none %}{{ this.state == 'on' }}
+          {% elif h >= b + 8 %}true
+          {% elif h <= b + 3 %}false
+          {% else %}{{ this.state == 'on' }}{% endif %}
+
+  # Occupancy, "wasp in a box": motion seen 45 s after the door closed means someone is
+  # inside, so the room stays occupied (even motionless in the shower) until the door opens.
+  # Door open: follows motion, with a 2 min hold.
+  - triggers:
+      - trigger: state
+        entity_id: binary_sensor.square_multi_sensor_occupancy
+        to: "on"
+        id: motion
+      - trigger: state
+        entity_id: binary_sensor.square_multi_sensor_occupancy
+        to: "off"
+        for: {minutes: 2}
+        id: motion_clear
+      - trigger: state
+        entity_id: binary_sensor.bathroom_contact_sensor_contact
+        to: "on"
+        id: door_open
+      - trigger: state
+        entity_id: binary_sensor.bathroom_contact_sensor_contact
+        to: "off"
+        for: {seconds: 45}
+        id: door_closed_settled
+      - trigger: state
+        entity_id: binary_sensor.bathroom_shower
+        to: "on"
+        id: shower
+    binary_sensor:
+      - name: Bathroom occupied
+        unique_id: bathroom_occupied
+        device_class: occupancy
+        state: >-
+          {% set motion = is_state('binary_sensor.square_multi_sensor_occupancy', 'on') %}
+          {% set door_closed = is_state('binary_sensor.bathroom_contact_sensor_contact', 'off') %}
+          {% set inside = this.attributes.get('someone_inside', false) if this.attributes is defined else false %}
+          {% if trigger.id in ['motion', 'shower'] %}true
+          {% elif trigger.id == 'door_open' %}{{ this.state == 'on' or motion }}
+          {% elif trigger.id == 'door_closed_settled' %}{{ motion }}
+          {% elif trigger.id == 'motion_clear' %}{{ door_closed and inside }}
+          {% else %}{{ this.state == 'on' }}{% endif %}
+        attributes:
+          someone_inside: >-
+            {% set motion = is_state('binary_sensor.square_multi_sensor_occupancy', 'on') %}
+            {% set door = states.binary_sensor.bathroom_contact_sensor_contact %}
+            {% set closed_45s = door is not none and door.state == 'off'
+               and (now() - door.last_changed).total_seconds() >= 45 %}
+            {% if trigger.id == 'door_open' %}false
+            {% elif trigger.id == 'shower' %}true
+            {% elif trigger.id in ['motion', 'door_closed_settled'] and motion and closed_45s %}true
+            {% else %}{{ this.attributes.get('someone_inside', false) if this.attributes is defined else false }}{% endif %}
+
+sensor:
+  # Recent "normal" bathroom humidity: 20th percentile of the last 3 h, robust to showers.
+  - platform: statistics
+    name: Bathroom humidity baseline
+    unique_id: bathroom_humidity_baseline
+    entity_id: sensor.indoor_outdoor_meter_97c8_humidity
+    state_characteristic: percentile
+    percentile: 20
+    max_age:
+      hours: 3
+    sampling_size: 1000
+    precision: 1
