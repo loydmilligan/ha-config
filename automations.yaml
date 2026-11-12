@@ -224,16 +224,16 @@
   description: ''
   triggers:
   - type: opened
-    device_id: d2ea7345dcb65983a35b708d81fca215
-    entity_id: 9ee575d5c6e094e1b0dee7774e4fde6d
+    device_id: c9dbd3fd3fea3687c830e8930358337a
+    entity_id: aa590cef068a9a5576b2a3b785445e95
     domain: binary_sensor
     metadata:
       secondary: false
     trigger: device
     id: open
   - type: not_opened
-    device_id: d2ea7345dcb65983a35b708d81fca215
-    entity_id: 9ee575d5c6e094e1b0dee7774e4fde6d
+    device_id: c9dbd3fd3fea3687c830e8930358337a
+    entity_id: aa590cef068a9a5576b2a3b785445e95
     domain: binary_sensor
     trigger: device
     id: closed
@@ -268,25 +268,25 @@
   description: Single - kasablanca fan toggle
   triggers:
   - domain: mqtt
-    device_id: 24286ef82d2444b54df694b8f9f03f0b
+    device_id: 14dec868d1886a7d7e05f7658e44f8c1
     type: action
     subtype: release
     trigger: device
     id: release_hold
   - domain: mqtt
-    device_id: 24286ef82d2444b54df694b8f9f03f0b
+    device_id: 14dec868d1886a7d7e05f7658e44f8c1
     type: action
     subtype: hold
     trigger: device
     id: hold
   - domain: mqtt
-    device_id: 24286ef82d2444b54df694b8f9f03f0b
+    device_id: 14dec868d1886a7d7e05f7658e44f8c1
     type: action
     subtype: double
     trigger: device
     id: double
   - domain: mqtt
-    device_id: 24286ef82d2444b54df694b8f9f03f0b
+    device_id: 14dec868d1886a7d7e05f7658e44f8c1
     type: action
     subtype: single
     metadata: {}
@@ -303,67 +303,51 @@
       - action: fan.toggle
         metadata: {}
         target:
-          entity_id: fan.air_purifier_f28a
+          entity_id: fan.air_purifier_us_f28a
         data: {}
     - conditions:
       - condition: trigger
         id:
         - single
       sequence:
-      - action: light.toggle
+      - action: switch.toggle
         metadata: {}
         target:
-          entity_id: light.kitchen_downlights
+          entity_id:
+          - switch.kitchen_se_downlight
+          - switch.kitchen_sw_downlight
         data: {}
   mode: single
 - id: '1770171751479'
   alias: Hue tap dial controls
   description: ''
   triggers:
-  - type: motion
-    device_id: b2f777fc0f774dc185f23e56a4873ac6
-    entity_id: 40c1395cbd398ca90128f0ccc2d4978b
-    domain: binary_sensor
-    metadata:
-      secondary: false
-    trigger: device
-    id: hall_motion_detected
-  - type: no_motion
-    device_id: b2f777fc0f774dc185f23e56a4873ac6
-    entity_id: 40c1395cbd398ca90128f0ccc2d4978b
-    domain: binary_sensor
-    trigger: device
-    id: hall_motion_cleared
-    for:
-      hours: 0
-      minutes: 0
-      seconds: 15
   - domain: mqtt
-    device_id: 8531efeed28e09ad07ff53f5b4f8b195
+    device_id: af63f89cb2a1e74b1f0cea4cb7b79210
     type: action
     subtype: button_1_press
     trigger: device
     id: press_1
   - domain: mqtt
-    device_id: 8531efeed28e09ad07ff53f5b4f8b195
+    device_id: af63f89cb2a1e74b1f0cea4cb7b79210
     type: action
     subtype: button_2_press
     trigger: device
     id: press_2
   - domain: mqtt
-    device_id: 8531efeed28e09ad07ff53f5b4f8b195
+    device_id: af63f89cb2a1e74b1f0cea4cb7b79210
     type: action
     subtype: button_3_press
     trigger: device
     id: press_3
   - domain: mqtt
-    device_id: 8531efeed28e09ad07ff53f5b4f8b195
+    device_id: af63f89cb2a1e74b1f0cea4cb7b79210
     type: action
     subtype: button_4_press
     trigger: device
     id: press_4
   - domain: mqtt
-    device_id: 544d1022ec14d15b3d84ffee8b173845
+    device_id: 6f6f1af56d533cb4b29169ea44b9b39b
     type: action
     subtype: single
     trigger: device
@@ -379,7 +363,7 @@
       - action: light.toggle
         metadata: {}
         target:
-          entity_id: light.hallway_ceiling
+          entity_id: light.hall_light
         data: {}
     - conditions:
       - condition: trigger
@@ -389,7 +373,7 @@
       - action: light.turn_on
         metadata: {}
         target:
-          entity_id: light.hallway_ceiling
+          entity_id: light.hall_light
         data:
           transition: 2
     - conditions:
@@ -400,7 +384,7 @@
       - action: light.turn_off
         metadata: {}
         target:
-          entity_id: light.hallway_ceiling
+          entity_id: light.hall_light
         data:
           transition: 7
     - conditions:
@@ -408,11 +392,12 @@
         id:
         - kitch_button_single
       sequence:
-      - action: light.toggle
+      - action: switch.toggle
         metadata: {}
         target:
           entity_id:
-          - light.kitchen_downlights
+          - switch.kitchen_se_downlight
+          - switch.kitchen_sw_downlight
         data: {}
     - conditions:
       - condition: trigger
@@ -423,23 +408,23 @@
         metadata: {}
         target:
           entity_id:
-          - light.office_ceiling_se
-          - light.office_ceiling_ne
-          - light.office_ceiling_sw
-          - light.office_ceiling_nw
+          - light.office_light_1
+          - light.office_light_2
+          - light.office_light_3
+          - light.office_light_4
         data: {}
     - conditions:
       - condition: trigger
         id:
         - press_2
       sequence:
-      - action: light.toggle
+      - action: homeassistant.toggle
         metadata: {}
         data: {}
         target:
           entity_id:
-          - light.bathroom_ceiling
-          - light.bathroom_switchbot
+          - light.bathroom_ceiling_light
+          - switch.bathroom
     - conditions:
       - condition: trigger
         id:
