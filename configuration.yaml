@@ -211,6 +211,12 @@ rest_command:
     # Optional look (Pocket Sign 0.6.0+): theme (e.g. neon), mode (e.g. bounce),
     # bounce (rare|perfect). A theme brings its own motion; a mode it doesn't
     # offer is refused.
+    # Countdown (Pocket Sign 0.11.0+): countdown (seconds) or countdown_until
+    # ("18:00", today or tomorrow if passed; a full ISO time also works). The text
+    # becomes the label and the time left shows under it. At zero it flashes
+    # done_text (default TIME'S UP!) for hold seconds (default 300, 0 = until
+    # cleared), then ends. duration is ignored: the countdown sets its own end.
+    # The same key again restarts it.
     sign_message:
       url: "https://sign.dogbelly.app/api/v1/displays/{{ display }}/message"
       method: POST
@@ -219,8 +225,16 @@ rest_command:
       content_type: "application/json"
       payload: >-
         {% set secs = (duration | default(60)) | int %}
+        {% set cd = none %}
+        {% if countdown is defined %}{% set cd = {'seconds': countdown | int} %}
+        {% elif countdown_until is defined %}
+          {% if 'T' in (countdown_until | string) %}{% set cd = {'endsAt': countdown_until | string} %}
+          {% else %}{% set at = today_at(countdown_until) %}{% if at <= now() %}{% set at = at + timedelta(days=1) %}{% endif %}{% set cd = {'endsAt': at.isoformat()} %}{% endif %}
+        {% endif %}
+        {% if cd is not none and done_text is defined %}{% set cd = dict(cd, doneText=done_text) %}{% endif %}
+        {% if cd is not none and hold is defined %}{% set cd = dict(cd, holdSec=((hold | int) if (hold | int) > 0 else none)) %}{% endif %}
         {% set p = {'text': text} %}
-        {% if secs > 0 %}{% set p = dict(p, durationSec=secs) %}{% endif %}
+        {% if cd is not none %}{% set p = dict(p, countdown=cd) %}{% elif secs > 0 %}{% set p = dict(p, durationSec=secs) %}{% endif %}
         {% if level is defined %}{% set p = dict(p, level=level) %}{% endif %}
         {% if key is defined %}{% set p = dict(p, key=key) %}{% endif %}
         {% if cast is defined and (cast | string | lower) == 'true' %}{% set p = dict(p, cast=true) %}{% endif %}
