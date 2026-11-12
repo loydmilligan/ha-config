@@ -914,7 +914,7 @@
               entity_id: counter.office_vision_absent_streak
           - if:
             - condition: template
-              value_template: "{{ states('counter.office_vision_absent_streak') | int(0) >= states('input_number.office_vision_absences_required') | int(2) and is_state('binary_sensor.office_camera_motion_detected', 'off') }}"
+              value_template: "{{ states('counter.office_vision_absent_streak') | int(0) >= states('input_number.office_vision_absences_required') | int(2) and is_state('binary_sensor.office_camera_motion_detected', 'off')  and is_state('binary_sensor.office_presence_radar', 'off') }}"
             then:
             - action: input_boolean.turn_on
               target:
@@ -1088,3 +1088,74 @@
         timestamp: "{{ now().timestamp() }}"
   mode: single
   max_exceeded: silent
+- id: office_lights_radar
+  alias: Office Lights by Radar
+  description: Either radar sensor seeing someone turns the office lights on; 5 minutes with neither seeing anyone turns them off. Respects the 30-minute hold after a manual off. The camera and AI checks stay as a backup.
+  triggers:
+  - trigger: state
+    entity_id: binary_sensor.office_presence_radar
+    to: 'on'
+    id: present
+  - trigger: state
+    entity_id: binary_sensor.office_presence_radar
+    to: 'off'
+    for: 00:05:00
+    id: empty
+  conditions: []
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id: present
+      - condition: state
+        entity_id:
+        - light.office_light_1
+        - light.office_light_2
+        - light.office_light_3
+        - light.office_light_4
+        state: 'off'
+        for: 00:00:20
+      - condition: or
+        conditions:
+        - condition: state
+          entity_id: input_boolean.office_lights_auto_off
+          state: 'on'
+        - condition: state
+          entity_id:
+          - light.office_light_1
+          - light.office_light_2
+          - light.office_light_3
+          - light.office_light_4
+          state: 'off'
+          for: 00:30:00
+      sequence:
+      - action: light.turn_on
+        target:
+          entity_id:
+          - light.office_light_1
+          - light.office_light_2
+          - light.office_light_3
+          - light.office_light_4
+    - conditions:
+      - condition: trigger
+        id: empty
+      - condition: state
+        entity_id:
+        - light.office_light_1
+        - light.office_light_2
+        - light.office_light_3
+        - light.office_light_4
+        state: 'on'
+        match: any
+      sequence:
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.office_lights_auto_off
+      - action: light.turn_off
+        target:
+          entity_id:
+          - light.office_light_1
+          - light.office_light_2
+          - light.office_light_3
+          - light.office_light_4
+  mode: queued

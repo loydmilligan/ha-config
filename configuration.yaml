@@ -276,3 +276,15 @@ mqtt:
       device_class: temperature
       state_class: measurement
       json_attributes_topic: "sensors/laptop_thermal"
+
+template:
+  - binary_sensor:
+      # On when either office radar sensor sees someone: Everything Presence Lite (NE corner,
+      # office floor zone or Matt's desk zone) or the Sonoff mmWave (south wall, aimed at Mara's desk).
+      - name: Office presence radar
+        unique_id: office_presence_radar
+        device_class: occupancy
+        state: >-
+          {{ is_state('binary_sensor.everything_presence_lite_cadb3c_zone_3_occupancy', 'on')
+             or is_state('binary_sensor.everything_presence_lite_cadb3c_zone_1_occupancy', 'on')
+             or is_state('binary_sensor.sonoff_mmwave_occupancy', 'on') }}
