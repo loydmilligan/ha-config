@@ -1,5 +1,3 @@
-# STAGE 1 of the v3 rollout: helpers and scripts only. Templates and automations follow
-# in stage 2, after script.bathroom_apply_defaults has run. Full design: ha-manager docs/bathroom-v3.
 # Bathroom "wasp in a box" — Home Assistant package, design v3 (2026-11-12)
 # Design and reasoning: ../DESIGN-HA.md. NOT yet run in Home Assistant.
 # Run "Check configuration" and the paper scenarios before deploying.
@@ -232,3 +230,699 @@ script:
       #   input_boolean.bathroom_switchbot_lux_sync
       #   input_boolean.bathroom_switchbot_fallback
 
+# ───────────────────────── Derived entities ─────────────────────────
+
+template:
+  - binary_sensor:
+      # Plain read-out of the state machine. Same entity id as before.
+      - name: Bathroom occupied
+        unique_id: bathroom_occupied  # same as deployed, keeps binary_sensor.bathroom_occupied
+        device_class: occupancy
+        state: "{{ not is_state('input_select.bathroom_occupancy', 'vacant') }}"
+        attributes:
+          someone_inside: "{{ is_state('input_select.bathroom_occupancy', 'locked') }}"
+
+      # "The light may not turn off." Humidity never turns the light ON; it only
+      # stops it turning off. The cap stops a stuck baseline holding it forever.
+      - name: Bathroom light hold
+        unique_id: bathroom_light_hold
+        state: >
+          {% set cap = states('input_number.bathroom_shower_max_hold') | float(120) * 60 %}
+          {% set sh = is_state('binary_sensor.bathroom_shower', 'on')
+             and (now() - states.binary_sensor.bathroom_shower.last_changed).total_seconds() < cap %}
+          {{ not is_state('input_select.bathroom_occupancy', 'vacant') or sh }}
+
+      # What the luminosity sensor says about the SwitchBot circuit, after
+      # subtracting what the Hue bulb is expected to add. 20 s debounce because
+      # luminosity reports lag a change by 10–20 s.
+      - name: Bathroom SwitchBot lights measured
+        unique_id: bathroom_switchbot_lights_measured
+        device_class: light
+        delay_on: "00:00:20"
+        delay_off: "00:00:20"
+        availability: "{{ states('sensor.square_multi_sensor_illuminance') | is_number }}"
+        state: >
+          {% set lux = states('sensor.square_multi_sensor_illuminance') | float(0) %}
+          {% set frac = (state_attr('light.bathroom_ceiling_light', 'brightness') | float(0)) / 255
+             if is_state('light.bathroom_ceiling_light', 'on') else 0 %}
+          {% set hue = frac * states('input_number.bathroom_hue_lux_at_full') | float(20) %}
+          {{ lux - hue >= states('input_number.bathroom_switchbot_lux_threshold') | float(15) }}
+
+      # Last command and measured light disagree for a full minute.
+      - name: Bathroom SwitchBot mismatch
+        unique_id: bathroom_switchbot_mismatch
+        device_class: problem
+        delay_on: "00:01:00"
+        availability: "{{ has_value('binary_sensor.bathroom_switchbot_lights_measured') }}"
+        state: >
+          {{ is_state('binary_sensor.bathroom_switchbot_lights_measured', 'on')
+             != is_state('input_boolean.bathroom_switchbot_target', 'on') }}
+
+  - triggers:
+      - trigger: state
+        entity_id:
+          - sensor.indoor_outdoor_meter_97c8_humidity
+          - sensor.bathroom_humidity_baseline
+          - input_number.bathroom_shower_on_offset
+          - input_number.bathroom_shower_off_offset
+    binary_sensor:
+      # Shower: humidity against the moving baseline, with hysteresis.
+      # If either sensor drops out, it keeps its last value (never releases blind).
+      # Trigger-based so HA restores its state after a restart.
+      - name: Bathroom shower
+        unique_id: bathroom_shower  # same as deployed, keeps binary_sensor.bathroom_shower
+        device_class: moisture
+        state: >
+          {% set h = states('sensor.indoor_outdoor_meter_97c8_humidity') | float(-1) %}
+          {% set b = states('sensor.bathroom_humidity_baseline') | float(-1) %}
+          {% set was_on = this.state == 'on' %}
+          {% if h < 0 or b < 0 %}
+            {{ was_on }}
+          {% elif h >= b + states('input_number.bathroom_shower_on_offset') | float(8) %}
+            true
+          {% elif h <= b + states('input_number.bathroom_shower_off_offset') | float(3) %}
+            false
+          {% else %}
+            {{ was_on }}
+          {% endif %}
+
+  - sensor:
+      - name: Bathroom shower on threshold
+        unique_id: bathroom_shower_on_threshold
+        unit_of_measurement: "%"
+        availability: "{{ states('sensor.bathroom_humidity_baseline') | is_number }}"
+        state: >
+          {{ (states('sensor.bathroom_humidity_baseline') | float(0)
+              + states('input_number.bathroom_shower_on_offset') | float(8)) | round(1) }}
+
+      - name: Bathroom shower off threshold
+        unique_id: bathroom_shower_off_threshold
+        unit_of_measurement: "%"
+        availability: "{{ states('sensor.bathroom_humidity_baseline') | is_number }}"
+        state: >
+          {{ (states('sensor.bathroom_humidity_baseline') | float(0)
+              + states('input_number.bathroom_shower_off_offset') | float(3)) | round(1) }}
+
+      # Data collection only. Near-shower minus far temperature. No rule reads it.
+      - name: Bathroom temperature delta
+        unique_id: bathroom_temperature_delta
+        unit_of_measurement: "°F"
+        device_class: temperature
+        state_class: measurement
+        availability: >
+          {{ states('sensor.indoor_outdoor_meter_97c8_temperature') | is_number
+             and states('sensor.square_multi_sensor_temperature') | is_number }}
+        state: >
+          {{ (states('sensor.indoor_outdoor_meter_97c8_temperature') | float(0)
+              - states('sensor.square_multi_sensor_temperature') | float(0)) | round(1) }}
+
+      # Everything the dashboard needs that is a fixed lookup from the published
+      # state. No sensor logic is repeated here.
+      - name: Bathroom debug view
+        unique_id: bathroom_debug_view
+        state: "{{ states('input_select.bathroom_occupancy') }}"
+        attributes:
+          shower_hold: "{{ is_state('binary_sensor.bathroom_shower', 'on') }}"
+          light_hold: "{{ is_state('binary_sensor.bathroom_light_hold', 'on') }}"
+          window_running: "{{ is_state('timer.bathroom_untrusted_window', 'active') }}"
+          window_ends: "{{ state_attr('timer.bathroom_untrusted_window', 'finishes_at') }}"
+          roles: >
+            {% set s = states('input_select.bathroom_occupancy') %}
+            {% set sh = is_state('binary_sensor.bathroom_shower', 'on') %}
+            {{ {
+              'door': 'driving' if s in ['presence', 'uncertain', 'locked'] else 'watching',
+              'pir': 'ignored' if s == 'locked' else ('driving' if s in ['presence', 'uncertain'] else 'watching'),
+              'window': 'driving' if s == 'uncertain' else 'watching',
+              'humidity': 'driving' if sh else 'watching',
+              'baseline': 'driving' if sh else 'watching',
+              'illuminance': 'driving' if is_state('input_boolean.bathroom_switchbot_lux_sync', 'on') else 'watching',
+              'temperatures': 'watching',
+              'tap': 'watching'
+            } }}
+          rules: >
+            {% set s = states('input_select.bathroom_occupancy') %}
+            {% set sh = is_state('binary_sensor.bathroom_shower', 'on') %}
+            {% set m = {
+              'vacant':    {'R1': 'armed',  'R2': 'armed',  'R3': 'armed',  'R4': 'idle',   'R6': 'active', 'R7': 'idle'},
+              'presence':  {'R1': 'active', 'R2': 'armed',  'R3': 'idle',   'R4': 'idle',   'R6': 'armed',  'R7': 'idle'},
+              'uncertain': {'R1': 'idle',   'R2': 'active', 'R3': 'armed',  'R4': 'idle',   'R6': 'armed',  'R7': 'idle'},
+              'locked':    {'R1': 'idle',   'R2': 'idle',   'R3': 'active', 'R4': 'active', 'R6': 'idle',   'R7': 'armed'}
+            } %}
+            {% set r = m.get(s, {}) %}
+            {{ {
+              'R1': r.get('R1', 'idle'), 'R2': r.get('R2', 'idle'), 'R3': r.get('R3', 'idle'),
+              'R4': r.get('R4', 'idle'), 'R5': 'active' if sh else 'armed',
+              'R6': 'idle' if sh else r.get('R6', 'idle'), 'R7': r.get('R7', 'idle')
+            } }}
+          next: >
+            {% set s = states('input_select.bathroom_occupancy') %}
+            {% set w = states('input_number.bathroom_pir_clear_delay') | int(12) %}
+            {% set m = {
+              'vacant': [
+                ['the door opens', 'Presence: light on at once'],
+                ['motion with the door open', 'Presence'],
+                ['motion with the door closed', 'Locked']],
+              'presence': [
+                ['the door closes while motion is showing', 'Uncertain, ' ~ w ~ ' s window starts'],
+                ['no motion for the hold time', 'Vacant'],
+                ['fresh motion after the door has closed', 'Locked']],
+              'uncertain': [
+                ['motion is still showing when the window ends', 'Locked'],
+                ['motion clears inside the window', 'Vacant, with the long light-off delay'],
+                ['the door opens', 'Presence']],
+              'locked': [
+                ['the door opens', 'Presence: the only normal way out'],
+                ['motion clears', 'Nothing: ignored while locked'],
+                ['no motion and no shower for the lock timeout', 'Vacant']]
+            } %}
+            {{ m.get(s, []) }}
+
+  # The SwitchBot as everything else should see it.
+  # Sync OFF: behaves like switch.bathroom (assumed state, always presses).
+  # Sync ON:  state is the measured light; it only presses when the measured
+  #           state differs from what is asked. Out-of-sync cannot invert it.
+  - switch:
+      - name: Bathroom fan and lights
+        unique_id: bathroom_fan_and_lights
+        state: >
+          {% if is_state('input_boolean.bathroom_switchbot_lux_sync', 'on')
+                and has_value('binary_sensor.bathroom_switchbot_lights_measured') %}
+            {{ is_state('binary_sensor.bathroom_switchbot_lights_measured', 'on') }}
+          {% else %}
+            {{ is_state('input_boolean.bathroom_switchbot_target', 'on') }}
+          {% endif %}
+        turn_on:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.bathroom_switchbot_target
+          - if: >
+              {{ not (is_state('input_boolean.bathroom_switchbot_lux_sync', 'on')
+                      and has_value('binary_sensor.bathroom_switchbot_lights_measured'))
+                 or is_state('binary_sensor.bathroom_switchbot_lights_measured', 'off') }}
+            then:
+              - action: switch.toggle
+                target:
+                  entity_id: switch.bathroom
+        turn_off:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.bathroom_switchbot_target
+          - if: >
+              {{ not (is_state('input_boolean.bathroom_switchbot_lux_sync', 'on')
+                      and has_value('binary_sensor.bathroom_switchbot_lights_measured'))
+                 or is_state('binary_sensor.bathroom_switchbot_lights_measured', 'on') }}
+            then:
+              - action: switch.toggle
+                target:
+                  entity_id: switch.bathroom
+
+# ───────────────────────── Automations ─────────────────────────
+
+automation:
+  # One automation owns occupancy. No delays or waits, so a restart never
+  # strands a run. Every branch ends in the set-occupancy script or a timer call.
+  - id: bathroom_occupancy_state_machine
+    alias: Bathroom occupancy state machine
+    mode: queued
+    max: 20
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.bathroom_contact_sensor_contact
+        from: "off"
+        to: "on"
+        id: door_opened
+      - trigger: state
+        entity_id: binary_sensor.bathroom_contact_sensor_contact
+        from: "on"
+        to: "off"
+        id: door_closed
+      - trigger: state
+        entity_id: binary_sensor.square_multi_sensor_occupancy
+        from: "off"
+        to: "on"
+        id: motion_on
+      - trigger: state
+        entity_id: binary_sensor.square_multi_sensor_occupancy
+        from: "on"
+        to: "off"
+        id: motion_off
+      - trigger: event
+        event_type: timer.finished
+        event_data:
+          entity_id: timer.bathroom_untrusted_window
+        id: window_done
+      - trigger: event
+        event_type: timer.finished
+        event_data:
+          entity_id: timer.bathroom_presence_hold
+        id: hold_done
+      - trigger: state
+        entity_id: binary_sensor.square_multi_sensor_occupancy
+        to: "off"
+        for:
+          minutes: "{{ states('input_number.bathroom_lock_timeout') | int(60) }}"
+        id: lock_timeout
+      - trigger: homeassistant
+        event: start
+        id: reconcile
+      - trigger: state
+        entity_id:
+          - binary_sensor.bathroom_contact_sensor_contact
+          - binary_sensor.square_multi_sensor_occupancy
+        from:
+          - unavailable
+          - unknown
+        id: reconcile
+    actions:
+      # Read state when this run starts, not when its trigger fired: in queued
+      # mode an earlier run may have changed occupancy while this one waited.
+      - variables:
+          occ: "{{ states('input_select.bathroom_occupancy') }}"
+          door_closed: "{{ is_state('binary_sensor.bathroom_contact_sensor_contact', 'off') }}"
+          pir_on: "{{ is_state('binary_sensor.square_multi_sensor_occupancy', 'on') }}"
+          door_closed_secs: >
+            {{ (now() - states.binary_sensor.bathroom_contact_sensor_contact.last_changed).total_seconds()
+               if is_state('binary_sensor.bathroom_contact_sensor_contact', 'off') else 0 }}
+          window_s: "{{ states('input_number.bathroom_pir_clear_delay') | int(12) }}"
+          settle_s: "{{ states('input_number.bathroom_door_settle') | int(3) }}"
+          entry_s: "{{ states('input_number.bathroom_door_entry_grace') | int(30) }}"
+          hold_s: "{{ states('input_number.bathroom_presence_hold') | int(180) }}"
+      - choose:
+          # ── Door opened ──
+          - conditions:
+              - condition: trigger
+                id: door_opened
+            sequence:
+              - action: timer.cancel
+                target:
+                  entity_id: timer.bathroom_untrusted_window
+              - choose:
+                  # Someone is leaving, or the lock is simply over.
+                  - conditions: "{{ occ in ['locked', 'uncertain'] }}"
+                    sequence:
+                      - action: script.bathroom_set_occupancy
+                        data:
+                          new_state: presence
+                          rule: R4
+                          reason: "Door opened. The room is no longer sealed, so it follows motion again."
+                      - if: "{{ not pir_on }}"
+                        then:
+                          - action: timer.start
+                            target:
+                              entity_id: timer.bathroom_presence_hold
+                            data:
+                              duration: "{{ hold_s }}"
+                  # Someone is probably coming in: light on now, do not wait for
+                  # the PIR. If no motion follows, the short grace ends it.
+                  - conditions: >
+                      {{ occ == 'vacant'
+                         and (pir_on or is_state('input_boolean.bathroom_door_open_turns_light_on', 'on')) }}
+                    sequence:
+                      - action: script.bathroom_set_occupancy
+                        data:
+                          new_state: presence
+                          rule: R1
+                          reason: "{{ 'Motion with the door open.' if pir_on else 'Door opened from vacant. Assuming someone is coming in.' }}"
+                      - if: "{{ not pir_on }}"
+                        then:
+                          - action: timer.start
+                            target:
+                              entity_id: timer.bathroom_presence_hold
+                            data:
+                              duration: "{{ entry_s }}"
+
+          # ── Door closed: only matters if motion is showing right now ──
+          - conditions:
+              - condition: trigger
+                id: door_closed
+              - condition: template
+                value_template: "{{ pir_on and occ != 'locked' }}"
+            sequence:
+              - action: timer.cancel
+                target:
+                  entity_id: timer.bathroom_presence_hold
+              - action: timer.start
+                target:
+                  entity_id: timer.bathroom_untrusted_window
+                data:
+                  duration: "{{ window_s }}"
+              - action: script.bathroom_set_occupancy
+                data:
+                  new_state: uncertain
+                  rule: R2
+                  reason: "Door closed while motion was showing. Not trusted for {{ window_s }} s: it may be the leftover reading."
+
+          # ── Motion started ──
+          - conditions:
+              - condition: trigger
+                id: motion_on
+            sequence:
+              - action: timer.cancel
+                target:
+                  entity_id: timer.bathroom_presence_hold
+              - choose:
+                  - conditions: "{{ occ == 'locked' }}"
+                    sequence: []
+                  # Door closed long enough that this cannot be the door swing or
+                  # the person who just left: someone is inside.
+                  - conditions: "{{ door_closed and door_closed_secs >= settle_s }}"
+                    sequence:
+                      - action: timer.cancel
+                        target:
+                          entity_id: timer.bathroom_untrusted_window
+                      - action: script.bathroom_set_occupancy
+                        data:
+                          new_state: locked
+                          rule: R3
+                          reason: "Fresh motion with the door closed for {{ door_closed_secs | round(0) }} s. Someone is inside until the door opens."
+                  # Motion report arrived just after the door closed.
+                  - conditions: "{{ door_closed }}"
+                    sequence:
+                      - action: timer.start
+                        target:
+                          entity_id: timer.bathroom_untrusted_window
+                        data:
+                          duration: "{{ window_s }}"
+                      - action: script.bathroom_set_occupancy
+                        data:
+                          new_state: uncertain
+                          rule: R2
+                          reason: "Motion reported within {{ settle_s }} s of the door closing. Not trusted for {{ window_s }} s."
+                  - conditions: "{{ occ != 'presence' }}"
+                    sequence:
+                      - action: script.bathroom_set_occupancy
+                        data:
+                          new_state: presence
+                          rule: R1
+                          reason: "Motion with the door open."
+
+          # ── Motion cleared ──
+          - conditions:
+              - condition: trigger
+                id: motion_off
+            sequence:
+              - choose:
+                  # Rule id R2c marks an AMBIGUOUS exit: this looks the same as a
+                  # person who went still right after closing the door. The
+                  # lights automation uses the long delay after R2c.
+                  - conditions: "{{ occ == 'uncertain' }}"
+                    sequence:
+                      - action: timer.cancel
+                        target:
+                          entity_id: timer.bathroom_untrusted_window
+                      - action: script.bathroom_set_occupancy
+                        data:
+                          new_state: vacant
+                          rule: R2c
+                          reason: "Motion cleared inside the window after the door closed. Probably the leftover reading, so probably empty. Light held for the long delay in case someone is sitting still."
+                  - conditions: "{{ occ == 'presence' }}"
+                    sequence:
+                      - action: timer.start
+                        target:
+                          entity_id: timer.bathroom_presence_hold
+                        data:
+                          duration: "{{ hold_s }}"
+                # locked: motion clearing is ignored (R4)
+
+          # ── Untrusted window ended ──
+          - conditions:
+              - condition: trigger
+                id: window_done
+              - condition: template
+                value_template: "{{ occ == 'uncertain' }}"
+            sequence:
+              - choose:
+                  - conditions: "{{ door_closed and pir_on }}"
+                    sequence:
+                      - action: script.bathroom_set_occupancy
+                        data:
+                          new_state: locked
+                          rule: R3
+                          reason: "Motion still showing {{ window_s }} s after the door closed. Someone is inside until the door opens."
+                  - conditions: "{{ not door_closed }}"
+                    sequence:
+                      - action: script.bathroom_set_occupancy
+                        data:
+                          new_state: presence
+                          rule: R4
+                          reason: "Window ended with the door open."
+                default:
+                  - action: script.bathroom_set_occupancy
+                    data:
+                      new_state: vacant
+                      rule: R2c
+                      reason: "Window ended with no motion showing."
+
+          # ── Hold or door-entry grace ran out ──
+          - conditions:
+              - condition: trigger
+                id: hold_done
+              - condition: template
+                value_template: "{{ occ == 'presence' and not pir_on }}"
+            sequence:
+              - action: script.bathroom_set_occupancy
+                data:
+                  new_state: vacant
+                  rule: R1
+                  reason: "No motion for the hold time and the room was never sealed with someone inside."
+
+          # ── Escape hatch for a false lock ──
+          - conditions:
+              - condition: trigger
+                id: lock_timeout
+              - condition: template
+                value_template: "{{ occ == 'locked' and is_state('binary_sensor.bathroom_shower', 'off') }}"
+            sequence:
+              - action: script.bathroom_set_occupancy
+                data:
+                  new_state: vacant
+                  rule: R7
+                  reason: "Locked, but no motion and no shower for {{ states('input_number.bathroom_lock_timeout') | int(60) }} min. Treated as a false lock."
+
+          # ── Restart, or a sensor came back from unavailable ──
+          - conditions:
+              - condition: trigger
+                id: reconcile
+            sequence:
+              - choose:
+                  - conditions: "{{ occ in ['locked', 'uncertain'] and not door_closed }}"
+                    sequence:
+                      - action: script.bathroom_set_occupancy
+                        data:
+                          new_state: presence
+                          rule: R4
+                          reason: "Reconcile: was {{ occ }}, but the door is open."
+                      - if: "{{ not pir_on }}"
+                        then:
+                          - action: timer.start
+                            target:
+                              entity_id: timer.bathroom_presence_hold
+                            data:
+                              duration: "{{ hold_s }}"
+                  # timer.finished is not replayed for a timer that ended while
+                  # Home Assistant was down, so decide now. Bias: stay occupied.
+                  - conditions: "{{ occ == 'uncertain' and is_state('timer.bathroom_untrusted_window', 'idle') }}"
+                    sequence:
+                      - action: script.bathroom_set_occupancy
+                        data:
+                          new_state: "{{ 'locked' if pir_on else 'vacant' }}"
+                          rule: "{{ 'R3' if pir_on else 'R2c' }}"
+                          reason: "Reconcile: the window ended while Home Assistant was not running. Motion is {{ 'showing' if pir_on else 'clear' }} now."
+                  - conditions: "{{ occ == 'presence' and not pir_on and is_state('timer.bathroom_presence_hold', 'idle') }}"
+                    sequence:
+                      - action: timer.start
+                        target:
+                          entity_id: timer.bathroom_presence_hold
+                        data:
+                          duration: "{{ hold_s }}"
+
+  # Hue bulb. ON: the instant occupancy leaves vacant (door or motion).
+  # OFF: only after "light hold" has been off for the delay. Humidity never
+  # turns it on.
+  - id: ham_bathroom_lights_occupancy  # deployed id, keeps automation.bathroom_lights_by_occupancy
+    alias: Bathroom lights by occupancy
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: input_select.bathroom_occupancy
+        from: vacant
+        id: "on"
+      - trigger: state
+        entity_id: binary_sensor.bathroom_light_hold
+        from: "on"
+        to: "off"
+        for:
+          seconds: >
+            {{ states('input_number.bathroom_ambiguous_exit_delay') | int(300)
+               if is_state('input_text.bathroom_last_rule', 'R2c')
+               else states('input_number.bathroom_light_off_delay') | int(60) }}
+        id: "off"
+      - trigger: homeassistant
+        event: start
+        id: reconcile
+    actions:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: "on"
+            sequence:
+              - choose:
+                  - conditions:
+                      - condition: state
+                        entity_id: light.bathroom_ceiling_light
+                        state: "off"
+                    sequence:
+                      - action: light.turn_on
+                        target:
+                          entity_id: light.bathroom_ceiling_light
+                        data:
+                          brightness_pct: "{{ states('sensor.house_light_level') | int(30) }}"
+                          transition: 0.3
+                  # Hue bulb unreachable (its wall switch is off, or it dropped
+                  # out): use the SwitchBot lights, but only through the
+                  # sync-corrected switch so the press cannot invert.
+                  - conditions: >
+                      {{ not has_value('light.bathroom_ceiling_light')
+                         and is_state('input_boolean.bathroom_switchbot_fallback', 'on')
+                         and is_state('input_boolean.bathroom_switchbot_lux_sync', 'on') }}
+                    sequence:
+                      - action: input_boolean.turn_on
+                        target:
+                          entity_id: input_boolean.bathroom_fallback_active
+                      - action: switch.turn_on
+                        target:
+                          entity_id: switch.bathroom_fan_and_lights
+          - conditions:
+              - condition: trigger
+                id: "off"
+            sequence:
+              - if: "{{ has_value('light.bathroom_ceiling_light') }}"
+                then:
+                  - action: light.turn_off
+                    target:
+                      entity_id: light.bathroom_ceiling_light
+                    data:
+                      transition: 3
+              - if: "{{ is_state('input_boolean.bathroom_fallback_active', 'on') }}"
+                then:
+                  - action: input_boolean.turn_off
+                    target:
+                      entity_id: input_boolean.bathroom_fallback_active
+                  - action: switch.turn_off
+                    target:
+                      entity_id: switch.bathroom_fan_and_lights
+          # The light-off `for:` is lost on restart: clean up if it was pending.
+          - conditions:
+              - condition: trigger
+                id: reconcile
+              - condition: state
+                entity_id: binary_sensor.bathroom_light_hold
+                state: "off"
+              - condition: state
+                entity_id: light.bathroom_ceiling_light
+                state: "on"
+            sequence:
+              - action: light.turn_off
+                target:
+                  entity_id: light.bathroom_ceiling_light
+
+  # Fan (and the two lights on the same wall switch) follow the shower.
+  - id: ham_bathroom_fan_humidity  # deployed id, keeps automation.bathroom_fan_by_humidity
+    alias: Bathroom fan by humidity
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.bathroom_shower
+        from: "off"
+        to: "on"
+        id: shower_on
+      - trigger: state
+        entity_id: binary_sensor.bathroom_shower
+        from: "on"
+        to: "off"
+        id: check_off
+      - trigger: state
+        entity_id: binary_sensor.bathroom_occupied
+        from: "on"
+        to: "off"
+        for:
+          minutes: "{{ states('input_number.bathroom_fan_off_delay') | int(10) }}"
+        id: check_off
+      - trigger: state
+        entity_id: switch.bathroom_fan_and_lights
+        to: "on"
+        for:
+          minutes: "{{ states('input_number.bathroom_fan_safety') | int(90) }}"
+        id: safety
+    actions:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: shower_on
+            sequence:
+              - action: switch.turn_on
+                target:
+                  entity_id: switch.bathroom_fan_and_lights
+          - conditions:
+              - condition: trigger
+                id: check_off
+              - condition: state
+                entity_id: binary_sensor.bathroom_shower
+                state: "off"
+              - condition: state
+                entity_id: switch.bathroom_fan_and_lights
+                state: "on"
+              - condition: state
+                entity_id: input_boolean.bathroom_fallback_active
+                state: "off"
+              - condition: template
+                value_template: >
+                  {{ is_state('binary_sensor.bathroom_occupied', 'off')
+                     and (now() - states.binary_sensor.bathroom_occupied.last_changed).total_seconds()
+                         >= states('input_number.bathroom_fan_off_delay') | int(10) * 60 - 1 }}
+            sequence:
+              - action: switch.turn_off
+                target:
+                  entity_id: switch.bathroom_fan_and_lights
+          - conditions:
+              - condition: trigger
+                id: safety
+              - condition: state
+                entity_id: binary_sensor.bathroom_occupied
+                state: "off"
+              - condition: state
+                entity_id: binary_sensor.bathroom_shower
+                state: "off"
+            sequence:
+              - action: switch.turn_off
+                target:
+                  entity_id: switch.bathroom_fan_and_lights
+
+  # Keeps Home Assistant's idea of the SwitchBot in line with the light sensor.
+  # Runs on every luminosity report (no polling needed). If the last command and
+  # the measured light disagree for a minute, reality wins: someone used the
+  # wall switch, or a press failed. Nothing is pressed here.
+  - id: bathroom_switchbot_sync
+    alias: Bathroom SwitchBot sync from light sensor
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.bathroom_switchbot_mismatch
+        from: "off"
+        to: "on"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.bathroom_switchbot_lux_sync
+        state: "on"
+    actions:
+      - action: "input_boolean.turn_{{ 'on' if is_state('binary_sensor.bathroom_switchbot_lights_measured', 'on') else 'off' }}"
+        target:
+          entity_id: input_boolean.bathroom_switchbot_target
+      - action: logbook.log
+        data:
+          name: Bathroom SwitchBot
+          entity_id: switch.bathroom_fan_and_lights
+          message: >
+            Measured light says the SwitchBot circuit is
+            {{ states('binary_sensor.bathroom_switchbot_lights_measured') }}, which is not what was last commanded.
+            Adopted the measured state (wall switch used by hand, or a press failed).
