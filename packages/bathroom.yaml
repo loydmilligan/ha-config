@@ -1,0 +1,234 @@
+# STAGE 1 of the v3 rollout: helpers and scripts only. Templates and automations follow
+# in stage 2, after script.bathroom_apply_defaults has run. Full design: ha-manager docs/bathroom-v3.
+# Bathroom "wasp in a box" — Home Assistant package, design v3 (2026-11-12)
+# Design and reasoning: ../DESIGN-HA.md. NOT yet run in Home Assistant.
+# Run "Check configuration" and the paper scenarios before deploying.
+#
+# Error priorities this is tuned for (Matt's ranking):
+#   1. Light off with someone in the room      — worst by far
+#   2. Light not on, or slow, when someone enters
+#   3. Light on in an empty room               — least bad, by a wide margin
+#
+# Replaces: the trigger-based template behind binary_sensor.bathroom_occupied,
+#           binary_sensor.bathroom_shower (same thresholds, now adjustable),
+#           automation.bathroom_lights_by_occupancy, automation.bathroom_fan_by_humidity.
+# Keeps:    sensor.bathroom_humidity_baseline, sensor.house_light_level,
+#           automation.bathroom_hue_tap (repoint it at switch.bathroom_fan_and_lights).
+#
+# First-time setup: run script.bathroom_apply_defaults once. Helpers have no
+# `initial:` so that later tuning survives restarts.
+
+# ───────────────────────── Helpers ─────────────────────────
+
+input_select:
+  bathroom_occupancy:
+    name: Bathroom occupancy
+    icon: mdi:shower-head
+    options:
+      - vacant
+      - presence
+      - uncertain
+      - locked
+
+# Every judgment call is a knob. Defaults are in script.bathroom_apply_defaults.
+input_number:
+  bathroom_pir_clear_delay:
+    name: "Bathroom: untrusted window after door closes"
+    min: 5
+    max: 60
+    step: 1
+    unit_of_measurement: s
+    mode: box
+  bathroom_door_settle:
+    name: "Bathroom: door settle time"
+    min: 0
+    max: 10
+    step: 1
+    unit_of_measurement: s
+    mode: box
+  bathroom_door_entry_grace:
+    name: "Bathroom: wait for motion after door opens"
+    min: 10
+    max: 300
+    step: 5
+    unit_of_measurement: s
+    mode: box
+  bathroom_presence_hold:
+    name: "Bathroom: open-door hold after motion clears"
+    min: 30
+    max: 900
+    step: 10
+    unit_of_measurement: s
+    mode: box
+  bathroom_light_off_delay:
+    name: "Bathroom: light-off delay"
+    min: 0
+    max: 600
+    step: 10
+    unit_of_measurement: s
+    mode: box
+  bathroom_ambiguous_exit_delay:
+    name: "Bathroom: light-off delay after an ambiguous exit"
+    min: 0
+    max: 1800
+    step: 30
+    unit_of_measurement: s
+    mode: box
+  bathroom_lock_timeout:
+    name: "Bathroom: lock timeout (no motion, no shower)"
+    min: 15
+    max: 240
+    step: 5
+    unit_of_measurement: min
+    mode: box
+  bathroom_shower_on_offset:
+    name: "Bathroom: shower starts at baseline +"
+    min: 2
+    max: 30
+    step: 0.5
+    unit_of_measurement: "%"
+    mode: box
+  bathroom_shower_off_offset:
+    name: "Bathroom: shower ends at baseline +"
+    min: 0
+    max: 20
+    step: 0.5
+    unit_of_measurement: "%"
+    mode: box
+  bathroom_shower_max_hold:
+    name: "Bathroom: longest a shower can hold the light"
+    min: 30
+    max: 360
+    step: 10
+    unit_of_measurement: min
+    mode: box
+  bathroom_fan_off_delay:
+    name: "Bathroom: fan off after vacant for"
+    min: 0
+    max: 60
+    step: 1
+    unit_of_measurement: min
+    mode: box
+  bathroom_fan_safety:
+    name: "Bathroom: fan safety cut-off"
+    min: 30
+    max: 360
+    step: 10
+    unit_of_measurement: min
+    mode: box
+  bathroom_switchbot_lux_threshold:
+    name: "Bathroom: SwitchBot lights lux threshold"
+    min: 5
+    max: 100
+    step: 1
+    unit_of_measurement: lx
+    mode: box
+  bathroom_hue_lux_at_full:
+    name: "Bathroom: lux from the Hue bulb alone at 100 %"
+    min: 0
+    max: 200
+    step: 1
+    unit_of_measurement: lx
+    mode: box
+
+input_boolean:
+  bathroom_door_open_turns_light_on:
+    name: "Bathroom: door opening turns the light on"
+  bathroom_switchbot_lux_sync:
+    name: "Bathroom: keep SwitchBot in sync from the light sensor"
+  bathroom_switchbot_fallback:
+    name: "Bathroom: use SwitchBot lights if the Hue bulb is unavailable"
+  # Internal bookkeeping, not knobs:
+  bathroom_switchbot_target:
+    name: "Bathroom: SwitchBot last commanded state"
+  bathroom_fallback_active:
+    name: "Bathroom: SwitchBot is standing in for the Hue bulb"
+
+timer:
+  bathroom_untrusted_window:
+    name: Bathroom untrusted window
+    restore: true
+  bathroom_presence_hold:
+    name: Bathroom presence hold
+    restore: true
+
+input_text:
+  bathroom_last_rule:
+    name: Bathroom last rule
+    max: 16
+  bathroom_last_reason:
+    name: Bathroom last reason
+    max: 255
+
+# ───────────────────────── Scripts ─────────────────────────
+
+script:
+  # The only writer of occupancy, rule and reason.
+  bathroom_set_occupancy:
+    alias: Bathroom set occupancy
+    mode: queued
+    max: 20
+    fields:
+      new_state:
+        description: vacant | presence | uncertain | locked
+      rule:
+        description: Rule id that fired, for example R3
+      reason:
+        description: One plain sentence for the dashboard
+    sequence:
+      # Rule and reason first, so anything reacting to the state reads fresh text.
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.bathroom_last_rule
+        data:
+          value: "{{ rule }}"
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.bathroom_last_reason
+        data:
+          value: "{{ reason[:255] }}"
+      - action: input_select.select_option
+        target:
+          entity_id: input_select.bathroom_occupancy
+        data:
+          option: "{{ new_state }}"
+      - action: logbook.log
+        data:
+          name: Bathroom occupancy
+          entity_id: input_select.bathroom_occupancy
+          message: "{{ rule }} → {{ new_state }}: {{ reason }}"
+
+  # Run once after first load. Conservative = biased toward keeping the light on.
+  bathroom_apply_defaults:
+    alias: Bathroom apply default tuning
+    mode: single
+    sequence:
+      - repeat:
+          for_each:
+            - { e: bathroom_pir_clear_delay, v: 12 }
+            - { e: bathroom_door_settle, v: 3 }
+            - { e: bathroom_door_entry_grace, v: 30 }
+            - { e: bathroom_presence_hold, v: 180 }
+            - { e: bathroom_light_off_delay, v: 60 }
+            - { e: bathroom_ambiguous_exit_delay, v: 300 }
+            - { e: bathroom_lock_timeout, v: 60 }
+            - { e: bathroom_shower_on_offset, v: 8 }
+            - { e: bathroom_shower_off_offset, v: 3 }
+            - { e: bathroom_shower_max_hold, v: 120 }
+            - { e: bathroom_fan_off_delay, v: 10 }
+            - { e: bathroom_fan_safety, v: 90 }
+            - { e: bathroom_switchbot_lux_threshold, v: 15 }
+            - { e: bathroom_hue_lux_at_full, v: 20 }
+          sequence:
+            - action: input_number.set_value
+              target:
+                entity_id: "input_number.{{ repeat.item.e }}"
+              data:
+                value: "{{ repeat.item.v }}"
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.bathroom_door_open_turns_light_on
+      # Left OFF until the two luminosity measurements are done (DESIGN-HA.md §7):
+      #   input_boolean.bathroom_switchbot_lux_sync
+      #   input_boolean.bathroom_switchbot_fallback
+

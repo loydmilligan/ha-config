@@ -29,6 +29,7 @@ amcrest:
       - motion_detected
       - online
 homeassistant:
+  packages: !include_dir_named packages
   external_url: https://ha.mattmariani.com
   internal_url: http://192.168.6.38:8123
 #  auth_providers:
