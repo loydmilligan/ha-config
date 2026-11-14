@@ -258,21 +258,29 @@ rest_command:
       method: POST
       headers:
         Authorization: !secret pocket_sign_key
+      content_type: "application/json"
+      payload: "{}"
     sign_ext_pause:
       url: "https://sign.dogbelly.app/api/v1/ext/displays/{{ display }}/pause"
       method: POST
       headers:
         Authorization: !secret pocket_sign_key
+      content_type: "application/json"
+      payload: "{}"
     sign_ext_reset:
       url: "https://sign.dogbelly.app/api/v1/ext/displays/{{ display }}/reset"
       method: POST
       headers:
         Authorization: !secret pocket_sign_key
+      content_type: "application/json"
+      payload: "{}"
     sign_ext_dismiss:
       url: "https://sign.dogbelly.app/api/v1/ext/displays/{{ display }}/dismiss"
       method: POST
       headers:
         Authorization: !secret pocket_sign_key
+      content_type: "application/json"
+      payload: "{}"
 
 # HA Manager phone approvals: the emoji to tap in the ntfy approval push. Pulled (read-only)
 # from the ham-approvals service on mash-ubie; HA never writes to it. State is e.g. "#19 🦊"
