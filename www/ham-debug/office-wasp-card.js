@@ -40,7 +40,7 @@
     radar: { name: 'Radar (combined)', entity: E.radar, about: 'OR of office floor, Matt\'s desk, and Mara\'s Sonoff. Either seeing someone turns the lights on; 5 min with nobody turns them off.', rules: 'R1 R2 R3' },
     floor: { name: 'Office floor', entity: E.floor, about: 'Everything Presence Lite zone 3: the room as a whole.', rules: 'R1' },
     matt: { name: 'Matt\'s desk', entity: E.matt, about: 'Everything Presence Lite zone 1.', rules: 'R1' },
-    mara: { name: 'Mara\'s desk', entity: E.mara, about: 'Sonoff mmWave on the south wall, aimed at Mara\'s desk.', rules: 'R1' },
+    mara: { name: 'Mara\'s desk', entity: E.mara, about: 'Sonoff mmWave on the IT-cabinet wall (top-right), aimed down at Mara\'s desk.', rules: 'R1' },
     motion: { name: 'Camera motion', entity: E.motion, about: 'Amcrest motion. Sets presence to motion and starts vision checks while the lights are on.', rules: 'R4 R5' },
     answer: { name: 'Vision answer', entity: E.answer, about: 'Last classifier result. Empty answers count toward lights-off only if not a reused frame.', rules: 'R5 R6' },
     streak: { name: 'Empty streak', entity: E.streak, about: 'Valid empty vision checks in a row. Lights off when this reaches the required count and radar + camera motion are both off.', rules: 'R6' },
@@ -70,37 +70,53 @@
     ['R7', 'Camera motion while lights are off: backup AI snapshots can turn them on (radar is the primary on-path).'],
   ];
 
-  // office.json: 160 × 124 in, y down. Scale 5 px/in.
+  // office.json (room-drawer/2 from room-room.json): 160 × 124 in, y down. Scale 5 px/in.
+  // Facing is degrees clockwise from up, same as the room drawer: angle = facing - 90.
   const S = 5, OX = 48, OY = 36;
   const X = (i) => Math.round(OX + i * S), Y = (i) => Math.round(OY + i * S);
   const pts = (arr) => arr.map(([x, y]) => X(x) + ',' + Y(y)).join(' ');
+  const wedge = (xIn, yIn, facing, fov, rangeIn) => {
+    const x = X(xIn), y = Y(yIn), a = (facing - 90) * Math.PI / 180, half = (fov / 2) * Math.PI / 180, R = rangeIn * S;
+    const x1 = x + Math.cos(a - half) * R, y1 = y + Math.sin(a - half) * R;
+    const x2 = x + Math.cos(a + half) * R, y2 = y + Math.sin(a + half) * R;
+    return 'M ' + x + ' ' + y + ' L ' + x1 + ' ' + y1 + ' A ' + R + ' ' + R + ' 0 0 1 ' + x2 + ' ' + y2 + ' Z';
+  };
   const F = {
     host: { w: 1120, h: 720 },
     room: pts([[0, 0], [160, 0], [160, 124], [0, 124]]),
     matt: pts([[0, 24], [54, 24], [54, 108], [0, 108]]),
     mara: pts([[96, 66], [159, 66], [159, 123], [96, 123]]),
     ignore: pts([[0, 84], [27, 84], [27, 120], [0, 120]]),
-    doors: [
-      { a: [117, 0], b: [144, 0] },
-      { a: [6, 6], b: [33, 3] },
-      { a: [39, 124], b: [114, 124] },
+    fixtures: [
+      { name: 'Rolltop', pts: pts([[0, 27], [33, 27], [33, 108], [0, 108]]), lx: 4, ly: 40 },
+      { name: 'Console', pts: pts([[42, 0], [114, 0], [114, 12], [42, 12]]), lx: 70, ly: 8 },
+      { name: 'IT cabinet', pts: pts([[144, 3], [159, 3], [159, 51], [144, 51]]), lx: 145, ly: 28 },
+      { name: 'Desk', pts: pts([[135, 75], [159, 75], [159, 102], [135, 102]]), lx: 138, ly: 88 },
+      { name: 'Corner desk', pts: pts([[111, 102], [159, 102], [159, 123], [111, 123]]), lx: 118, ly: 114 },
     ],
-    sensor: { x: X(3), y: Y(6), facing: 145, fov: 120, range: 90 },
+    doors: [
+      { a: [117, 0], b: [144, 0], label: 'Kitchen', lx: 130, ly: -4 },
+      { a: [6, 0], b: [33, 0], label: 'Hallway', lx: 20, ly: -4 },
+      { a: [54, 123], b: [117, 123], label: 'Living', lx: 85, ly: 128 },
+    ],
+    ep: { x: 0, y: 0, facing: 145, fov: 120, range: 236 },
+    sonoff: { x: 144, y: 12, facing: 185, fov: 120, range: 110 },
+    cam: { x: 144, y: 18, facing: 255, fov: 90, range: 90 },
     lights: [
-      { id: 'l1', x: X(55), y: Y(40) },
-      { id: 'l2', x: X(105), y: Y(40) },
-      { id: 'l3', x: X(55), y: Y(85) },
-      { id: 'l4', x: X(105), y: Y(85) },
+      { id: 'l1', x: X(72), y: Y(54) },
+      { id: 'l2', x: X(72), y: Y(66) },
+      { id: 'l3', x: X(84), y: Y(66) },
+      { id: 'l4', x: X(84), y: Y(54) },
     ],
     pins: [
       { id: 'radar', label: 'Radar', x: 70, y: 48, w: 168 },
-      { id: 'floor', label: 'Office floor', x: 70, y: 320, w: 168 },
       { id: 'matt', label: "Matt's desk", x: 70, y: 200, w: 168 },
-      { id: 'mara', label: "Mara's desk", x: 620, y: 430, w: 168 },
-      { id: 'motion', label: 'Camera motion', x: 430, y: 48, w: 180 },
-      { id: 'answer', label: 'Vision', x: 430, y: 100, w: 180 },
-      { id: 'autoOff', label: 'Auto-off flag', x: 620, y: 48, w: 180 },
-      { id: 'streak', label: 'Empty streak', x: 620, y: 100, w: 180 },
+      { id: 'floor', label: 'Office floor', x: 280, y: 400, w: 168 },
+      { id: 'mara', label: "Mara's desk", x: 500, y: 480, w: 168 },
+      { id: 'motion', label: 'Camera motion', x: 620, y: 70, w: 180 },
+      { id: 'answer', label: 'Vision', x: 870, y: 280, w: 180 },
+      { id: 'autoOff', label: 'Auto-off flag', x: 870, y: 340, w: 180 },
+      { id: 'streak', label: 'Empty streak', x: 870, y: 400, w: 180 },
     ],
     legend: { x: 870, y: 36, w: 230 },
   };
@@ -317,33 +333,42 @@
 
       const roomFill = this.s(E.floor) === 'on' ? '#121b27' : '#12161c';
       const roomStroke = this.s(E.radar) === 'on' ? T.blue : T.dim;
-      const wedge = (() => {
-        const p = F.sensor, rad = p.facing * Math.PI / 180, half = (p.fov / 2) * Math.PI / 180;
-        const a1 = rad - half, a2 = rad + half;
-        const x1 = p.x + Math.sin(a1) * p.range * S, y1 = p.y + Math.cos(a1) * p.range * S;
-        const x2 = p.x + Math.sin(a2) * p.range * S, y2 = p.y + Math.cos(a2) * p.range * S;
-        return 'M ' + p.x + ' ' + p.y + ' L ' + x1 + ' ' + y1 + ' A ' + (p.range * S) + ' ' + (p.range * S) + ' 0 0 0 ' + x2 + ' ' + y2 + ' Z';
-      })();
       const zoneFill = (on) => on ? 'rgba(108,176,255,0.22)' : 'rgba(47,57,69,0.35)';
       const zoneStroke = (on) => on ? T.blue : T.line;
       const lightsSvg = F.lights.map((l) => {
         const on = V[l.id][1] === 'on';
-        return '<circle cx="' + l.x + '" cy="' + l.y + '" r="16" fill="' + (on ? T.blue : 'transparent') + '" fill-opacity="' + (on ? 0.35 : 0) + '" stroke="' + (on ? T.blue : T.line) + '" stroke-width="2"/>' +
+        return '<circle cx="' + l.x + '" cy="' + l.y + '" r="14" fill="' + (on ? T.blue : 'transparent') + '" fill-opacity="' + (on ? 0.35 : 0) + '" stroke="' + (on ? T.blue : T.line) + '" stroke-width="2"/>' +
           '<text x="' + l.x + '" y="' + (l.y + 4) + '" text-anchor="middle" font-size="10" fill="' + (on ? T.blue : T.dim) + '">' + l.id.slice(1) + '</text>';
       }).join('');
-      const doorsSvg = F.doors.map((d) => '<line x1="' + X(d.a[0]) + '" y1="' + Y(d.a[1]) + '" x2="' + X(d.b[0]) + '" y2="' + Y(d.b[1]) + '" stroke="' + T.text + '" stroke-width="8" stroke-linecap="round"/>').join('');
+      const doorsSvg = F.doors.map((d) =>
+        '<line x1="' + X(d.a[0]) + '" y1="' + Y(d.a[1]) + '" x2="' + X(d.b[0]) + '" y2="' + Y(d.b[1]) + '" stroke="' + T.text + '" stroke-width="8" stroke-linecap="round"/>' +
+        '<text x="' + X(d.lx) + '" y="' + Y(d.ly) + '" text-anchor="middle" font-size="11" fill="' + T.dim + '" font-family="Inter,system-ui,sans-serif">' + d.label + '</text>'
+      ).join('');
+      const fixturesSvg = F.fixtures.map((f) =>
+        '<polygon points="' + f.pts + '" fill="rgba(154,167,180,0.10)" stroke="' + T.line + '" stroke-width="1"/>' +
+        '<text x="' + X(f.lx) + '" y="' + Y(f.ly) + '" font-size="11" fill="' + T.dim + '" font-family="Inter,system-ui,sans-serif">' + f.name + '</text>'
+      ).join('');
+      const mark = (p, fill, label, ox, oy) =>
+        '<circle cx="' + X(p.x) + '" cy="' + Y(p.y) + '" r="7" fill="' + fill + '"/>' +
+        '<text x="' + X(p.x + ox) + '" y="' + Y(p.y + oy) + '" font-size="11" fill="' + T.dim + '" font-family="Inter,system-ui,sans-serif">' + label + '</text>';
       const planSvg = '<svg width="' + F.host.w + '" height="' + F.host.h + '" xmlns="http://www.w3.org/2000/svg">' +
+        '<defs><clipPath id="officeRoom"><polygon points="' + F.room + '"/></clipPath></defs>' +
         '<polygon points="' + F.room + '" fill="' + roomFill + '" stroke="' + roomStroke + '" stroke-width="4"/>' +
-        '<path d="' + wedge + '" fill="rgba(108,176,255,0.08)" stroke="' + T.blue + '" stroke-width="1" stroke-dasharray="4 4"/>' +
+        '<g clip-path="url(#officeRoom)">' +
+        '<path d="' + wedge(F.ep.x, F.ep.y, F.ep.facing, F.ep.fov, F.ep.range) + '" fill="rgba(108,176,255,0.10)" stroke="' + T.blue + '" stroke-width="1" stroke-dasharray="4 4"/>' +
+        '<path d="' + wedge(F.sonoff.x, F.sonoff.y, F.sonoff.facing, F.sonoff.fov, F.sonoff.range) + '" fill="rgba(108,176,255,0.08)" stroke="' + T.blue + '" stroke-width="1" stroke-dasharray="3 4"/>' +
+        '<path d="' + wedge(F.cam.x, F.cam.y, F.cam.facing, F.cam.fov, F.cam.range) + '" fill="rgba(207,214,222,0.08)" stroke="' + T.dim + '" stroke-width="1" stroke-dasharray="2 4"/>' +
+        '</g>' +
         '<polygon points="' + F.matt + '" fill="' + zoneFill(this.s(E.matt) === 'on') + '" stroke="' + zoneStroke(this.s(E.matt) === 'on') + '" stroke-width="2"/>' +
         '<polygon points="' + F.mara + '" fill="' + zoneFill(this.s(E.mara) === 'on') + '" stroke="' + zoneStroke(this.s(E.mara) === 'on') + '" stroke-width="2"/>' +
         '<polygon points="' + F.ignore + '" fill="rgba(154,167,180,0.12)" stroke="' + T.dim + '" stroke-width="1" stroke-dasharray="4 3"/>' +
-        doorsSvg + lightsSvg +
-        '<circle cx="' + F.sensor.x + '" cy="' + F.sensor.y + '" r="7" fill="' + T.blue + '"/>' +
-        '<text x="' + X(8) + '" y="' + Y(20) + '" font-size="12" fill="' + T.dim + '" font-family="Inter,system-ui,sans-serif">EP Lite</text>' +
-        '<text x="' + X(10) + '" y="' + Y(70) + '" font-size="12" fill="' + T.dim + '" font-family="Inter,system-ui,sans-serif">Matt desk</text>' +
+        fixturesSvg + doorsSvg + lightsSvg +
+        mark(F.ep, T.blue, 'EP Lite', 4, 5) +
+        mark(F.sonoff, T.blue, 'Sonoff', -18, -4) +
+        mark(F.cam, T.dim, 'Camera', -18, 6) +
+        '<text x="' + X(8) + '" y="' + Y(70) + '" font-size="12" fill="' + T.dim + '" font-family="Inter,system-ui,sans-serif">Matt desk</text>' +
         '<text x="' + X(108) + '" y="' + Y(92) + '" font-size="12" fill="' + T.dim + '" font-family="Inter,system-ui,sans-serif">Mara desk</text>' +
-        '<text x="' + X(4) + '" y="' + Y(100) + '" font-size="11" fill="' + T.dim + '" font-family="Inter,system-ui,sans-serif">ignore</text>' +
+        '<text x="' + X(4) + '" y="' + Y(100) + '" font-size="11" fill="' + T.dim + '" font-family="Inter,system-ui,sans-serif">fan ignore</text>' +
         '</svg>';
 
       const pins = F.pins.map((p) => {
@@ -363,7 +388,7 @@
         '<b style="margin-top:6px">Lights</b>' +
         key('border-radius:50%;border:2px solid ' + T.blue + ';background:rgba(108,176,255,0.4)', 'Glow: on') +
         key('border-radius:50%;border:2px solid ' + T.line, 'Ring: off') +
-        '<div class="dim" style="margin-top:6px">Layout from office.json (160 × 124 in). Light positions are a 2×2 guess until they are drawn in the room drawer.</div></div>';
+        '<div class="dim" style="margin-top:6px">Layout from room-room.json (160 × 124 in). Lights 1–4 are the centre cluster in drawing order; say if a number is on the wrong bulb.</div></div>';
 
       const statesHtml = STATES.map((x) => {
         const now = x.id === occ, c = C[x.color];
