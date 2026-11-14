@@ -249,6 +249,30 @@ rest_command:
       method: DELETE
       headers:
         Authorization: !secret pocket_sign_bearer
+    # Pocket Sign ext API (0.13.3+). Token: !secret pocket_sign_key
+    # ("Bearer psk_…", set with `ha-config secret pocket_sign_key`). Scopes
+    # playlists + messages, limited to Office TV 027YiRhj.
+    # sign_ext_next/pause/reset: display. sign_ext_dismiss: display.
+    sign_ext_next:
+      url: "https://sign.dogbelly.app/api/v1/ext/displays/{{ display }}/next"
+      method: POST
+      headers:
+        Authorization: !secret pocket_sign_key
+    sign_ext_pause:
+      url: "https://sign.dogbelly.app/api/v1/ext/displays/{{ display }}/pause"
+      method: POST
+      headers:
+        Authorization: !secret pocket_sign_key
+    sign_ext_reset:
+      url: "https://sign.dogbelly.app/api/v1/ext/displays/{{ display }}/reset"
+      method: POST
+      headers:
+        Authorization: !secret pocket_sign_key
+    sign_ext_dismiss:
+      url: "https://sign.dogbelly.app/api/v1/ext/displays/{{ display }}/dismiss"
+      method: POST
+      headers:
+        Authorization: !secret pocket_sign_key
 
 # HA Manager phone approvals: the emoji to tap in the ntfy approval push. Pulled (read-only)
 # from the ham-approvals service on mash-ubie; HA never writes to it. State is e.g. "#19 🦊"

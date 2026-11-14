@@ -1208,3 +1208,71 @@
         target:
           entity_id: switch.bathroom
   mode: queued
+- id: 'pocket-sign-square-button-1'
+  alias: Pocket Sign square button
+  description: Office TV — single next card, hold pause, double dismiss overlays, triple reset to shared rotation
+  triggers:
+  - domain: mqtt
+    device_id: f7ac7546116da2ba84174fc1a6827035
+    type: action
+    subtype: single
+    trigger: device
+    id: single
+  - domain: mqtt
+    device_id: f7ac7546116da2ba84174fc1a6827035
+    type: action
+    subtype: hold
+    trigger: device
+    id: hold
+  - domain: mqtt
+    device_id: f7ac7546116da2ba84174fc1a6827035
+    type: action
+    subtype: double
+    trigger: device
+    id: double
+  - domain: mqtt
+    device_id: f7ac7546116da2ba84174fc1a6827035
+    type: action
+    subtype: triple
+    trigger: device
+    id: triple
+  conditions: []
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id:
+        - single
+      sequence:
+      - action: rest_command.sign_ext_next
+        data:
+          display: 027YiRhj
+        continue_on_error: true
+    - conditions:
+      - condition: trigger
+        id:
+        - hold
+      sequence:
+      - action: rest_command.sign_ext_pause
+        data:
+          display: 027YiRhj
+        continue_on_error: true
+    - conditions:
+      - condition: trigger
+        id:
+        - double
+      sequence:
+      - action: rest_command.sign_ext_dismiss
+        data:
+          display: 027YiRhj
+        continue_on_error: true
+    - conditions:
+      - condition: trigger
+        id:
+        - triple
+      sequence:
+      - action: rest_command.sign_ext_reset
+        data:
+          display: 027YiRhj
+        continue_on_error: true
+  mode: queued
