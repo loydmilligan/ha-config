@@ -34,6 +34,7 @@
     l3: 'light.office_light_3',
     l4: 'light.office_light_4',
     camera: 'binary_sensor.office_camera_online',
+    tap: 'event.4_button_smart_remote_action',
   };
 
   const DEV = {
@@ -49,8 +50,9 @@
     l2: { name: 'Office light 2', entity: E.l2, about: 'Hue bulb.', rules: 'R1 R2' },
     l3: { name: 'Office light 3', entity: E.l3, about: 'Hue bulb.', rules: 'R1 R2' },
     l4: { name: 'Office light 4', entity: E.l4, about: 'Hue bulb.', rules: 'R1 R2' },
+    tap: { name: 'Hue 4-button', entity: E.tap, about: 'Hue remote on the east wall, switch height, just south of the kitchen opening.', rules: 'manual' },
   };
-  const INPUTS = ['radar', 'floor', 'matt', 'mara', 'motion', 'answer', 'streak', 'autoOff'];
+  const INPUTS = ['radar', 'floor', 'matt', 'mara', 'motion', 'answer', 'streak', 'autoOff', 'tap'];
   const OUTPUTS = ['l1', 'l2', 'l3', 'l4'];
 
   const STATES = [
@@ -102,6 +104,7 @@
     ep: { x: 0, y: 0, facing: 145, fov: 120, range: 236 },
     sonoff: { x: 144, y: 12, facing: 185, fov: 120, range: 110 },
     cam: { x: 144, y: 18, facing: 255, fov: 90, range: 90 },
+    tap: { x: 156, y: 10 },
     lights: [
       { id: 'l1', x: X(72), y: Y(54) },
       { id: 'l2', x: X(72), y: Y(66) },
@@ -117,6 +120,7 @@
       { id: 'answer', label: 'Vision', x: 870, y: 280, w: 180 },
       { id: 'autoOff', label: 'Auto-off flag', x: 870, y: 340, w: 180 },
       { id: 'streak', label: 'Empty streak', x: 870, y: 400, w: 180 },
+      { id: 'tap', label: 'Hue 4-button', x: 680, y: 8, w: 160 },
     ],
     legend: { x: 870, y: 36, w: 230 },
   };
@@ -228,6 +232,7 @@
         answer: vis === 'vision_present' || vis === 'vision_absent' ? 'driving' : 'watching',
         streak: vis === 'vision_present' || this.s(E.streak) !== '0' ? 'watching' : 'watching',
         autoOff: this.s(E.autoOff) === 'on' ? 'watching' : (this.lightsOn() ? 'watching' : 'driving'),
+        tap: 'watching',
       };
     }
 
@@ -265,6 +270,7 @@
       V.answer = [this.s(E.answer), roles.answer, this.s(E.reason) + ' · ' + this.s(E.source) + '.'];
       V.streak = [this.s(E.streak) + ' of ' + Number(this.s(E.need) || 7), roles.streak, 'Valid empty checks. Poll every ' + Number(this.s(E.poll) || 30) + ' s. Vision ' + (this.s(E.visionOn) === 'on' ? 'on' : 'off') + '.'];
       V.autoOff = [this.s(E.autoOff) === 'on' ? 'Auto last off' : 'Person last off', roles.autoOff, this.s(E.autoOff) === 'on' ? 'Radar may turn lights back on after 20 s.' : '30 min hold after a manual off.'];
+      V.tap = [BAD.includes(this.s(E.tap)) ? 'Unavailable' : 'Last ' + dur(age(E.tap)) + ' ago', roles.tap, 'Wall switch position, just south of the kitchen door.'];
       for (const id of ['l1', 'l2', 'l3', 'l4']) {
         const ent = E[id], st = this.st(ent);
         let txt = 'Unavailable', role = 'unavailable';
@@ -366,6 +372,7 @@
         mark(F.ep, T.blue, 'EP Lite', 4, 5) +
         mark(F.sonoff, T.blue, 'Sonoff', -18, -4) +
         mark(F.cam, T.dim, 'Camera', -18, 6) +
+        mark(F.tap, '#c792ea', 'Hue remote', -4, 8) +
         '<text x="' + X(8) + '" y="' + Y(70) + '" font-size="12" fill="' + T.dim + '" font-family="Inter,system-ui,sans-serif">Matt desk</text>' +
         '<text x="' + X(108) + '" y="' + Y(92) + '" font-size="12" fill="' + T.dim + '" font-family="Inter,system-ui,sans-serif">Mara desk</text>' +
         '<text x="' + X(4) + '" y="' + Y(100) + '" font-size="11" fill="' + T.dim + '" font-family="Inter,system-ui,sans-serif">fan ignore</text>' +
