@@ -50,7 +50,7 @@
     door: { name: 'Door contact', entity: E.door, role: 'door', about: 'The box lid. Closed with someone moving inside means someone is inside until it opens.', rules: 'R1 R2 R3 R4' },
     pir: { name: 'PIR motion', entity: E.pir, role: 'pir', about: 'Hue motion sensor. Reads detected for 7 to 10 s after motion stops, so a reading right after the door closes may be left over.', rules: 'R1 R2 R2c R3 R7' },
     delay: { name: 'Untrusted window', entity: E.win, role: 'window', about: 'Starts when the door closes with motion showing. Motion is not trusted until it ends (input_number.bathroom_pir_clear_delay).', rules: 'R2 R2c R3' },
-    hum: { name: 'Humidity', entity: E.hum, role: 'humidity', about: 'SwitchBot meter by the shower. Above the shower line it holds the light. It never turns the light on.', rules: 'R5' },
+    hum: { name: 'Humidity', entity: E.hum, role: 'humidity', about: 'SwitchBot meter by the shower. Above the shower line it holds occupancy, and occupancy holds the light. A humidity spike in an empty room will turn the light on.', rules: 'R5' },
     base: { name: 'Humidity baseline', entity: E.base, role: 'baseline', about: '20th percentile of the last 3 h. Shower starts at baseline + on offset, ends at baseline + off offset.', rules: 'R5' },
     lux: { name: 'Luminosity', entity: E.lux, role: 'illuminance', about: 'Hue motion sensor. Tells whether the SwitchBot lights are really on (used when sync is on).', rules: 'sync' },
     temp: { name: 'Temperature (meter)', entity: E.temp, role: 'temperatures', about: 'Same sensor as humidity. Data only: no rule reads it yet.', rules: 'none' },
@@ -80,7 +80,7 @@
     ['R2', 'Door closes with motion showing: not trusted for the window.'],
     ['R3', 'Motion still showing when the window ends, or fresh motion behind a closed door: locked.'],
     ['R4', 'Locked ignores motion clearing. The door opening ends it.'],
-    ['R5', 'Shower on: the light is held.'],
+    ['R5', 'Shower on: occupancy is held. The light follows occupancy.'],
     ['R6', 'Light off after the delay once nothing holds it (5 min after R2c, else 1 min).'],
     ['R7', 'Locked with no motion and no shower for the lock timeout: false lock.'],
   ];

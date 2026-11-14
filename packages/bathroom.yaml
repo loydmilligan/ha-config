@@ -94,7 +94,7 @@ input_number:
     unit_of_measurement: "%"
     mode: box
   bathroom_shower_max_hold:
-    name: "Bathroom: longest a shower can hold the light"
+    name: "Bathroom: longest a shower can hold occupancy"
     min: 30
     max: 360
     step: 10
@@ -242,15 +242,12 @@ template:
         attributes:
           someone_inside: "{{ is_state('input_select.bathroom_occupancy', 'locked') }}"
 
-      # "The light may not turn off." Humidity never turns the light ON; it only
-      # stops it turning off. The cap stops a stuck baseline holding it forever.
+      # Light follows occupancy only. Shower holds occupancy (R5), so steam
+      # keeps the light on by keeping the room occupied. The 120 min cap is
+      # applied in the occupancy machine, not here.
       - name: Bathroom light hold
         unique_id: bathroom_light_hold
-        state: >
-          {% set cap = states('input_number.bathroom_shower_max_hold') | float(120) * 60 %}
-          {% set sh = is_state('binary_sensor.bathroom_shower', 'on')
-             and (now() - states.binary_sensor.bathroom_shower.last_changed).total_seconds() < cap %}
-          {{ not is_state('input_select.bathroom_occupancy', 'vacant') or sh }}
+        state: "{{ not is_state('input_select.bathroom_occupancy', 'vacant') }}"
 
       # What the luminosity sensor says about the SwitchBot circuit, after
       # subtracting what the Hue bulb is expected to add. 20 s debounce because
@@ -381,14 +378,15 @@ template:
               'vacant': [
                 ['the door opens', 'Presence: light on at once'],
                 ['motion with the door open', 'Presence'],
-                ['motion with the door closed', 'Locked']],
+                ['motion with the door closed', 'Locked'],
+                ['the shower starts', 'Locked (door closed) or presence (door open)']],
               'presence': [
                 ['the door closes while motion is showing', 'Uncertain, ' ~ w ~ ' s window starts'],
-                ['no motion for the hold time', 'Vacant'],
+                ['no motion for the hold time', 'Vacant, unless the shower is on'],
                 ['fresh motion after the door has closed', 'Locked']],
               'uncertain': [
                 ['motion is still showing when the window ends', 'Locked'],
-                ['motion clears inside the window', 'Vacant, with the long light-off delay'],
+                ['motion clears inside the window', 'Vacant, unless the shower is on (then locked)'],
                 ['the door opens', 'Presence']],
               'locked': [
                 ['the door opens', 'Presence: the only normal way out'],
@@ -482,8 +480,27 @@ automation:
         for:
           minutes: "{{ states('input_number.bathroom_lock_timeout') | int(60) }}"
         id: lock_timeout
+      - trigger: state
+        entity_id: binary_sensor.bathroom_shower
+        from: "off"
+        to: "on"
+        id: shower_on
+      - trigger: state
+        entity_id: binary_sensor.bathroom_shower
+        from: "on"
+        to: "off"
+        id: shower_off
+      - trigger: state
+        entity_id: binary_sensor.bathroom_shower
+        to: "on"
+        for:
+          minutes: "{{ states('input_number.bathroom_shower_max_hold') | int(120) }}"
+        id: shower_off
       - trigger: homeassistant
         event: start
+        id: reconcile
+      - trigger: event
+        event_type: automation_reloaded
         id: reconcile
       - trigger: state
         entity_id:
@@ -507,6 +524,10 @@ automation:
           settle_s: "{{ states('input_number.bathroom_door_settle') | int(3) }}"
           entry_s: "{{ states('input_number.bathroom_door_entry_grace') | int(30) }}"
           hold_s: "{{ states('input_number.bathroom_presence_hold') | int(180) }}"
+          shower_hold: >
+            {% set cap = states('input_number.bathroom_shower_max_hold') | float(120) * 60 %}
+            {{ is_state('binary_sensor.bathroom_shower', 'on')
+               and (now() - states.binary_sensor.bathroom_shower.last_changed).total_seconds() < cap }}
       - choose:
           # ── Door opened ──
           - conditions:
@@ -632,9 +653,12 @@ automation:
                           entity_id: timer.bathroom_untrusted_window
                       - action: script.bathroom_set_occupancy
                         data:
-                          new_state: vacant
-                          rule: R2c
-                          reason: "Motion cleared inside the window after the door closed. Probably the leftover reading, so probably empty. Light held for the long delay in case someone is sitting still."
+                          new_state: "{{ 'locked' if shower_hold else 'vacant' }}"
+                          rule: "{{ 'R5' if shower_hold else 'R2c' }}"
+                          reason: >
+                            {{ 'Motion cleared after the door closed, but the shower is on, so someone is still inside.'
+                               if shower_hold else
+                               'Motion cleared inside the window after the door closed. Probably the leftover reading, so probably empty. Light held for the long delay in case someone is sitting still.' }}
                   - conditions: "{{ occ == 'presence' }}"
                     sequence:
                       - action: timer.start
@@ -669,9 +693,12 @@ automation:
                 default:
                   - action: script.bathroom_set_occupancy
                     data:
-                      new_state: vacant
-                      rule: R2c
-                      reason: "Window ended with no motion showing."
+                      new_state: "{{ 'locked' if shower_hold else 'vacant' }}"
+                      rule: "{{ 'R5' if shower_hold else 'R2c' }}"
+                      reason: >
+                        {{ 'Window ended with no motion, but the shower is on, so someone is still inside.'
+                           if shower_hold else
+                           'Window ended with no motion showing.' }}
 
           # ── Hold or door-entry grace ran out ──
           - conditions:
@@ -682,22 +709,67 @@ automation:
             sequence:
               - action: script.bathroom_set_occupancy
                 data:
-                  new_state: vacant
-                  rule: R1
-                  reason: "No motion for the hold time and the room was never sealed with someone inside."
+                  new_state: "{{ 'presence' if shower_hold else 'vacant' }}"
+                  rule: "{{ 'R5' if shower_hold else 'R1' }}"
+                  reason: >
+                    {{ 'No motion for the hold time, but the shower is on, so occupancy stays.'
+                       if shower_hold else
+                       'No motion for the hold time and the room was never sealed with someone inside.' }}
 
           # ── Escape hatch for a false lock ──
           - conditions:
               - condition: trigger
                 id: lock_timeout
               - condition: template
-                value_template: "{{ occ == 'locked' and is_state('binary_sensor.bathroom_shower', 'off') }}"
+                value_template: "{{ occ == 'locked' and not shower_hold }}"
             sequence:
               - action: script.bathroom_set_occupancy
                 data:
                   new_state: vacant
                   rule: R7
                   reason: "Locked, but no motion and no shower for {{ states('input_number.bathroom_lock_timeout') | int(60) }} min. Treated as a false lock."
+
+          # ── Shower started: humidity holds occupancy, which holds the light ──
+          - conditions:
+              - condition: trigger
+                id: shower_on
+              - condition: template
+                value_template: "{{ occ != 'locked' }}"
+            sequence:
+              - action: timer.cancel
+                target:
+                  entity_id: timer.bathroom_presence_hold
+              - action: script.bathroom_set_occupancy
+                data:
+                  new_state: "{{ 'locked' if door_closed else 'presence' }}"
+                  rule: R5
+                  reason: "Shower detected. Occupancy is held until humidity falls."
+
+          # ── Shower ended or hit the max hold: drop occupancy if nothing else is holding it ──
+          - conditions:
+              - condition: trigger
+                id: shower_off
+            sequence:
+              - choose:
+                  - conditions: "{{ pir_on }}"
+                    sequence: []
+                  - conditions: "{{ occ == 'locked' and is_state('input_text.bathroom_last_rule', 'R3') }}"
+                    sequence: []
+                  - conditions: "{{ occ == 'presence' }}"
+                    sequence:
+                      - action: timer.start
+                        target:
+                          entity_id: timer.bathroom_presence_hold
+                        data:
+                          duration: "{{ hold_s }}"
+                  - conditions: "{{ occ != 'vacant' }}"
+                    sequence:
+                      - action: script.bathroom_set_occupancy
+                        data:
+                          new_state: vacant
+                          rule: R2c
+                          reason: "Shower ended with no motion showing. Vacant, with the long light-off delay in case someone is still sitting."
+
 
           # ── Restart, or a sensor came back from unavailable ──
           - conditions:
@@ -725,20 +797,35 @@ automation:
                     sequence:
                       - action: script.bathroom_set_occupancy
                         data:
-                          new_state: "{{ 'locked' if pir_on else 'vacant' }}"
-                          rule: "{{ 'R3' if pir_on else 'R2c' }}"
+                          new_state: "{{ 'locked' if (pir_on or shower_hold) else 'vacant' }}"
+                          rule: "{{ 'R3' if pir_on else ('R5' if shower_hold else 'R2c') }}"
                           reason: "Reconcile: the window ended while Home Assistant was not running. Motion is {{ 'showing' if pir_on else 'clear' }} now."
+                  - conditions: "{{ occ == 'vacant' and shower_hold }}"
+                    sequence:
+                      - action: script.bathroom_set_occupancy
+                        data:
+                          new_state: "{{ 'locked' if door_closed else 'presence' }}"
+                          rule: R5
+                          reason: "Reconcile: shower is on, so occupancy is held."
                   - conditions: "{{ occ == 'presence' and not pir_on and is_state('timer.bathroom_presence_hold', 'idle') }}"
                     sequence:
-                      - action: timer.start
-                        target:
-                          entity_id: timer.bathroom_presence_hold
-                        data:
-                          duration: "{{ hold_s }}"
+                      - if: "{{ shower_hold }}"
+                        then:
+                          - action: script.bathroom_set_occupancy
+                            data:
+                              new_state: presence
+                              rule: R5
+                              reason: "Reconcile: shower is on, so occupancy stays."
+                        else:
+                          - action: timer.start
+                            target:
+                              entity_id: timer.bathroom_presence_hold
+                            data:
+                              duration: "{{ hold_s }}"
 
-  # Hue bulb. ON: the instant occupancy leaves vacant (door or motion).
-  # OFF: only after "light hold" has been off for the delay. Humidity never
-  # turns it on.
+  # Hue bulb. ON: the instant occupancy leaves vacant.
+  # OFF: after occupancy has been vacant for the delay.
+  # Shower holds occupancy (R5), so steam keeps the light on through presence.
   - id: ham_bathroom_lights_occupancy  # deployed id, keeps automation.bathroom_lights_by_occupancy
     alias: Bathroom lights by occupancy
     mode: queued
