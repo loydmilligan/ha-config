@@ -224,19 +224,15 @@
   description: Door open turns the light on, door closed turns it off, and the light
     turns off after 60 minutes on even if the door stays open.
   triggers:
-  - type: opened
-    device_id: c9dbd3fd3fea3687c830e8930358337a
-    entity_id: aa590cef068a9a5576b2a3b785445e95
-    domain: binary_sensor
-    metadata:
-      secondary: false
-    trigger: device
+  - trigger: state
+    entity_id: binary_sensor.misc_contact_sensor_contact
+    from: 'off'
+    to: 'on'
     id: open
-  - type: not_opened
-    device_id: c9dbd3fd3fea3687c830e8930358337a
-    entity_id: aa590cef068a9a5576b2a3b785445e95
-    domain: binary_sensor
-    trigger: device
+  - trigger: state
+    entity_id: binary_sensor.misc_contact_sensor_contact
+    from: 'on'
+    to: 'off'
     id: closed
   - trigger: state
     entity_id: light.luggage_room_light

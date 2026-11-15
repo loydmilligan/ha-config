@@ -102,7 +102,7 @@
    "id": "contact-mwhi4xb9",
    "kind": "contact",
    "name": "Luggage Closet Door",
-   "entity": "binary_sensor.mash_closet_contact_sensor_contact",
+   "entity": "binary_sensor.misc_contact_sensor_contact",
    "x": 21,
    "y": 0
   },
@@ -195,7 +195,7 @@
   "binary_sensor.square_pir_sensor_5_occupancy",
   "binary_sensor.front_door_door",
   "event.family_switch_1_action",
-  "binary_sensor.mash_closet_contact_sensor_contact",
+  "binary_sensor.misc_contact_sensor_contact",
   "light.luggage_room_light",
   "media_player.googletv_chromecast",
   "input_boolean.living_room_motion_lights",
