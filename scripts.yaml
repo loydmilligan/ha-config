@@ -1,3 +1,27 @@
+sign_button_press:
+  alias: Pocket Sign button (virtual press)
+  description: >-
+    Publishes the same MQTT action the physical Office TV square button sends, so the real
+    "Pocket Sign square button" automation runs exactly as if it were pressed.
+    press = single (show / next card), hold (pause/resume), double (dismiss overlays).
+  mode: queued
+  fields:
+    press:
+      name: Press
+      description: Which press to mimic.
+      required: true
+      default: single
+      selector:
+        select:
+          options:
+          - single
+          - hold
+          - double
+  sequence:
+  - action: mqtt.publish
+    data:
+      topic: zigbee2mqtt/square_smart_button_1/action
+      payload: "{{ press | default('single') }}"
 get_now_playing_track_name:
   mode: queued
   alias: Get Now Playing Track Name
