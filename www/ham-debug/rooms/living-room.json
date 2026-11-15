@@ -1,0 +1,207 @@
+{
+ "format": "room-drawer/2",
+ "name": "living-room",
+ "units": "inches",
+ "note": "x grows to the right, y grows down the page; facing is degrees clockwise from up. Layout and intent only: radar zones must be calibrated in the sensor frame with a walk.",
+ "room": {
+  "closed": true,
+  "corners": [
+   [
+    0,
+    0
+   ],
+   [
+    196,
+    0
+   ],
+   [
+    196,
+    249
+   ],
+   [
+    0,
+    249
+   ]
+  ]
+ },
+ "devices": [
+  {
+   "id": "light-mwhhze25",
+   "kind": "light",
+   "name": "Fireplace1",
+   "entity": "light.fireplace_light_1",
+   "x": 192,
+   "y": 153
+  },
+  {
+   "id": "light-mwhhzgra",
+   "kind": "light",
+   "name": "Fireplace2",
+   "entity": "light.fireplace_light_2",
+   "x": 192,
+   "y": 99
+  },
+  {
+   "id": "light-mwhhzkul",
+   "kind": "light",
+   "name": "Gallery1",
+   "entity": "light.gallery_light_1",
+   "x": 174,
+   "y": 3
+  },
+  {
+   "id": "light-mwhhzron",
+   "kind": "light",
+   "name": "Gallery2",
+   "entity": "light.gallery_light_2",
+   "x": 48,
+   "y": 0
+  },
+  {
+   "id": "light-mwhhzu69",
+   "kind": "light",
+   "name": "Gallery3",
+   "entity": "light.gallery_light_3",
+   "x": 0,
+   "y": 93
+  },
+  {
+   "id": "motion-mwhi05xs",
+   "kind": "motion",
+   "name": "Square PIR sensor 5",
+   "entity": "binary_sensor.square_pir_sensor_5_occupancy",
+   "x": 30,
+   "y": 0,
+   "facing": 160
+  },
+  {
+   "id": "contact-mwhi1fdz",
+   "kind": "contact",
+   "name": "Front Door",
+   "entity": "binary_sensor.front_door_door",
+   "x": 0,
+   "y": 219
+  },
+  {
+   "id": "button-mwhi1pzh",
+   "kind": "button",
+   "name": "Hue Wall Module",
+   "entity": "event.family_switch_1_action",
+   "x": 0,
+   "y": 207
+  },
+  {
+   "id": "fan-mwhi1xx2",
+   "kind": "fan",
+   "name": "Family Room Fan",
+   "entity": "switch.family_room_bar_cart_outlet",
+   "x": 63,
+   "y": 6
+  },
+  {
+   "id": "contact-mwhi4xb9",
+   "kind": "contact",
+   "name": "Luggage Closet Door",
+   "entity": "binary_sensor.mash_closet_contact_sensor_contact",
+   "x": 21,
+   "y": 0
+  },
+  {
+   "id": "light-mwhi5loh",
+   "kind": "light",
+   "name": "Luggage Room Light",
+   "entity": "light.luggage_room_light",
+   "x": 9,
+   "y": -3
+  },
+  {
+   "id": "fan-herr-cleany",
+   "kind": "fan",
+   "name": "Herr Cleany",
+   "entity": "fan.herr_cleany",
+   "x": 132,
+   "y": 6
+  }
+ ],
+ "items": [
+  {
+   "kind": "door",
+   "name": "door 1",
+   "entity": "",
+   "points": [
+    [
+     0,
+     243
+    ],
+    [
+     0,
+     216
+    ]
+   ]
+  },
+  {
+   "kind": "door",
+   "name": "to Office",
+   "entity": "",
+   "points": [
+    [
+     54,
+     0
+    ],
+    [
+     141,
+     0
+    ]
+   ]
+  },
+  {
+   "kind": "door",
+   "name": "door 3",
+   "entity": "",
+   "points": [
+    [
+     0,
+     0
+    ],
+    [
+     24,
+     0
+    ]
+   ]
+  },
+  {
+   "kind": "door",
+   "name": "door 4",
+   "entity": "",
+   "points": [
+    [
+     0,
+     6
+    ],
+    [
+     0,
+     27
+    ]
+   ]
+  }
+ ],
+ "watch": [
+  "input_boolean.living_room_occupied",
+  "light.fireplace_light_1",
+  "light.fireplace_light_2",
+  "light.gallery_light_1",
+  "light.gallery_light_2",
+  "light.gallery_light_3",
+  "binary_sensor.square_pir_sensor_5_occupancy",
+  "binary_sensor.front_door_door",
+  "event.family_switch_1_action",
+  "binary_sensor.mash_closet_contact_sensor_contact",
+  "light.luggage_room_light",
+  "media_player.googletv_chromecast",
+  "input_boolean.living_room_motion_lights",
+  "input_text.living_room_occupancy_reason",
+  "input_text.living_room_lights_reason",
+  "fan.herr_cleany",
+  "switch.family_room_bar_cart_outlet"
+ ]
+}
