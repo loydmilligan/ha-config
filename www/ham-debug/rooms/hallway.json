@@ -1,0 +1,131 @@
+{
+ "format": "room-drawer/2",
+ "name": "hallway",
+ "units": "inches",
+ "note": "x grows to the right, y grows down the page; facing is degrees clockwise from up. Layout and intent only: radar zones must be calibrated in the sensor frame with a walk.",
+ "room": {
+  "closed": true,
+  "corners": [
+   [
+    0,
+    0
+   ],
+   [
+    36,
+    0
+   ],
+   [
+    36,
+    147
+   ],
+   [
+    0,
+    147
+   ]
+  ]
+ },
+ "devices": [
+  {
+   "id": "motion-mwhjfgbr",
+   "kind": "motion",
+   "name": "Motion (Tapo T100)",
+   "entity": "binary_sensor.hallway_motion_occupancy",
+   "x": 33,
+   "y": 0,
+   "facing": 185
+  },
+  {
+   "id": "light-mwhjgcv7",
+   "kind": "light",
+   "name": "Hall light",
+   "entity": "light.hall_light",
+   "x": 18,
+   "y": 72
+  }
+ ],
+ "items": [
+  {
+   "kind": "door",
+   "name": "to Bedroom",
+   "entity": "",
+   "points": [
+    [
+     3,
+     0
+    ],
+    [
+     33,
+     0
+    ]
+   ]
+  },
+  {
+   "kind": "door",
+   "name": "to Laundry Room",
+   "entity": "",
+   "points": [
+    [
+     0,
+     12
+    ],
+    [
+     0,
+     27
+    ]
+   ]
+  },
+  {
+   "kind": "door",
+   "name": "to Bathroom",
+   "entity": "",
+   "points": [
+    [
+     0,
+     132
+    ],
+    [
+     0,
+     111
+    ]
+   ]
+  },
+  {
+   "kind": "door",
+   "name": "to Kitchen",
+   "entity": "",
+   "points": [
+    [
+     36,
+     12
+    ],
+    [
+     36,
+     27
+    ]
+   ]
+  },
+  {
+   "kind": "door",
+   "name": "to Office",
+   "entity": "",
+   "points": [
+    [
+     0,
+     147
+    ],
+    [
+     36,
+     147
+    ]
+   ]
+  }
+ ],
+ "watch": [
+  "input_boolean.hallway_occupied",
+  "binary_sensor.hallway_motion_occupancy",
+  "light.hall_light",
+  "input_boolean.hallway_motion_lights",
+  "input_text.hallway_occupancy_reason",
+  "input_text.hallway_lights_reason"
+ ]
+}
