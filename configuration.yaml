@@ -87,6 +87,12 @@ input_number:
     step: 1
 
 input_datetime:
+  # When the last "show now" on the Office TV ends (Pocket Sign sign_ext_show reports it).
+  # The square button uses it to tell "screensaver up" (start a show) from "rotation running" (next card).
+  sign_show_until:
+    name: Pocket Sign show ends
+    has_date: true
+    has_time: true
   doorbell_last_check:
     name: Doorbell last change check
     has_date: true

@@ -1214,7 +1214,7 @@
   mode: queued
 - id: 'pocket-sign-square-button-1'
   alias: Pocket Sign square button
-  description: Office TV — single next card, hold pause/resume, double dismiss overlays. Triple is free.
+  description: Office TV — single starts a show when the hourly-recap screensaver is up (else next card), hold pause/resume, double dismiss overlays. Triple is free.
   triggers:
   - domain: mqtt
     device_id: f7ac7546116da2ba84174fc1a6827035
@@ -1242,10 +1242,37 @@
         id:
         - single
       sequence:
-      - action: rest_command.sign_ext_next
-        data:
-          display: 027YiRhj
-        continue_on_error: true
+      - choose:
+        # Screensaver up (:00-:50, no show running): end it and play one full rotation.
+        - conditions:
+          - condition: template
+            value_template: >-
+              {{ now().minute < 50 and
+                 (state_attr('input_datetime.sign_show_until', 'timestamp') | float(0)) < now().timestamp() }}
+          sequence:
+          - action: rest_command.sign_ext_show
+            data:
+              display: 027YiRhj
+              rotations: 1
+            response_variable: show
+            continue_on_error: true
+          - if:
+            - condition: template
+              value_template: >-
+                {{ show is defined and show.status | int(0) == 200
+                   and show.content is mapping and show.content.untilMs is number }}
+            then:
+            - action: input_datetime.set_datetime
+              target:
+                entity_id: input_datetime.sign_show_until
+              data:
+                timestamp: "{{ (show.content.untilMs / 1000) | int }}"
+        # Rotation or a show already running: next card, as before.
+        default:
+        - action: rest_command.sign_ext_next
+          data:
+            display: 027YiRhj
+          continue_on_error: true
     - conditions:
       - condition: trigger
         id:
