@@ -41,6 +41,14 @@
    "entity": "light.hall_light",
    "x": 18,
    "y": 72
+  },
+  {
+   "id": "button-hue-tap-dial",
+   "kind": "button",
+   "name": "Hue Tap dial",
+   "entity": "event.4_button_rotary_encoder_action",
+   "x": 32,
+   "y": 147
   }
  ],
  "items": [
@@ -126,6 +134,7 @@
   "light.hall_light",
   "input_boolean.hallway_motion_lights",
   "input_text.hallway_occupancy_reason",
-  "input_text.hallway_lights_reason"
+  "input_text.hallway_lights_reason",
+  "event.4_button_rotary_encoder_action"
  ]
 }
