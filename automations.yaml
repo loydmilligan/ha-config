@@ -221,7 +221,8 @@
   mode: single
 - id: '1765285365878'
   alias: Closet lights
-  description: ''
+  description: Door open turns the light on, door closed turns it off, and the light
+    turns off after 60 minutes on even if the door stays open.
   triggers:
   - type: opened
     device_id: c9dbd3fd3fea3687c830e8930358337a
@@ -237,6 +238,12 @@
     domain: binary_sensor
     trigger: device
     id: closed
+  - trigger: state
+    entity_id: light.luggage_room_light
+    to: 'on'
+    for:
+      minutes: 60
+    id: timeout
   conditions: []
   actions:
   - choose:
@@ -255,6 +262,7 @@
       - condition: trigger
         id:
         - closed
+        - timeout
       sequence:
       - action: light.turn_off
         metadata: {}

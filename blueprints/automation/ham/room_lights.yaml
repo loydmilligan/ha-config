@@ -1,0 +1,132 @@
+blueprint:
+  name: Room motion lights (ha-manager)
+  description: >-
+    Turns a room's light on when the room becomes occupied and off when it
+    becomes vacant. Brightness follows sensor.house_light_level. It only acts on
+    the two occupancy transitions, so a light turned off by hand stays off until
+    the room has gone vacant and is entered again, and a light that is already on
+    is left as it is.
+  domain: automation
+  input:
+    occupied:
+      name: Occupied helper
+      description: input_boolean written by the room's occupancy automation.
+      selector:
+        entity:
+          domain: input_boolean
+    lights:
+      name: Light or light group
+      selector:
+        entity:
+          domain: light
+    enabled:
+      name: Enabled helper
+      description: input_boolean. While off, this automation does nothing.
+      selector:
+        entity:
+          domain: input_boolean
+    sleep_behavior:
+      name: While sleep mode is on
+      description: >-
+        dim = still turn on (house light level is 3 % in sleep mode).
+        skip = do not turn the light on.
+      default: dim
+      selector:
+        select:
+          options:
+            - dim
+            - skip
+    reason:
+      name: Reason text
+      description: input_text that receives what this automation last did.
+      selector:
+        entity:
+          domain: input_text
+
+mode: restart
+max_exceeded: silent
+
+triggers:
+  - trigger: state
+    entity_id: !input occupied
+    from: "off"
+    to: "on"
+    id: occupied
+  - trigger: state
+    entity_id: !input occupied
+    from: "on"
+    to: "off"
+    id: vacant
+
+conditions:
+  - condition: state
+    entity_id: !input enabled
+    state: "on"
+
+variables:
+  lights: !input lights
+  sleep_behavior: !input sleep_behavior
+  reason: !input reason
+  level: "{{ states('sensor.house_light_level') | int(30) }}"
+  stamp: "{{ now().strftime('%H:%M:%S') }}"
+
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: occupied
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >-
+                      {{ sleep_behavior == 'skip'
+                         and is_state('input_boolean.sleep_mode', 'on') }}
+                sequence:
+                  - action: input_text.set_value
+                    target:
+                      entity_id: "{{ reason }}"
+                    data:
+                      value: "{{ stamp }} left off: sleep mode is on"
+              - conditions:
+                  - condition: template
+                    value_template: "{{ is_state(lights, 'on') }}"
+                sequence:
+                  - action: input_text.set_value
+                    target:
+                      entity_id: "{{ reason }}"
+                    data:
+                      value: "{{ stamp }} already on, left as it is"
+            default:
+              - action: light.turn_on
+                target:
+                  entity_id: "{{ lights }}"
+                data:
+                  brightness_pct: "{{ level }}"
+              - action: input_text.set_value
+                target:
+                  entity_id: "{{ reason }}"
+                data:
+                  value: "{{ stamp }} on at {{ level }} %: room occupied"
+      - conditions:
+          - condition: trigger
+            id: vacant
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ is_state(lights, 'on') }}"
+            then:
+              - action: light.turn_off
+                target:
+                  entity_id: "{{ lights }}"
+              - action: input_text.set_value
+                target:
+                  entity_id: "{{ reason }}"
+                data:
+                  value: "{{ stamp }} off: room vacant"
+            else:
+              - action: input_text.set_value
+                target:
+                  entity_id: "{{ reason }}"
+                data:
+                  value: "{{ stamp }} room vacant, light was already off"

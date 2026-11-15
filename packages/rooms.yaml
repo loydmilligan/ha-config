@@ -1,0 +1,236 @@
+# Room motion lights — one pattern, every room (ha-manager, 2026-11-14).
+#
+# Per room: an occupancy automation (the only writer of input_boolean.<room>_occupied)
+# and a lights automation, both from blueprints/automation/ham/.
+#
+# Error priorities (Matt's ranking), same as the bathroom:
+#   1. Light off with someone in the room      — worst by far
+#   2. Light not on, or slow, when someone enters
+#   3. Light on in an empty room               — least bad, by a wide margin
+#
+# The bathroom keeps its own logic in packages/bathroom.yaml.
+#
+# First-time setup: helpers have no `initial:` so later tuning survives restarts.
+# New input_numbers load at their minimum and new input_booleans load off, so
+# set each room's vacancy hold once, then turn on input_boolean.<room>_motion_lights.
+#
+# Adding a room: copy one block of helpers and the two automations, list the
+# room's activity entities, pick its light.
+
+# ───────────────────────── Helpers ─────────────────────────
+
+input_boolean:
+  hallway_occupied:
+    name: Hallway occupied
+    icon: mdi:account-check
+  hallway_motion_lights:
+    name: Hallway motion lights enabled
+    icon: mdi:lightbulb-auto
+  living_room_occupied:
+    name: Living room occupied
+    icon: mdi:account-check
+  living_room_motion_lights:
+    name: Living room motion lights enabled
+    icon: mdi:lightbulb-auto
+  bedroom_occupied:
+    name: Bedroom occupied
+    icon: mdi:account-check
+  bedroom_motion_lights:
+    name: Bedroom motion lights enabled
+    icon: mdi:lightbulb-auto
+  laundry_room_occupied:
+    name: Laundry room occupied
+    icon: mdi:account-check
+  laundry_room_motion_lights:
+    name: Laundry room motion lights enabled
+    icon: mdi:lightbulb-auto
+
+input_number:
+  hallway_vacancy_hold:
+    name: "Hallway: quiet time before vacant"
+    min: 0.5
+    max: 60
+    step: 0.5
+    unit_of_measurement: min
+    mode: box
+    icon: mdi:timer-sand
+  living_room_vacancy_hold:
+    name: "Living room: quiet time before vacant"
+    min: 0.5
+    max: 60
+    step: 0.5
+    unit_of_measurement: min
+    mode: box
+    icon: mdi:timer-sand
+  bedroom_vacancy_hold:
+    name: "Bedroom: quiet time before vacant"
+    min: 0.5
+    max: 60
+    step: 0.5
+    unit_of_measurement: min
+    mode: box
+    icon: mdi:timer-sand
+  laundry_room_vacancy_hold:
+    name: "Laundry room: quiet time before vacant"
+    min: 0.5
+    max: 60
+    step: 0.5
+    unit_of_measurement: min
+    mode: box
+    icon: mdi:timer-sand
+
+input_text:
+  hallway_occupancy_reason:
+    name: "Hallway: last occupancy change"
+    max: 255
+  hallway_lights_reason:
+    name: "Hallway: last light action"
+    max: 255
+  living_room_occupancy_reason:
+    name: "Living room: last occupancy change"
+    max: 255
+  living_room_lights_reason:
+    name: "Living room: last light action"
+    max: 255
+  bedroom_occupancy_reason:
+    name: "Bedroom: last occupancy change"
+    max: 255
+  bedroom_lights_reason:
+    name: "Bedroom: last light action"
+    max: 255
+  laundry_room_occupancy_reason:
+    name: "Laundry room: last occupancy change"
+    max: 255
+  laundry_room_lights_reason:
+    name: "Laundry room: last light action"
+    max: 255
+
+# ───────────────────────── Light groups ─────────────────────────
+# One entity per room for automations and dashboards. Swapping a bulb later
+# only changes the group.
+
+light:
+  - platform: group
+    name: Living room lights
+    unique_id: ham_living_room_lights
+    entities:
+      - light.fireplace_light_1
+      - light.fireplace_light_2
+      - light.gallery_light_1
+      - light.gallery_light_2
+      - light.gallery_light_3
+  - platform: group
+    name: Laundry lights
+    unique_id: ham_laundry_lights
+    entities:
+      - light.laundry_front_light_north
+      - light.laundry_front_light_south
+
+# ───────────────────────── Automations ─────────────────────────
+
+automation:
+  # ── Hallway: Tapo T100 (Matter) + the hall light. A pass-through room.
+  - id: ham_hallway_occupancy
+    alias: "[Hallway] Activity → occupied"
+    use_blueprint:
+      path: ham/room_occupancy.yaml
+      input:
+        occupied: input_boolean.hallway_occupied
+        activity_entities:
+          - binary_sensor.hallway_motion_occupancy
+        vacancy_hold: input_number.hallway_vacancy_hold
+        reason: input_text.hallway_occupancy_reason
+  - id: ham_hallway_lights
+    alias: "[Hallway] Occupied → light"
+    use_blueprint:
+      path: ham/room_lights.yaml
+      input:
+        occupied: input_boolean.hallway_occupied
+        lights: light.hall_light
+        enabled: input_boolean.hallway_motion_lights
+        sleep_behavior: dim
+        reason: input_text.hallway_lights_reason
+
+  # ── Living room: PIR 5 + the TV. A playing TV holds the room while you sit still.
+  - id: ham_living_room_occupancy
+    alias: "[Living room] Activity → occupied"
+    use_blueprint:
+      path: ham/room_occupancy.yaml
+      input:
+        occupied: input_boolean.living_room_occupied
+        activity_entities:
+          - binary_sensor.square_pir_sensor_5_occupancy
+          - media_player.googletv_chromecast
+        vacancy_hold: input_number.living_room_vacancy_hold
+        reason: input_text.living_room_occupancy_reason
+  - id: ham_living_room_lights
+    alias: "[Living room] Occupied → lights"
+    use_blueprint:
+      path: ham/room_lights.yaml
+      input:
+        occupied: input_boolean.living_room_occupied
+        lights: light.living_room_lights
+        enabled: input_boolean.living_room_motion_lights
+        sleep_behavior: dim
+        reason: input_text.living_room_lights_reason
+
+  # ── Bedroom: YoLink motion + the wall dimmer. No motion lights while sleep mode is on.
+  - id: ham_bedroom_occupancy
+    alias: "[Bedroom] Activity → occupied"
+    use_blueprint:
+      path: ham/room_occupancy.yaml
+      input:
+        occupied: input_boolean.bedroom_occupied
+        activity_entities:
+          - binary_sensor.bedroom_bedroom_motion_motion
+        vacancy_hold: input_number.bedroom_vacancy_hold
+        reason: input_text.bedroom_occupancy_reason
+  - id: ham_bedroom_lights
+    alias: "[Bedroom] Occupied → light"
+    use_blueprint:
+      path: ham/room_lights.yaml
+      input:
+        occupied: input_boolean.bedroom_occupied
+        lights: light.bedroom_bedroom_dimmer
+        enabled: input_boolean.bedroom_motion_lights
+        sleep_behavior: skip
+        reason: input_text.bedroom_lights_reason
+
+  # ── Laundry room: the old SmartThings PIR (needs a battery as of 2026-11-14) + both lights.
+  - id: ham_laundry_room_occupancy
+    alias: "[Laundry room] Activity → occupied"
+    use_blueprint:
+      path: ham/room_occupancy.yaml
+      input:
+        occupied: input_boolean.laundry_room_occupied
+        activity_entities:
+          - binary_sensor.laundry_room_motion_occupancy
+        vacancy_hold: input_number.laundry_room_vacancy_hold
+        reason: input_text.laundry_room_occupancy_reason
+  - id: ham_laundry_room_lights
+    alias: "[Laundry room] Occupied → lights"
+    use_blueprint:
+      path: ham/room_lights.yaml
+      input:
+        occupied: input_boolean.laundry_room_occupied
+        lights: light.laundry_lights
+        enabled: input_boolean.laundry_room_motion_lights
+        sleep_behavior: dim
+        reason: input_text.laundry_room_lights_reason
+
+  # ── Laundry button (SONOFF): single press toggles both laundry lights.
+  # The kitchen button already toggles the kitchen downlights in the UI
+  # automation "Hue tap dial controls", so it is not repeated here.
+  - id: ham_laundry_button
+    alias: "[Laundry room] Button → lights"
+    mode: single
+    triggers:
+      - trigger: device
+        domain: mqtt
+        device_id: 61078f03347fbe18de5026656f87bb2f
+        type: action
+        subtype: single
+    actions:
+      - action: light.toggle
+        target:
+          entity_id: light.laundry_lights

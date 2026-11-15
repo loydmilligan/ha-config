@@ -1,0 +1,100 @@
+blueprint:
+  name: Room occupancy (ha-manager)
+  description: >-
+    The one writer of a room's "occupied" helper. Any activity entity turning on
+    (motion) or playing (media player) marks the room occupied. When every
+    activity entity has been quiet for the vacancy hold, the room is marked vacant.
+    Tuned for: a light going off with someone in the room is the worst failure,
+    a light left on in an empty room is the least bad.
+  domain: automation
+  input:
+    occupied:
+      name: Occupied helper
+      description: input_boolean this automation writes. Nothing else should write it.
+      selector:
+        entity:
+          domain: input_boolean
+    activity_entities:
+      name: Activity entities
+      description: >-
+        Motion or occupancy binary sensors, and media players. A binary sensor
+        counts while it is on; a media player counts while it is playing.
+      selector:
+        entity:
+          multiple: true
+          domain:
+            - binary_sensor
+            - media_player
+    vacancy_hold:
+      name: Vacancy hold (minutes)
+      description: input_number. Everything quiet for this long means vacant.
+      selector:
+        entity:
+          domain: input_number
+    reason:
+      name: Reason text
+      description: input_text that receives why the room last changed.
+      selector:
+        entity:
+          domain: input_text
+
+# restart: any new state change cancels a running vacancy countdown.
+mode: restart
+max_exceeded: silent
+
+triggers:
+  # `to: null` fires on state changes only, not on attribute updates.
+  - trigger: state
+    entity_id: !input activity_entities
+    to: null
+  # A countdown is lost when HA restarts, so re-evaluate after start.
+  - trigger: homeassistant
+    event: start
+
+variables:
+  occupied: !input occupied
+  activity_entities: !input activity_entities
+  vacancy_hold: !input vacancy_hold
+  reason: !input reason
+  active: >-
+    {{ activity_entities
+       | select('is_state', ['on', 'playing'])
+       | list }}
+  hold_minutes: "{{ states(vacancy_hold) | float(5) }}"
+
+actions:
+  - if:
+      - condition: template
+        value_template: "{{ active | count > 0 }}"
+    then:
+      - if:
+          - condition: template
+            value_template: "{{ not is_state(occupied, 'on') }}"
+        then:
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ reason }}"
+            data:
+              value: >-
+                {{ now().strftime('%H:%M:%S') }} occupied:
+                {{ (active | map('state_attr', 'friendly_name') | join(', '))[:200] }}
+          - action: input_boolean.turn_on
+            target:
+              entity_id: "{{ occupied }}"
+    else:
+      - delay:
+          minutes: "{{ hold_minutes }}"
+      - if:
+          - condition: template
+            value_template: "{{ is_state(occupied, 'on') }}"
+        then:
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ reason }}"
+            data:
+              value: >-
+                {{ now().strftime('%H:%M:%S') }} vacant: nothing active for
+                {{ hold_minutes }} min
+          - action: input_boolean.turn_off
+            target:
+              entity_id: "{{ occupied }}"
