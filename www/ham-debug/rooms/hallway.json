@@ -47,8 +47,8 @@
    "kind": "button",
    "name": "Hue Tap dial",
    "entity": "event.4_button_rotary_encoder_action",
-   "x": 32,
-   "y": 147
+   "x": 36,
+   "y": 5
   }
  ],
  "items": [
