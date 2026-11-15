@@ -15,9 +15,11 @@ blueprint:
         entity:
           domain: input_boolean
     lights:
-      name: Light or light group
+      name: Lights
+      description: One or more lights or light groups. "On" means any of them is on.
       selector:
         entity:
+          multiple: true
           domain: light
     enabled:
       name: Enabled helper
@@ -64,7 +66,9 @@ conditions:
     state: "on"
 
 variables:
-  lights: !input lights
+  lights_input: !input lights
+  lights: "{{ [lights_input] if lights_input is string else lights_input }}"
+  any_on: "{{ lights | select('is_state', 'on') | list | count > 0 }}"
   sleep_behavior: !input sleep_behavior
   reason: !input reason
   level: "{{ states('sensor.house_light_level') | int(30) }}"
@@ -90,7 +94,7 @@ actions:
                       value: "{{ stamp }} left off: sleep mode is on"
               - conditions:
                   - condition: template
-                    value_template: "{{ is_state(lights, 'on') }}"
+                    value_template: "{{ any_on }}"
                 sequence:
                   - action: input_text.set_value
                     target:
@@ -114,7 +118,7 @@ actions:
         sequence:
           - if:
               - condition: template
-                value_template: "{{ is_state(lights, 'on') }}"
+                value_template: "{{ any_on }}"
             then:
               - action: light.turn_off
                 target:

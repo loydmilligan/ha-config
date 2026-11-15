@@ -106,8 +106,9 @@ input_text:
     max: 255
 
 # ───────────────────────── Light groups ─────────────────────────
-# One entity per room for automations and dashboards. Swapping a bulb later
-# only changes the group.
+# One entity per room for dashboards and manual control. These only appear after
+# an HA restart (a new `light:` platform cannot be reloaded), so the automations
+# below list the member lights directly and do not depend on the groups.
 
 light:
   - platform: group
@@ -169,7 +170,12 @@ automation:
       path: ham/room_lights.yaml
       input:
         occupied: input_boolean.living_room_occupied
-        lights: light.living_room_lights
+        lights:
+          - light.fireplace_light_1
+          - light.fireplace_light_2
+          - light.gallery_light_1
+          - light.gallery_light_2
+          - light.gallery_light_3
         enabled: input_boolean.living_room_motion_lights
         sleep_behavior: dim
         reason: input_text.living_room_lights_reason
@@ -213,7 +219,9 @@ automation:
       path: ham/room_lights.yaml
       input:
         occupied: input_boolean.laundry_room_occupied
-        lights: light.laundry_lights
+        lights:
+          - light.laundry_front_light_north
+          - light.laundry_front_light_south
         enabled: input_boolean.laundry_room_motion_lights
         sleep_behavior: dim
         reason: input_text.laundry_room_lights_reason
@@ -231,6 +239,27 @@ automation:
         type: action
         subtype: single
     actions:
-      - action: light.toggle
-        target:
-          entity_id: light.laundry_lights
+      # Both on or both off, never one of each: decide from "is either on".
+      - if:
+          - condition: or
+            conditions:
+              - condition: state
+                entity_id: light.laundry_front_light_north
+                state: "on"
+              - condition: state
+                entity_id: light.laundry_front_light_south
+                state: "on"
+        then:
+          - action: light.turn_off
+            target:
+              entity_id:
+                - light.laundry_front_light_north
+                - light.laundry_front_light_south
+        else:
+          - action: light.turn_on
+            target:
+              entity_id:
+                - light.laundry_front_light_north
+                - light.laundry_front_light_south
+            data:
+              brightness_pct: "{{ states('sensor.house_light_level') | int(30) }}"
