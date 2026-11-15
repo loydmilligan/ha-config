@@ -17,7 +17,7 @@
     radar: 'binary_sensor.office_presence_radar',
     floor: 'binary_sensor.everything_presence_lite_cadb3c_zone_3_occupancy',
     matt: 'binary_sensor.everything_presence_lite_cadb3c_zone_1_occupancy',
-    mara: 'binary_sensor.sonoff_mmwave_occupancy',
+    mara: 'binary_sensor.off_mara_pr_occupancy',
     motion: 'binary_sensor.office_camera_motion_detected',
     answer: 'input_select.office_ai_last_answer',
     reason: 'input_text.office_ai_last_reason',
@@ -29,12 +29,12 @@
     autoOff: 'input_boolean.office_lights_auto_off',
     radarAuto: 'automation.office_lights_by_radar',
     visionPoll: 'automation.office_vision_poll',
-    l1: 'light.office_light_1',
-    l2: 'light.office_light_2',
-    l3: 'light.office_light_3',
-    l4: 'light.office_light_4',
+    l1: 'light.off_lt1',
+    l2: 'light.off_lt2',
+    l3: 'light.off_lt3',
+    l4: 'light.off_lt4',
     camera: 'binary_sensor.office_camera_online',
-    tap: 'event.4_button_smart_remote_action',
+    tap: 'event.off_sw_action',
   };
 
   const DEV = {

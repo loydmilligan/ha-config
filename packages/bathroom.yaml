@@ -257,11 +257,11 @@ template:
         device_class: light
         delay_on: "00:00:20"
         delay_off: "00:00:20"
-        availability: "{{ states('sensor.square_multi_sensor_illuminance') | is_number }}"
+        availability: "{{ states('sensor.bat_mo_illuminance') | is_number }}"
         state: >
-          {% set lux = states('sensor.square_multi_sensor_illuminance') | float(0) %}
-          {% set frac = (state_attr('light.bathroom_ceiling_light', 'brightness') | float(0)) / 255
-             if is_state('light.bathroom_ceiling_light', 'on') else 0 %}
+          {% set lux = states('sensor.bat_mo_illuminance') | float(0) %}
+          {% set frac = (state_attr('light.bat_lt', 'brightness') | float(0)) / 255
+             if is_state('light.bat_lt', 'on') else 0 %}
           {% set hue = frac * states('input_number.bathroom_hue_lux_at_full') | float(20) %}
           {{ lux - hue >= states('input_number.bathroom_switchbot_lux_threshold') | float(15) }}
 
@@ -328,10 +328,10 @@ template:
         state_class: measurement
         availability: >
           {{ states('sensor.indoor_outdoor_meter_97c8_temperature') | is_number
-             and states('sensor.square_multi_sensor_temperature') | is_number }}
+             and states('sensor.bat_mo_temperature') | is_number }}
         state: >
           {{ (states('sensor.indoor_outdoor_meter_97c8_temperature') | float(0)
-              - states('sensor.square_multi_sensor_temperature') | float(0)) | round(1) }}
+              - states('sensor.bat_mo_temperature') | float(0)) | round(1) }}
 
       # Everything the dashboard needs that is a fixed lookup from the published
       # state. No sensor logic is repeated here.
@@ -396,7 +396,7 @@ template:
             {{ m.get(s, []) }}
 
   # The SwitchBot as everything else should see it.
-  # Sync OFF: behaves like switch.bathroom (assumed state, always presses).
+  # Sync OFF: behaves like switch.bat_bot (assumed state, always presses).
   # Sync ON:  state is the measured light; it only presses when the measured
   #           state differs from what is asked. Out-of-sync cannot invert it.
   - switch:
@@ -420,7 +420,7 @@ template:
             then:
               - action: switch.toggle
                 target:
-                  entity_id: switch.bathroom
+                  entity_id: switch.bat_bot
         turn_off:
           - action: input_boolean.turn_off
             target:
@@ -432,7 +432,7 @@ template:
             then:
               - action: switch.toggle
                 target:
-                  entity_id: switch.bathroom
+                  entity_id: switch.bat_bot
 
 # ───────────────────────── Automations ─────────────────────────
 
@@ -445,22 +445,22 @@ automation:
     max: 20
     triggers:
       - trigger: state
-        entity_id: binary_sensor.bathroom_contact_sensor_contact
+        entity_id: binary_sensor.bat_dr_contact
         from: "off"
         to: "on"
         id: door_opened
       - trigger: state
-        entity_id: binary_sensor.bathroom_contact_sensor_contact
+        entity_id: binary_sensor.bat_dr_contact
         from: "on"
         to: "off"
         id: door_closed
       - trigger: state
-        entity_id: binary_sensor.square_multi_sensor_occupancy
+        entity_id: binary_sensor.bat_mo_occupancy
         from: "off"
         to: "on"
         id: motion_on
       - trigger: state
-        entity_id: binary_sensor.square_multi_sensor_occupancy
+        entity_id: binary_sensor.bat_mo_occupancy
         from: "on"
         to: "off"
         id: motion_off
@@ -475,7 +475,7 @@ automation:
           entity_id: timer.bathroom_presence_hold
         id: hold_done
       - trigger: state
-        entity_id: binary_sensor.square_multi_sensor_occupancy
+        entity_id: binary_sensor.bat_mo_occupancy
         to: "off"
         for:
           minutes: "{{ states('input_number.bathroom_lock_timeout') | int(60) }}"
@@ -504,8 +504,8 @@ automation:
         id: reconcile
       - trigger: state
         entity_id:
-          - binary_sensor.bathroom_contact_sensor_contact
-          - binary_sensor.square_multi_sensor_occupancy
+          - binary_sensor.bat_dr_contact
+          - binary_sensor.bat_mo_occupancy
         from:
           - unavailable
           - unknown
@@ -515,11 +515,11 @@ automation:
       # mode an earlier run may have changed occupancy while this one waited.
       - variables:
           occ: "{{ states('input_select.bathroom_occupancy') }}"
-          door_closed: "{{ is_state('binary_sensor.bathroom_contact_sensor_contact', 'off') }}"
-          pir_on: "{{ is_state('binary_sensor.square_multi_sensor_occupancy', 'on') }}"
+          door_closed: "{{ is_state('binary_sensor.bat_dr_contact', 'off') }}"
+          pir_on: "{{ is_state('binary_sensor.bat_mo_occupancy', 'on') }}"
           door_closed_secs: >
-            {{ (now() - states.binary_sensor.bathroom_contact_sensor_contact.last_changed).total_seconds()
-               if is_state('binary_sensor.bathroom_contact_sensor_contact', 'off') else 0 }}
+            {{ (now() - states.binary_sensor.bat_dr_contact.last_changed).total_seconds()
+               if is_state('binary_sensor.bat_dr_contact', 'off') else 0 }}
           window_s: "{{ states('input_number.bathroom_pir_clear_delay') | int(12) }}"
           settle_s: "{{ states('input_number.bathroom_door_settle') | int(3) }}"
           entry_s: "{{ states('input_number.bathroom_door_entry_grace') | int(30) }}"
@@ -856,12 +856,12 @@ automation:
               - choose:
                   - conditions:
                       - condition: state
-                        entity_id: light.bathroom_ceiling_light
+                        entity_id: light.bat_lt
                         state: "off"
                     sequence:
                       - action: light.turn_on
                         target:
-                          entity_id: light.bathroom_ceiling_light
+                          entity_id: light.bat_lt
                         data:
                           brightness_pct: "{{ states('sensor.house_light_level') | int(30) }}"
                           transition: 0.3
@@ -869,7 +869,7 @@ automation:
                   # out): use the SwitchBot lights, but only through the
                   # sync-corrected switch so the press cannot invert.
                   - conditions: >
-                      {{ not has_value('light.bathroom_ceiling_light')
+                      {{ not has_value('light.bat_lt')
                          and is_state('input_boolean.bathroom_switchbot_fallback', 'on')
                          and is_state('input_boolean.bathroom_switchbot_lux_sync', 'on') }}
                     sequence:
@@ -883,11 +883,11 @@ automation:
               - condition: trigger
                 id: "off"
             sequence:
-              - if: "{{ has_value('light.bathroom_ceiling_light') }}"
+              - if: "{{ has_value('light.bat_lt') }}"
                 then:
                   - action: light.turn_off
                     target:
-                      entity_id: light.bathroom_ceiling_light
+                      entity_id: light.bat_lt
                     data:
                       transition: 3
               - if: "{{ is_state('input_boolean.bathroom_fallback_active', 'on') }}"
@@ -906,12 +906,12 @@ automation:
                 entity_id: binary_sensor.bathroom_light_hold
                 state: "off"
               - condition: state
-                entity_id: light.bathroom_ceiling_light
+                entity_id: light.bat_lt
                 state: "on"
             sequence:
               - action: light.turn_off
                 target:
-                  entity_id: light.bathroom_ceiling_light
+                  entity_id: light.bat_lt
 
   # Fan (and the two lights on the same wall switch) follow the shower.
   - id: ham_bathroom_fan_humidity  # deployed id, keeps automation.bathroom_fan_by_humidity

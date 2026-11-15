@@ -115,17 +115,17 @@ light:
     name: Living room lights
     unique_id: ham_living_room_lights
     entities:
-      - light.fireplace_light_1
-      - light.fireplace_light_2
-      - light.gallery_light_1
-      - light.gallery_light_2
-      - light.gallery_light_3
+      - light.liv_fire_lt1
+      - light.liv_fire_lt2
+      - light.liv_gal_lt1
+      - light.liv_gal_lt2
+      - light.liv_gal_lt3
   - platform: group
     name: Laundry lights
     unique_id: ham_laundry_lights
     entities:
-      - light.laundry_front_light_north
-      - light.laundry_front_light_south
+      - light.lau_n_lt
+      - light.lau_s_lt
 
 # ───────────────────────── Automations ─────────────────────────
 
@@ -138,7 +138,7 @@ automation:
       input:
         occupied: input_boolean.hallway_occupied
         activity_entities:
-          - binary_sensor.hallway_motion_occupancy
+          - binary_sensor.hal_mo_occupancy
         vacancy_hold: input_number.hallway_vacancy_hold
         reason: input_text.hallway_occupancy_reason
   - id: ham_hallway_lights
@@ -147,7 +147,7 @@ automation:
       path: ham/room_lights.yaml
       input:
         occupied: input_boolean.hallway_occupied
-        lights: light.hall_light
+        lights: light.hal_lt
         enabled: input_boolean.hallway_motion_lights
         sleep_behavior: dim
         reason: input_text.hallway_lights_reason
@@ -160,7 +160,7 @@ automation:
       input:
         occupied: input_boolean.living_room_occupied
         activity_entities:
-          - binary_sensor.square_pir_sensor_5_occupancy
+          - binary_sensor.liv_mo_occupancy
           - media_player.googletv_chromecast
         vacancy_hold: input_number.living_room_vacancy_hold
         reason: input_text.living_room_occupancy_reason
@@ -171,11 +171,11 @@ automation:
       input:
         occupied: input_boolean.living_room_occupied
         lights:
-          - light.fireplace_light_1
-          - light.fireplace_light_2
-          - light.gallery_light_1
-          - light.gallery_light_2
-          - light.gallery_light_3
+          - light.liv_fire_lt1
+          - light.liv_fire_lt2
+          - light.liv_gal_lt1
+          - light.liv_gal_lt2
+          - light.liv_gal_lt3
         enabled: input_boolean.living_room_motion_lights
         sleep_behavior: dim
         reason: input_text.living_room_lights_reason
@@ -188,7 +188,7 @@ automation:
       input:
         occupied: input_boolean.bedroom_occupied
         activity_entities:
-          - binary_sensor.bedroom_bedroom_motion_motion
+          - binary_sensor.bed_mo_motion
         vacancy_hold: input_number.bedroom_vacancy_hold
         reason: input_text.bedroom_occupancy_reason
   - id: ham_bedroom_lights
@@ -197,7 +197,7 @@ automation:
       path: ham/room_lights.yaml
       input:
         occupied: input_boolean.bedroom_occupied
-        lights: light.bedroom_bedroom_dimmer
+        lights: light.bed_lt
         enabled: input_boolean.bedroom_motion_lights
         sleep_behavior: skip
         reason: input_text.bedroom_lights_reason
@@ -210,7 +210,7 @@ automation:
       input:
         occupied: input_boolean.laundry_room_occupied
         activity_entities:
-          - binary_sensor.laundry_room_motion_occupancy
+          - binary_sensor.lau_mo_occupancy
         vacancy_hold: input_number.laundry_room_vacancy_hold
         reason: input_text.laundry_room_occupancy_reason
   - id: ham_laundry_room_lights
@@ -220,8 +220,8 @@ automation:
       input:
         occupied: input_boolean.laundry_room_occupied
         lights:
-          - light.laundry_front_light_north
-          - light.laundry_front_light_south
+          - light.lau_n_lt
+          - light.lau_s_lt
         enabled: input_boolean.laundry_room_motion_lights
         sleep_behavior: dim
         reason: input_text.laundry_room_lights_reason
@@ -244,22 +244,22 @@ automation:
           - condition: or
             conditions:
               - condition: state
-                entity_id: light.laundry_front_light_north
+                entity_id: light.lau_n_lt
                 state: "on"
               - condition: state
-                entity_id: light.laundry_front_light_south
+                entity_id: light.lau_s_lt
                 state: "on"
         then:
           - action: light.turn_off
             target:
               entity_id:
-                - light.laundry_front_light_north
-                - light.laundry_front_light_south
+                - light.lau_n_lt
+                - light.lau_s_lt
         else:
           - action: light.turn_on
             target:
               entity_id:
-                - light.laundry_front_light_north
-                - light.laundry_front_light_south
+                - light.lau_n_lt
+                - light.lau_s_lt
             data:
               brightness_pct: "{{ states('sensor.house_light_level') | int(30) }}"

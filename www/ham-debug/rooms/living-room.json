@@ -29,7 +29,7 @@
    "id": "light-mwhhze25",
    "kind": "light",
    "name": "Fireplace1",
-   "entity": "light.fireplace_light_1",
+   "entity": "light.liv_fire_lt1",
    "x": 192,
    "y": 153
   },
@@ -37,7 +37,7 @@
    "id": "light-mwhhzgra",
    "kind": "light",
    "name": "Fireplace2",
-   "entity": "light.fireplace_light_2",
+   "entity": "light.liv_fire_lt2",
    "x": 192,
    "y": 99
   },
@@ -45,7 +45,7 @@
    "id": "light-mwhhzkul",
    "kind": "light",
    "name": "Gallery1",
-   "entity": "light.gallery_light_1",
+   "entity": "light.liv_gal_lt1",
    "x": 174,
    "y": 3
   },
@@ -53,7 +53,7 @@
    "id": "light-mwhhzron",
    "kind": "light",
    "name": "Gallery2",
-   "entity": "light.gallery_light_2",
+   "entity": "light.liv_gal_lt2",
    "x": 48,
    "y": 0
   },
@@ -61,7 +61,7 @@
    "id": "light-mwhhzu69",
    "kind": "light",
    "name": "Gallery3",
-   "entity": "light.gallery_light_3",
+   "entity": "light.liv_gal_lt3",
    "x": 0,
    "y": 93
   },
@@ -69,7 +69,7 @@
    "id": "motion-mwhi05xs",
    "kind": "motion",
    "name": "Square PIR sensor 5",
-   "entity": "binary_sensor.square_pir_sensor_5_occupancy",
+   "entity": "binary_sensor.liv_mo_occupancy",
    "x": 30,
    "y": 0,
    "facing": 160
@@ -86,7 +86,7 @@
    "id": "button-mwhi1pzh",
    "kind": "button",
    "name": "Hue Wall Module",
-   "entity": "event.family_switch_1_action",
+   "entity": "event.liv_sw_action",
    "x": 0,
    "y": 207
   },
@@ -94,7 +94,7 @@
    "id": "fan-mwhi1xx2",
    "kind": "fan",
    "name": "Family Room Fan",
-   "entity": "switch.family_room_bar_cart_outlet",
+   "entity": "switch.liv_fan_pl",
    "x": 63,
    "y": 6
   },
@@ -102,7 +102,7 @@
    "id": "contact-mwhi4xb9",
    "kind": "contact",
    "name": "Luggage Closet Door",
-   "entity": "binary_sensor.misc_contact_sensor_contact",
+   "entity": "binary_sensor.lug_dr_contact",
    "x": 21,
    "y": 0
   },
@@ -110,7 +110,7 @@
    "id": "light-mwhi5loh",
    "kind": "light",
    "name": "Luggage Room Light",
-   "entity": "light.luggage_room_light",
+   "entity": "light.lug_lt",
    "x": 9,
    "y": -3
   },
@@ -187,21 +187,21 @@
  ],
  "watch": [
   "input_boolean.living_room_occupied",
-  "light.fireplace_light_1",
-  "light.fireplace_light_2",
-  "light.gallery_light_1",
-  "light.gallery_light_2",
-  "light.gallery_light_3",
-  "binary_sensor.square_pir_sensor_5_occupancy",
+  "light.liv_fire_lt1",
+  "light.liv_fire_lt2",
+  "light.liv_gal_lt1",
+  "light.liv_gal_lt2",
+  "light.liv_gal_lt3",
+  "binary_sensor.liv_mo_occupancy",
   "binary_sensor.front_door_door",
-  "event.family_switch_1_action",
-  "binary_sensor.misc_contact_sensor_contact",
-  "light.luggage_room_light",
+  "event.liv_sw_action",
+  "binary_sensor.lug_dr_contact",
+  "light.lug_lt",
   "media_player.googletv_chromecast",
   "input_boolean.living_room_motion_lights",
   "input_text.living_room_occupancy_reason",
   "input_text.living_room_lights_reason",
   "fan.herr_cleany",
-  "switch.family_room_bar_cart_outlet"
+  "switch.liv_fan_pl"
  ]
 }

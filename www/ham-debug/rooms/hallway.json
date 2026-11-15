@@ -29,7 +29,7 @@
    "id": "motion-mwhjfgbr",
    "kind": "motion",
    "name": "Motion (Tapo T100)",
-   "entity": "binary_sensor.hallway_motion_occupancy",
+   "entity": "binary_sensor.hal_mo_occupancy",
    "x": 33,
    "y": 0,
    "facing": 185
@@ -38,7 +38,7 @@
    "id": "light-mwhjgcv7",
    "kind": "light",
    "name": "Hall light",
-   "entity": "light.hall_light",
+   "entity": "light.hal_lt",
    "x": 18,
    "y": 72
   },
@@ -46,7 +46,7 @@
    "id": "button-hue-tap-dial",
    "kind": "button",
    "name": "Hue Tap dial",
-   "entity": "event.4_button_rotary_encoder_action",
+   "entity": "event.hal_sw_action",
    "x": 36,
    "y": 5
   }
@@ -130,11 +130,11 @@
  ],
  "watch": [
   "input_boolean.hallway_occupied",
-  "binary_sensor.hallway_motion_occupancy",
-  "light.hall_light",
+  "binary_sensor.hal_mo_occupancy",
+  "light.hal_lt",
   "input_boolean.hallway_motion_lights",
   "input_text.hallway_occupancy_reason",
   "input_text.hallway_lights_reason",
-  "event.4_button_rotary_encoder_action"
+  "event.hal_sw_action"
  ]
 }

@@ -28,9 +28,9 @@
         data: {}
         target:
           entity_id:
-          - light.gallery_light_1
-          - light.gallery_light_2
-          - light.gallery_light_3
+          - light.liv_gal_lt1
+          - light.liv_gal_lt2
+          - light.liv_gal_lt3
     - conditions:
       - condition: trigger
         id:
@@ -41,8 +41,8 @@
         data: {}
         target:
           entity_id:
-          - light.fireplace_light_1
-          - light.fireplace_light_2
+          - light.liv_fire_lt1
+          - light.liv_fire_lt2
   mode: single
 - id: '1763440155306'
   alias: Office Lights
@@ -103,10 +103,10 @@
         data: {}
         target:
           entity_id:
-          - light.office_light_1
-          - light.office_light_2
-          - light.office_light_3
-          - light.office_light_4
+          - light.off_lt1
+          - light.off_lt2
+          - light.off_lt3
+          - light.off_lt4
     - conditions:
       - condition: trigger
         id:
@@ -129,10 +129,10 @@
           brightness_step_pct: -8
         target:
           entity_id:
-          - light.office_light_1
-          - light.office_light_2
-          - light.office_light_3
-          - light.office_light_4
+          - light.off_lt1
+          - light.off_lt2
+          - light.off_lt3
+          - light.off_lt4
     - conditions:
       - condition: trigger
         id:
@@ -144,10 +144,10 @@
           brightness_step_pct: 8
         target:
           entity_id:
-          - light.office_light_1
-          - light.office_light_2
-          - light.office_light_3
-          - light.office_light_4
+          - light.off_lt1
+          - light.off_lt2
+          - light.off_lt3
+          - light.off_lt4
     - conditions:
       - condition: trigger
         id:
@@ -159,10 +159,10 @@
           transition: 4
         target:
           entity_id:
-          - light.office_light_1
-          - light.office_light_2
-          - light.office_light_3
-          - light.office_light_4
+          - light.off_lt1
+          - light.off_lt2
+          - light.off_lt3
+          - light.off_lt4
   mode: single
 - id: '1763521696392'
   alias: Bedroom Headboard Lights
@@ -205,7 +205,7 @@
           brightness_pct: 39
         target:
           entity_id:
-          - light.headboard_light
+          - light.bed_head_lt
     - conditions:
       - condition: trigger
         id:
@@ -217,7 +217,7 @@
           transition: 3
         target:
           entity_id:
-          - light.headboard_light
+          - light.bed_head_lt
   mode: single
 - id: '1765285365878'
   alias: Closet lights
@@ -225,17 +225,17 @@
     turns off after 60 minutes on even if the door stays open.
   triggers:
   - trigger: state
-    entity_id: binary_sensor.misc_contact_sensor_contact
+    entity_id: binary_sensor.lug_dr_contact
     from: 'off'
     to: 'on'
     id: open
   - trigger: state
-    entity_id: binary_sensor.misc_contact_sensor_contact
+    entity_id: binary_sensor.lug_dr_contact
     from: 'on'
     to: 'off'
     id: closed
   - trigger: state
-    entity_id: light.luggage_room_light
+    entity_id: light.lug_lt
     to: 'on'
     for:
       minutes: 60
@@ -251,7 +251,7 @@
       - action: light.turn_on
         metadata: {}
         target:
-          entity_id: light.luggage_room_light
+          entity_id: light.lug_lt
         data:
           brightness_pct: 68
     - conditions:
@@ -263,7 +263,7 @@
       - action: light.turn_off
         metadata: {}
         target:
-          entity_id: light.luggage_room_light
+          entity_id: light.lug_lt
         data:
           transition: 5
   mode: single
@@ -318,8 +318,8 @@
         metadata: {}
         target:
           entity_id:
-          - switch.kitchen_se_downlight
-          - switch.kitchen_sw_downlight
+          - switch.kit_se_lt
+          - switch.kit_sw_lt
         data: {}
   mode: single
 - id: '1770171751479'
@@ -367,7 +367,7 @@
       - action: light.toggle
         metadata: {}
         target:
-          entity_id: light.hall_light
+          entity_id: light.hal_lt
         data: {}
     - conditions:
       - condition: trigger
@@ -377,7 +377,7 @@
       - action: light.turn_on
         metadata: {}
         target:
-          entity_id: light.hall_light
+          entity_id: light.hal_lt
         data:
           transition: 2
     - conditions:
@@ -388,7 +388,7 @@
       - action: light.turn_off
         metadata: {}
         target:
-          entity_id: light.hall_light
+          entity_id: light.hal_lt
         data:
           transition: 7
     - conditions:
@@ -400,8 +400,8 @@
         metadata: {}
         target:
           entity_id:
-          - switch.kitchen_se_downlight
-          - switch.kitchen_sw_downlight
+          - switch.kit_se_lt
+          - switch.kit_sw_lt
         data: {}
     - conditions:
       - condition: trigger
@@ -412,10 +412,10 @@
         metadata: {}
         target:
           entity_id:
-          - light.office_light_1
-          - light.office_light_2
-          - light.office_light_3
-          - light.office_light_4
+          - light.off_lt1
+          - light.off_lt2
+          - light.off_lt3
+          - light.off_lt4
         data: {}
     - conditions:
       - condition: trigger
@@ -427,8 +427,8 @@
         data: {}
         target:
           entity_id:
-          - light.bathroom_ceiling_light
-          - switch.bathroom
+          - light.bat_lt
+          - switch.bat_bot
     - conditions:
       - condition: trigger
         id:
@@ -712,10 +712,10 @@
         id: motion
       - condition: state
         entity_id:
-        - light.office_light_1
-        - light.office_light_2
-        - light.office_light_3
-        - light.office_light_4
+        - light.off_lt1
+        - light.off_lt2
+        - light.off_lt3
+        - light.off_lt4
         state: 'off'
         for: 00:00:20
       - condition: or
@@ -725,10 +725,10 @@
           state: 'on'
         - condition: state
           entity_id:
-          - light.office_light_1
-          - light.office_light_2
-          - light.office_light_3
-          - light.office_light_4
+          - light.off_lt1
+          - light.off_lt2
+          - light.off_lt3
+          - light.off_lt4
           state: 'off'
           for: 00:30:00
       sequence:
@@ -752,10 +752,10 @@
             - action: light.turn_on
               target:
                 entity_id:
-                - light.office_light_1
-                - light.office_light_2
-                - light.office_light_3
-                - light.office_light_4
+                - light.off_lt1
+                - light.off_lt2
+                - light.off_lt3
+                - light.off_lt4
             - stop: Person found
           - delay: 00:00:02
     - conditions:
@@ -766,10 +766,10 @@
         state: 'off'
       - condition: state
         entity_id:
-        - light.office_light_1
-        - light.office_light_2
-        - light.office_light_3
-        - light.office_light_4
+        - light.off_lt1
+        - light.off_lt2
+        - light.off_lt3
+        - light.off_lt4
         state: 'on'
         match: any
       sequence:
@@ -799,10 +799,10 @@
           - action: light.turn_off
             target:
               entity_id:
-              - light.office_light_1
-              - light.office_light_2
-              - light.office_light_3
-              - light.office_light_4
+              - light.off_lt1
+              - light.off_lt2
+              - light.off_lt3
+              - light.off_lt4
   mode: single
   max_exceeded: silent
 - id: office_lights_ai_mark_on
@@ -811,10 +811,10 @@
   triggers:
   - trigger: state
     entity_id:
-    - light.office_light_1
-    - light.office_light_2
-    - light.office_light_3
-    - light.office_light_4
+    - light.off_lt1
+    - light.off_lt2
+    - light.off_lt3
+    - light.off_lt4
     to: 'on'
   conditions: []
   actions:
@@ -862,10 +862,10 @@
         state: 'off'
       - condition: state
         entity_id:
-        - light.office_light_1
-        - light.office_light_2
-        - light.office_light_3
-        - light.office_light_4
+        - light.off_lt1
+        - light.off_lt2
+        - light.off_lt3
+        - light.off_lt4
         state: 'on'
         match: any
       - condition: template
@@ -911,10 +911,10 @@
             - action: light.turn_off
               target:
                 entity_id:
-                - light.office_light_1
-                - light.office_light_2
-                - light.office_light_3
-                - light.office_light_4
+                - light.off_lt1
+                - light.off_lt2
+                - light.off_lt3
+                - light.off_lt4
             - action: counter.reset
               target:
                 entity_id: counter.office_vision_absent_streak
@@ -1098,10 +1098,10 @@
         id: present
       - condition: state
         entity_id:
-        - light.office_light_1
-        - light.office_light_2
-        - light.office_light_3
-        - light.office_light_4
+        - light.off_lt1
+        - light.off_lt2
+        - light.off_lt3
+        - light.off_lt4
         state: 'off'
         for: 00:00:20
       - condition: or
@@ -1111,29 +1111,29 @@
           state: 'on'
         - condition: state
           entity_id:
-          - light.office_light_1
-          - light.office_light_2
-          - light.office_light_3
-          - light.office_light_4
+          - light.off_lt1
+          - light.off_lt2
+          - light.off_lt3
+          - light.off_lt4
           state: 'off'
           for: 00:30:00
       sequence:
       - action: light.turn_on
         target:
           entity_id:
-          - light.office_light_1
-          - light.office_light_2
-          - light.office_light_3
-          - light.office_light_4
+          - light.off_lt1
+          - light.off_lt2
+          - light.off_lt3
+          - light.off_lt4
     - conditions:
       - condition: trigger
         id: empty
       - condition: state
         entity_id:
-        - light.office_light_1
-        - light.office_light_2
-        - light.office_light_3
-        - light.office_light_4
+        - light.off_lt1
+        - light.off_lt2
+        - light.off_lt3
+        - light.off_lt4
         state: 'on'
         match: any
       sequence:
@@ -1143,10 +1143,10 @@
       - action: light.turn_off
         target:
           entity_id:
-          - light.office_light_1
-          - light.office_light_2
-          - light.office_light_3
-          - light.office_light_4
+          - light.off_lt1
+          - light.off_lt2
+          - light.off_lt3
+          - light.off_lt4
   mode: queued
 - id: 'ham_bathroom_hue_tap'
   alias: Bathroom Hue tap
@@ -1155,7 +1155,7 @@
     4: all off.
   triggers:
   - trigger: state
-    entity_id: event.4_button_circular_smart_button_action
+    entity_id: event.bat_sw_action
     not_from:
     - unavailable
     - unknown
@@ -1166,51 +1166,51 @@
   actions:
   - variables:
       button: "{{ trigger.to_state.attributes.event_type }}"
-      any_on: "{{ is_state('light.bathroom_ceiling_light', 'on') or is_state('switch.bathroom', 'on') }}"
+      any_on: "{{ is_state('light.bat_lt', 'on') or is_state('switch.bat_bot', 'on') }}"
   - choose:
     - conditions: "{{ button == 'press_1' and any_on }}"
       sequence:
       - action: light.turn_off
         target:
-          entity_id: light.bathroom_ceiling_light
+          entity_id: light.bat_lt
       - action: switch.turn_off
         target:
-          entity_id: switch.bathroom
+          entity_id: switch.bat_bot
     - conditions: "{{ button == 'press_1' }}"
       sequence:
       - action: light.turn_on
         target:
-          entity_id: light.bathroom_ceiling_light
+          entity_id: light.bat_lt
         data:
           brightness_pct: "{{ states('sensor.house_light_level') | int(30) }}"
       - action: switch.turn_on
         target:
-          entity_id: switch.bathroom
-    - conditions: "{{ button == 'press_2' and is_state('light.bathroom_ceiling_light', 'on') }}"
+          entity_id: switch.bat_bot
+    - conditions: "{{ button == 'press_2' and is_state('light.bat_lt', 'on') }}"
       sequence:
       - action: light.turn_off
         target:
-          entity_id: light.bathroom_ceiling_light
+          entity_id: light.bat_lt
     - conditions: "{{ button == 'press_2' }}"
       sequence:
       - action: light.turn_on
         target:
-          entity_id: light.bathroom_ceiling_light
+          entity_id: light.bat_lt
         data:
           brightness_pct: "{{ states('sensor.house_light_level') | int(30) }}"
     - conditions: "{{ button == 'press_3' }}"
       sequence:
       - action: switch.toggle
         target:
-          entity_id: switch.bathroom
+          entity_id: switch.bat_bot
     - conditions: "{{ button == 'press_4' }}"
       sequence:
       - action: light.turn_off
         target:
-          entity_id: light.bathroom_ceiling_light
+          entity_id: light.bat_lt
       - action: switch.turn_off
         target:
-          entity_id: switch.bathroom
+          entity_id: switch.bat_bot
   mode: queued
 - id: 'pocket-sign-square-button-1'
   alias: Pocket Sign square button

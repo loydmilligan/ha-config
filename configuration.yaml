@@ -359,7 +359,7 @@ template:
         state: >-
           {{ is_state('binary_sensor.everything_presence_lite_cadb3c_zone_3_occupancy', 'on')
              or is_state('binary_sensor.everything_presence_lite_cadb3c_zone_1_occupancy', 'on')
-             or is_state('binary_sensor.sonoff_mmwave_occupancy', 'on') }}
+             or is_state('binary_sensor.off_mara_pr_occupancy', 'on') }}
 
   # --- House light level (ha-manager task #20) --------------------------------------
   # One brightness target (%) for every automatic light. Interim levels; to be revised
@@ -389,14 +389,14 @@ template:
           {% set occ = states('binary_sensor.bathroom_occupied') %}
           {% set o = 'unknown' if occ not in ['on', 'off'] else ('vacant' if occ == 'off' else
              ('inside' if state_attr('binary_sensor.bathroom_occupied', 'someone_inside') else 'occupied')) %}
-          {% set fan = states('switch.bathroom') %}
+          {% set fan = states('switch.bat_bot') %}
           {% set f = 'unknown' if fan not in ['on', 'off'] else ('off' if fan == 'off' else
              ('running' if is_state('binary_sensor.bathroom_shower', 'on') else 'on_no_shower')) %}
           {{ o }}.{{ f }}
         attributes:
           label: >-
             {% set occ = states('binary_sensor.bathroom_occupied') %}
-            {% set fan = states('switch.bathroom') %}
+            {% set fan = states('switch.bat_bot') %}
             {% if occ not in ['on', 'off'] %}Occupancy unknown{% elif occ == 'off' %}Vacant{% elif state_attr('binary_sensor.bathroom_occupied', 'someone_inside') %}Someone inside (door closed){% else %}Occupied (door open){% endif %} · {% if fan not in ['on', 'off'] %}fan unknown{% elif fan == 'off' %}fan off{% elif is_state('binary_sensor.bathroom_shower', 'on') %}shower, fan running{% else %}fan on, no shower{% endif %}
 
 sensor:
