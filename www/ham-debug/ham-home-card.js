@@ -414,7 +414,7 @@
       this.shadowRoot.innerHTML = `<style>
         :host { display: block; scroll-margin-top: 72px; }
         .wrap { position: relative; border-radius: var(--ha-card-border-radius, 12px); border: 0 solid var(--c); transition: box-shadow .3s; }
-        .wrap.live { border-left-width: 3px; padding-left: 0; }
+        .wrap.live { border-width: 1.5px; border-style: solid; padding: 0; }
         .wrap.dashed, .wrap.dotted { border-width: 1.5px; padding: 0; }
         .wrap.dashed { border-style: dashed; } .wrap.dotted { border-style: dotted; border-width: 2px; }
         .wrap.flash { box-shadow: 0 0 0 3px var(--primary-color, #03a9f4); }
@@ -488,9 +488,9 @@
           summary::before { content: '\\25B8'; color: var(--secondary-text-color,#9aa7b4); }
           details[open] summary::before { content: '\\25BE'; }
           ul { margin: 0 0 10px; padding: 0; list-style: none; }
-          li { padding: 7px 8px; margin: 6px 0; font-size: 14px; color: var(--primary-text-color,#e8edf2); border-left: 3px dashed var(--c); border-radius: 6px;
+          li { padding: 7px 8px; margin: 6px 0; font-size: 14px; color: var(--primary-text-color,#e8edf2); border: 1.5px dashed var(--c); border-radius: 8px;
             background: color-mix(in srgb, var(--c) 7%, transparent); }
-          li.concept { border-left-style: dotted; border-left-width: 4px; }
+          li.concept { border-style: dotted; border-width: 2px; }
           .h { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
           .id { margin-left: auto; font-size: 11px; color: var(--secondary-text-color,#9aa7b4); }
           code { display: block; font-size: 12px; color: var(--secondary-text-color,#9aa7b4); word-break: break-all; margin-top: 2px; }
