@@ -1,0 +1,122 @@
+# Controls helpers — Phase 1 (ha-manager, 2026-11-17). Helpers only: NOTHING reads these yet,
+# so adding this package changes no behaviour. Plan and backlog: tela pages 1500 and 1496
+# (HC-001 … HC-020); dashboard: /house-controls.
+#
+# Like packages/rooms.yaml, helpers carry no `initial:` so later tuning survives restarts.
+# Defaults are set ONCE after creation with service calls (see the change plan), and reproduce
+# today's behaviour (brightness 100/60/30/3, motion lights on, window 12:00 to 00:00).
+#
+# Later phases wire these in: 2 sleep schedule, 3 brightness levels and exterior light,
+# 4 motion-lights time window, 5 room fans.
+
+# ───────────────────────── Booleans ─────────────────────────
+
+input_boolean:
+  # HC-001: master switch for the scheduled sleep mode (off = sleep mode stays manual, as today).
+  sleep_auto_enabled:
+    name: Auto sleep enabled
+    icon: mdi:sleep
+  # HC-008: master switch for every room's motion lights (on = rooms run as they do today).
+  motion_lights_master:
+    name: Motion lights master
+    icon: mdi:lightbulb-auto
+
+# ───────────────────────── Times of day ─────────────────────────
+
+input_datetime:
+  # HC-002 / HC-003: scheduled sleep mode window (unused while sleep_auto_enabled is off).
+  sleep_auto_start:
+    name: Sleep starts at
+    has_date: false
+    has_time: true
+    icon: mdi:weather-night
+  sleep_auto_end:
+    name: Sleep ends at
+    has_date: false
+    has_time: true
+    icon: mdi:weather-sunset-up
+  # HC-010 / HC-011: motion lights only turn ON inside this window (start 12:00, end 00:00 = midnight).
+  motion_lights_start:
+    name: Motion lights start time
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  motion_lights_end:
+    name: Motion lights end time
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+
+# ───────────────────────── Numbers ─────────────────────────
+
+input_number:
+  # HC-004 … HC-007: the four brightness targets (%). Today these are hard-coded in
+  # sensor.house_light_level: 100 / 60 / 30 / 3.
+  house_brightness_day:
+    name: Brightness, day
+    min: 1
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+    icon: mdi:brightness-7
+  house_brightness_dusk:
+    name: Brightness, dusk
+    min: 1
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+    icon: mdi:brightness-6
+  house_brightness_night:
+    name: Brightness, night
+    min: 1
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+    icon: mdi:brightness-5
+  house_brightness_sleep:
+    name: Brightness, sleep
+    min: 1
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+    icon: mdi:brightness-3
+  # HC-013 / HC-014: a fan goes off after the primary room's vacancy hold x this multiplier,
+  # but never sooner than the floor.
+  fan_hold_multiplier:
+    name: Fan off delay, times the room's light hold
+    min: 1
+    max: 10
+    step: 0.5
+    mode: box
+    icon: mdi:fan-clock
+  fan_hold_floor:
+    name: Fan off delay, minimum
+    min: 1
+    max: 120
+    step: 1
+    unit_of_measurement: min
+    mode: box
+    icon: mdi:fan-clock
+
+# ───────────────────────── Read-only occupancy for the office ─────────────────────────
+# The office keeps its own camera-based lights logic ("Office Lights by AI Camera", "Office Vision
+# Poll"). This sensor only READS that state so other automations (the fans, Phase 5) have one
+# entity to consume. It writes nothing, so the one-writer rule is unaffected.
+# Occupied = radar on OR presence state motion / vision_present; vision_absent forces empty.
+
+template:
+  - binary_sensor:
+      - name: Office occupied
+        unique_id: office_occupied
+        device_class: occupancy
+        icon: mdi:account-check
+        # Matt, 2026-11-17: the camera's "absent" answer wins, even if the radar still says on.
+        state: >-
+          {% set p = states('input_select.office_presence_state') %}
+          {% if p == 'vision_absent' %}false
+          {% else %}{{ is_state('binary_sensor.office_presence_radar', 'on') or p in ['motion', 'vision_present'] }}
+          {% endif %}
