@@ -65,6 +65,43 @@ template:
           {% set d = states('sensor.home_matt_mariani_distance') | float(0) * 0.3048 %}
           {% if trigger.id == 'left' %}{{ d | round(0) }}
           {% else %}{{ [this.state | float(0), d] | max | round(0) }}{% endif %}
+  # Matt's phone as heard over BLE (companion-app BLE transmitter -> iBeacon Tracker). The phone
+  # rotates its Bluetooth address, so iBeacon makes one entity per address: take every live
+  # estimated-distance sensor with Matt's beacon UUID. State = closest reading heard by the LED Matrix
+  # proxy at the front door (24:DC:C3:C4:CE:36); attributes keep the closest reading from any scanner.
+  - sensor:
+      - name: Matt phone door BLE distance
+        unique_id: matt_phone_door_ble_distance
+        unit_of_measurement: m
+        icon: mdi:bluetooth-connect
+        state: >-
+          {% set uuid = '4e6c3c7a-418d-4314-bdba-40866c93d79c' %}
+          {% set door = '24:DC:C3:C4:CE:36' %}
+          {% set ns = namespace(d=[]) %}
+          {% for s in states.sensor if s.entity_id.endswith('_estimated_distance')
+               and s.attributes.get('uuid') == uuid and s.attributes.get('source') == door and s.state | is_number %}
+            {% set ns.d = ns.d + [s.state | float * 0.3048] %}
+          {% endfor %}
+          {# 99 = the door proxy does not hear the phone right now #}
+          {{ (ns.d | min) | round(1) if ns.d else 99 }}
+        attributes:
+          nearest_any_m: >-
+            {% set uuid = '4e6c3c7a-418d-4314-bdba-40866c93d79c' %}
+            {% set ns = namespace(d=[]) %}
+            {% for s in states.sensor if s.entity_id.endswith('_estimated_distance')
+                 and s.attributes.get('uuid') == uuid and s.state | is_number %}
+              {% set ns.d = ns.d + [s.state | float * 0.3048] %}
+            {% endfor %}
+            {{ (ns.d | min) | round(1) if ns.d else none }}
+          nearest_any_source: >-
+            {% set uuid = '4e6c3c7a-418d-4314-bdba-40866c93d79c' %}
+            {% set ns = namespace(best=99999, src=none) %}
+            {% for s in states.sensor if s.entity_id.endswith('_estimated_distance')
+                 and s.attributes.get('uuid') == uuid and s.state | is_number %}
+              {% if s.state | float < ns.best %}{% set ns.best = s.state | float %}{% set ns.src = s.attributes.get('source') %}{% endif %}
+            {% endfor %}
+            {{ {'24:DC:C3:C4:CE:36': 'led-matrix (door)', 'C0:FB:F9:61:B1:E3': 'CM4 dongle',
+                'E0:5A:1B:6C:3C:46': 'sensorguy', 'EC:C9:FF:CA:DB:3E': 'office presence'}.get(ns.src, ns.src) }}
   - binary_sensor:
       # Matt is approaching home: away >= 10 min, proximity says "towards", within ~2 km.
       # On only after 2 min of that (delay_on); stays on 3 min after it stops (covers the moment of arrival).
@@ -89,7 +126,7 @@ template:
         icon: mdi:shield-check
         state: >-
           {% set ssids = states('input_text.home_wifi_ssids').split(',') | map('trim') | reject('eq', '') | list %}
-          {% set ble = '' %}{# iBeacon estimated-distance sensor for the Pixel, set once it appears #}
+          {% set ble = 'sensor.matt_phone_door_ble_distance' %}
           {% set wifi_ok = states('sensor.pixel_11_pro_wi_fi_connection') in ssids %}
           {% set ble_ok = ble != '' and states(ble) | float(99) <= states('input_number.door_ble_near_m') | float(3) %}
           {{ is_state('binary_sensor.matt_arrival_armed', 'on') and (wifi_ok or ble_ok) }}
@@ -116,7 +153,7 @@ automation:
           armed: binary_sensor.matt_arrival_armed
           trip_max: sensor.matt_trip_max_distance
           wifi: sensor.pixel_11_pro_wi_fi_connection
-          ble_distance: ""   # iBeacon estimated-distance sensor for the Pixel, set once it appears
+          ble_distance: sensor.matt_phone_door_ble_distance
       who: "{{ people[trigger.entity_id] }}"
       t0: "{{ now().isoformat() }}"
       away_min: >-
@@ -161,6 +198,8 @@ automation:
             {{ ((w.last_changed - as_datetime(t0)).total_seconds()) | round(0)
                if w is not none and w.state in ssids else 'n/a' }}
           ble_m: "{{ states(who.ble_distance) if who.ble_distance else 'n/a' }}"
+          ble_any: >-
+            {{ state_attr(who.ble_distance, 'nearest_any_m') }} m via {{ state_attr(who.ble_distance, 'nearest_any_source') }}
           rails_ok: "{{ away_min | float(0) >= 10 and came_from_m | float(0) >= 1000 }}"
       - event: ham_door_arrival
         event_data:
@@ -174,6 +213,7 @@ automation:
           wifi_home: "{{ wifi_home }}"
           wifi_lag_s: "{{ wifi_lag_s }}"
           ble_m: "{{ ble_m }}"
+          ble_any: "{{ ble_any }}"
           rails_ok: "{{ rails_ok }}"
           mode: "{{ mode }}"
       - action: logbook.log
@@ -183,7 +223,7 @@ automation:
           message: >-
             [{{ mode }}] {{ who.name }} arrived: away {{ away_min }} min, armed {{ 'yes (' ~ armed_for_min ~ ' min)' if was_armed else 'NO' }},
             from {{ came_from_m }} m; door opened {{ door_lag_s ~ ' s' if door_lag_s != -1 else 'not within 10 min' }};
-            Wi-Fi {{ 'home' if wifi_home else wifi_state }} (lag {{ wifi_lag_s }} s); BLE {{ ble_m }} m;
+            Wi-Fi {{ 'home' if wifi_home else wifi_state }} (lag {{ wifi_lag_s }} s); BLE at door {{ ble_m }} m (nearest {{ ble_any }});
             lock was {{ lock_at_arrival }}; stage-3 rails {{ 'PASS' if rails_ok else 'fail' }}
 
   - id: door_arrival_near_miss
