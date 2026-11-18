@@ -37,7 +37,9 @@ rest:
       - name: Office TV sign items
         unique_id: office_tv_sign_items
         icon: mdi:television-guide
-        value_template: "{{ value_json['items'] | count }}"
+        # A refused request (403: the key lacks the "status" scope) has no items list.
+        value_template: >-
+          {{ value_json.get('items') | count if value_json is mapping and value_json.get('items') is list else 'unavailable' }}
         json_attributes: [items]
 
 template:
@@ -75,7 +77,8 @@ script:
     sequence:
       - variables:
           rgbs: "{{ state_attr('sensor.daily_theme', 'rgb') or [[0, 179, 179], [255, 140, 0]] }}"
-          rounds: "{{ (20 / (rgbs | count)) | round(0, 'ceil') | int }}"
+          # ~10 s of smooth cross-fades: each colour fades in over 0.9 s and holds 0.3 s.
+          rounds: "{{ (10 / (1.2 * (rgbs | count))) | round(0, 'ceil') | int }}"
       - repeat:
           count: "{{ rounds }}"
           sequence:
@@ -84,8 +87,8 @@ script:
                 sequence:
                   - action: light.turn_on
                     target: { entity_id: light.sensorguy_status_light }
-                    data: { rgb_color: "{{ repeat.item }}", brightness_pct: 80, effect: None, transition: 0 }
-                  - delay: { milliseconds: 500 }
+                    data: { rgb_color: "{{ repeat.item }}", brightness_pct: 80, effect: None, transition: 0.9 }
+                  - delay: { milliseconds: 1200 }
       - action: light.turn_on
         target: { entity_id: light.sensorguy_status_light }
         data: { rgb_color: "{{ rgbs[0] }}", brightness_pct: 80, effect: Pulse }
