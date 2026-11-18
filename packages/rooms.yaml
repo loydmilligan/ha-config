@@ -120,14 +120,27 @@ light:
       - light.liv_gal_lt1
       - light.liv_gal_lt2
       - light.liv_gal_lt3
+  # Laundry: two fixtures, each its own group; the room group holds both fixture groups.
+  # Single bulbs are hidden (Matt, 2026-11-18). East fixture = colour bulbs, kept addressable
+  # on its own so it can show information (status colours).
+  - platform: group
+    name: Laundry west fixture
+    unique_id: ham_laundry_west_fixture
+    entities:
+      - light.lau_n_lt
+      - light.lau_s_lt
+  - platform: group
+    name: Laundry east fixture
+    unique_id: ham_laundry_east_fixture
+    entities:
+      - light.lau_ne_lt
+      - light.lau_se_lt
   - platform: group
     name: Laundry lights
     unique_id: ham_laundry_lights
     entities:
-      - light.lau_n_lt
-      - light.lau_s_lt
-      - light.lau_ne_lt
-      - light.lau_se_lt
+      - light.laundry_west_fixture
+      - light.laundry_east_fixture
 
 # ───────────────────────── Automations ─────────────────────────
 
