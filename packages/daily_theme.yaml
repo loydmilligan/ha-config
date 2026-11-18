@@ -1,0 +1,68 @@
+# Daily theme colours (ha-manager, 2026-11-18). Contract: ha-manager docs/contracts/daily-theme.md.
+#
+# A cron job on the CM4 (~/bin/daily-theme-fetch.sh, 01:05 and 04:30) pulls today's row from
+# Supabase and atomically replaces config/daily-theme/theme.json (gitignored). HA only READS it:
+#   sensor.daily_theme_raw  - the file as JSON attributes (re-read every 5 min)
+#   sensor.daily_theme      - validated theme, or the teal/orange fallback (fallback: true) when
+#                             the file is missing, not JSON, fails the format check, or is dated
+#                             more than 2 days ago.
+# Used by priority-2 alerts on the sensorguy status light (doorbell; daily announcements later).
+
+command_line:
+  - sensor:
+      name: Daily theme raw
+      unique_id: daily_theme_raw
+      icon: mdi:file-code
+      command: "cat /config/daily-theme/theme.json 2>/dev/null || echo '{}'"
+      value_template: "{{ value_json.date | default('missing') if value_json is defined else 'invalid' }}"
+      json_attributes: [date, name, colors, reason, source, generated_at, fetched_at]
+      scan_interval: 300
+
+template:
+  - triggers:
+      - trigger: state
+        entity_id: sensor.daily_theme_raw
+      - trigger: time_pattern
+        minutes: "/15"
+      - trigger: homeassistant
+        event: start
+      - trigger: event
+        event_type: event_template_reloaded
+    actions:
+      - variables:
+          raw: "{{ states.sensor.daily_theme_raw.attributes if states.sensor.daily_theme_raw is not none else {} }}"
+          fallback_theme:
+            name: Fallback
+            date: "{{ now().date().isoformat() }}"
+            colors: ["#00B3B3", "#FF8C00"]
+            reason: No valid theme file for today
+            source: fallback
+            generated_at: null
+            fetched_at: null
+          valid: >-
+            {% set c = raw.get('colors') %}
+            {% set d = raw.get('date') | string %}
+            {% set n = raw.get('name') %}
+            {% set ok_colors = c is list and 2 <= c | count <= 4
+               and c | select('string') | select('match', '^#[0-9A-Fa-f]{6}$') | list | count == c | count %}
+            {% set ok_date = d is match('^\d{4}-\d{2}-\d{2}$') %}
+            {% set age = (now().date() - as_datetime(d).date()).days if ok_date and as_datetime(d, none) is not none else 99 %}
+            {{ ok_colors and n is string and n | length > 0 and 0 <= age <= 2 }}
+          theme: "{{ raw if valid else fallback_theme }}"
+    sensor:
+      - name: Daily theme
+        unique_id: daily_theme
+        icon: mdi:palette
+        state: "{{ theme.name }}"
+        attributes:
+          date: "{{ theme.date }}"
+          colors: "{{ theme.colors }}"
+          rgb: >-
+            {{ theme.colors | map('regex_replace', '^#', '')
+               | map('regex_findall', '..') | map('map', 'int', 0, 16) | map('list') | list }}
+          reason: "{{ theme.get('reason') }}"
+          source: "{{ theme.get('source') }}"
+          generated_at: "{{ theme.get('generated_at') }}"
+          fetched_at: "{{ theme.get('fetched_at') }}"
+          fallback: "{{ not valid }}"
+          updated_at: "{{ now().isoformat() }}"
