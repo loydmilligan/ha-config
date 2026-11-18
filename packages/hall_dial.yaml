@@ -105,6 +105,8 @@ automation:
                     - light.lug_lt
                     - light.lau_n_lt
                     - light.lau_s_lt
+                    - light.laundry_room_laundry_room_ne_matter_bulb
+                    - light.smart_rgbtw_bulb
               - action: switch.turn_off
                 target: { entity_id: [switch.kit_se_lt, switch.kit_sw_lt] }
           # Holds: select the room, confirm the select changed, then flash that room
