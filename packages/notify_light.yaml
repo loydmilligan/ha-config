@@ -1,0 +1,333 @@
+# Notification light on sensorguy (ha-manager, 2026-11-18). Contract and priorities:
+# ha-manager docs/contracts/daily-theme.md. Matt approved the design 2026-11-18.
+#
+# Each alert is an input_boolean (+ a 30-min timer that clears it). One script renders the
+# highest-priority active alert on light.sensorguy_status_light:
+#   P2 doorbell        daily theme (sensor.daily_theme): cycle the colours ~10 s, then pulse the first
+#   P3 pocket          amber pulse   (new Pocket-agent note on the Office TV sign)
+#   P4 sign            blue pulse    (any other new note/interrupt on the Office TV sign)
+#   P4 laundry         green pulse   (washer or dryer finished)
+#   P4 battery         red pulse     (phone below the warning level, not charging)
+# Power key: clear the alert being shown. Lock key: clear it AND dismiss the Office TV overlays.
+# Sleep mode (02:00-08:00) keeps the light dark; alerts still clear themselves after 30 min.
+
+input_boolean:
+  notify_doorbell: { name: "Notify: doorbell", icon: mdi:doorbell }
+  notify_pocket: { name: "Notify: Pocket note", icon: mdi:robot }
+  notify_sign: { name: "Notify: sign message", icon: mdi:message-text }
+  notify_laundry: { name: "Notify: laundry done", icon: mdi:washing-machine }
+  notify_battery: { name: "Notify: phone battery low", icon: mdi:battery-alert }
+
+timer:
+  notify_doorbell: { name: "Notify clear: doorbell", duration: "00:30:00", restore: true }
+  notify_pocket: { name: "Notify clear: Pocket note", duration: "00:30:00", restore: true }
+  notify_sign: { name: "Notify clear: sign message", duration: "00:30:00", restore: true }
+  notify_laundry: { name: "Notify clear: laundry", duration: "00:30:00", restore: true }
+  notify_battery: { name: "Notify clear: phone battery", duration: "00:30:00", restore: true }
+
+# ── Signals ──────────────────────────────────────────────────────────────────────────────
+# Office TV sign: current items (read-only ext API; the key needs the "status" scope).
+rest:
+  - resource: https://sign.dogbelly.app/api/v1/ext/displays/027YiRhj
+    headers:
+      Authorization: !secret pocket_sign_key
+    scan_interval: 30
+    timeout: 15
+    sensor:
+      - name: Office TV sign items
+        unique_id: office_tv_sign_items
+        icon: mdi:television-guide
+        value_template: "{{ value_json['items'] | count }}"
+        json_attributes: [items]
+
+template:
+  - binary_sensor:
+      # Washer / dryer running from plug power: on after 5 min above 8 W, off after 5 min below 3 W.
+      - name: Washer running
+        unique_id: washer_running
+        icon: mdi:washing-machine
+        state: >-
+          {% set w = states('sensor.lau_wash_pl_power') | float(0) %}
+          {{ w > 8 or (w > 3 and is_state('binary_sensor.washer_running', 'on')) }}
+        delay_on: "00:05:00"
+        delay_off: "00:05:00"
+      - name: Dryer running
+        unique_id: dryer_running
+        icon: mdi:tumble-dryer
+        state: >-
+          {% set w = states('sensor.lau_dry_pl_power') | float(0) %}
+          {{ w > 8 or (w > 3 and is_state('binary_sensor.dryer_running', 'on')) }}
+        delay_on: "00:05:00"
+        delay_off: "00:05:00"
+      # Same rule as "Pocket Sign - phone battery low": below 20 % (90 % in test mode), not charging.
+      - name: Phone battery low
+        unique_id: phone_battery_low
+        icon: mdi:battery-alert
+        state: >-
+          {% set threshold = 90 if is_state('input_boolean.pocket_sign_battery_test', 'on') else 20 %}
+          {{ states('sensor.pixel_11_pro_battery_state') in ['discharging', 'not_charging']
+             and states('sensor.pixel_11_pro_battery_level') | float(100) < threshold }}
+
+script:
+  notify_light_theme_show:
+    alias: Notify light — daily theme cycle then pulse
+    mode: restart
+    sequence:
+      - variables:
+          rgbs: "{{ state_attr('sensor.daily_theme', 'rgb') or [[0, 179, 179], [255, 140, 0]] }}"
+          rounds: "{{ (20 / (rgbs | count)) | round(0, 'ceil') | int }}"
+      - repeat:
+          count: "{{ rounds }}"
+          sequence:
+            - repeat:
+                for_each: "{{ rgbs }}"
+                sequence:
+                  - action: light.turn_on
+                    target: { entity_id: light.sensorguy_status_light }
+                    data: { rgb_color: "{{ repeat.item }}", brightness_pct: 80, effect: None, transition: 0 }
+                  - delay: { milliseconds: 500 }
+      - action: light.turn_on
+        target: { entity_id: light.sensorguy_status_light }
+        data: { rgb_color: "{{ rgbs[0] }}", brightness_pct: 80, effect: Pulse }
+
+  notify_light_render:
+    alias: Notify light — show the highest-priority alert
+    mode: restart
+    fields:
+      fresh:
+        description: True when the doorbell just rang (play the colour cycle first)
+    sequence:
+      - variables:
+          order: [doorbell, pocket, sign, laundry, battery]
+          colors:
+            pocket: [255, 110, 0]
+            sign: [0, 70, 255]
+            laundry: [0, 255, 40]
+            battery: [255, 0, 0]
+          top: >-
+            {% set ns = namespace(t='') %}
+            {% for a in order if ns.t == '' and is_state('input_boolean.notify_' ~ a, 'on') %}{% set ns.t = a %}{% endfor %}
+            {{ ns.t }}
+      - choose:
+          - conditions: "{{ top == '' or is_state('input_boolean.sleep_mode', 'on') }}"
+            sequence:
+              - action: light.turn_off
+                target: { entity_id: light.sensorguy_status_light }
+          - conditions: "{{ top == 'doorbell' and (fresh | default(false)) }}"
+            sequence:
+              - action: script.notify_light_theme_show
+          - conditions: "{{ top == 'doorbell' }}"
+            sequence:
+              - action: light.turn_on
+                target: { entity_id: light.sensorguy_status_light }
+                data:
+                  rgb_color: "{{ (state_attr('sensor.daily_theme', 'rgb') or [[0, 179, 179]])[0] }}"
+                  brightness_pct: 80
+                  effect: Pulse
+        default:
+          - action: light.turn_on
+            target: { entity_id: light.sensorguy_status_light }
+            data: { rgb_color: "{{ colors[top] }}", brightness_pct: 80, effect: Pulse }
+
+  notify_light_preview_doorbell:
+    alias: Notify light — preview the doorbell look (ignores sleep mode)
+    mode: single
+    sequence:
+      - action: script.turn_on
+        target: { entity_id: script.notify_light_theme_show }
+      - delay: { seconds: 25 }
+      - action: script.notify_light_render
+
+automation:
+  # ── Render whenever an alert, sleep mode or the theme changes ──
+  - id: notify_light_render
+    alias: "[Notify] Render status light"
+    mode: queued
+    max: 5
+    triggers:
+      - trigger: state
+        entity_id:
+          - input_boolean.notify_doorbell
+          - input_boolean.notify_pocket
+          - input_boolean.notify_sign
+          - input_boolean.notify_laundry
+          - input_boolean.notify_battery
+          - input_boolean.sleep_mode
+        not_to: [unavailable, unknown]
+      - trigger: state
+        entity_id: sensor.daily_theme
+        attribute: colors
+      - trigger: homeassistant
+        event: start
+    actions:
+      - action: script.notify_light_render
+        data:
+          fresh: >-
+            {{ trigger.platform == 'state' and trigger.entity_id == 'input_boolean.notify_doorbell'
+               and trigger.to_state.state == 'on' }}
+
+  # ── Each alert clears itself 30 min after it was (re)raised ──
+  - id: notify_light_timers
+    alias: "[Notify] Start / finish the 30-min clear timers"
+    mode: queued
+    max: 10
+    triggers:
+      - trigger: state
+        entity_id:
+          - input_boolean.notify_doorbell
+          - input_boolean.notify_pocket
+          - input_boolean.notify_sign
+          - input_boolean.notify_laundry
+          - input_boolean.notify_battery
+        id: flag
+      - trigger: event
+        event_type: timer.finished
+        id: done
+    actions:
+      - variables:
+          name: >-
+            {{ (trigger.entity_id if trigger.id == 'flag' else trigger.event.data.entity_id).split('.')[1] }}
+      - condition: "{{ name.startswith('notify_') }}"
+      - choose:
+          - conditions: "{{ trigger.id == 'done' }}"
+            sequence:
+              - action: input_boolean.turn_off
+                target: { entity_id: "input_boolean.{{ name }}" }
+          - conditions: "{{ trigger.to_state.state == 'on' }}"
+            sequence:
+              - action: timer.start
+                target: { entity_id: "timer.{{ name }}" }
+        default:
+          - action: timer.cancel
+            target: { entity_id: "timer.{{ name }}" }
+
+  # ── Raise / clear alerts ──
+  - id: notify_doorbell
+    alias: "[Notify] Doorbell ring → P2"
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: event.doorbell_chime
+        not_to: [unavailable, unknown]
+    conditions:
+      - "{{ trigger.to_state.attributes.event_type == 'ring' }}"
+    actions:
+      - if: "{{ is_state('input_boolean.notify_doorbell', 'on') }}"
+        then:
+          # Already up: replay the colour cycle and restart its 30-min timer.
+          - action: timer.start
+            target: { entity_id: timer.notify_doorbell }
+          - action: script.notify_light_render
+            data: { fresh: true }
+        else:
+          - action: input_boolean.turn_on
+            target: { entity_id: input_boolean.notify_doorbell }
+
+  - id: notify_laundry
+    alias: "[Notify] Washer / dryer finished → P4 green; door opened → clear"
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: [binary_sensor.washer_running, binary_sensor.dryer_running]
+        from: "on"
+        to: "off"
+        id: done
+      - trigger: state
+        entity_id: [binary_sensor.lau_wash_dr_contact]
+        to: "on"
+        id: opened
+    actions:
+      - if: "{{ trigger.id == 'done' }}"
+        then:
+          - action: input_boolean.turn_on
+            target: { entity_id: input_boolean.notify_laundry }
+        else:
+          - action: input_boolean.turn_off
+            target: { entity_id: input_boolean.notify_laundry }
+
+  - id: notify_battery
+    alias: "[Notify] Phone battery low → P4 red"
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.phone_battery_low
+        to: ["on", "off"]
+    actions:
+      - action: "input_boolean.turn_{{ trigger.to_state.state }}"
+        target: { entity_id: input_boolean.notify_battery }
+
+  - id: notify_sign_items
+    alias: "[Notify] Office TV sign items → Pocket (P3 amber) / other (P4 blue)"
+    mode: queued
+    max: 5
+    triggers:
+      - trigger: state
+        entity_id: sensor.office_tv_sign_items
+        attribute: items
+    conditions:
+      - "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
+    actions:
+      - variables:
+          ha_keys: [doorbell, phone-battery]
+          prev_ids: "{{ (trigger.from_state.attributes.get('items') or []) | map(attribute='id') | list }}"
+          items: "{{ trigger.to_state.attributes.get('items') or [] }}"
+          tally: >-
+            {% set ns = namespace(pn=0, on=0, pp=0, op=0) %}
+            {% for i in items %}
+              {% set pocket = (i.key or '').startswith('pocket') or (i.text or '').startswith('Pocket:') %}
+              {% set other = not pocket and i.level in ['note', 'interrupt'] and (i.key or '') not in ha_keys %}
+              {% set new = i.id not in prev_ids %}
+              {% if pocket %}{% set ns.pp = ns.pp + 1 %}{% if new %}{% set ns.pn = ns.pn + 1 %}{% endif %}{% endif %}
+              {% if other %}{% set ns.op = ns.op + 1 %}{% if new %}{% set ns.on = ns.on + 1 %}{% endif %}{% endif %}
+            {% endfor %}
+            {{ {'pocket_new': ns.pn, 'other_new': ns.on, 'pocket_present': ns.pp, 'other_present': ns.op} }}
+      - if: "{{ tally.pocket_new > 0 }}"
+        then:
+          - action: input_boolean.turn_on
+            target: { entity_id: input_boolean.notify_pocket }
+      - if: "{{ tally.other_new > 0 }}"
+        then:
+          - action: input_boolean.turn_on
+            target: { entity_id: input_boolean.notify_sign }
+      # The message left the sign (expired or dismissed): the light follows.
+      - if: "{{ tally.pocket_present == 0 }}"
+        then:
+          - action: input_boolean.turn_off
+            target: { entity_id: input_boolean.notify_pocket }
+      - if: "{{ tally.other_present == 0 }}"
+        then:
+          - action: input_boolean.turn_off
+            target: { entity_id: input_boolean.notify_sign }
+
+  # ── Keys ──
+  - id: notify_keys
+    alias: "[Notify] Power key clears the shown alert; Lock key also dismisses the sign overlays"
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.sensorguy_power_key
+        from: "off"
+        to: "on"
+        id: power
+      - trigger: state
+        entity_id: binary_sensor.sensorguy_lock_key
+        from: "off"
+        to: "on"
+        id: lock
+    actions:
+      - variables:
+          top: >-
+            {% set ns = namespace(t='') %}
+            {% for a in ['doorbell', 'pocket', 'sign', 'laundry', 'battery'] if ns.t == '' and is_state('input_boolean.notify_' ~ a, 'on') %}{% set ns.t = a %}{% endfor %}
+            {{ ns.t }}
+      - if: "{{ top != '' }}"
+        then:
+          - action: input_boolean.turn_off
+            target: { entity_id: "input_boolean.notify_{{ top }}" }
+      - if: "{{ trigger.id == 'lock' }}"
+        then:
+          - action: rest_command.sign_ext_dismiss
+            data: { display: 027YiRhj }
+            continue_on_error: true
+          - action: input_boolean.turn_off
+            target: { entity_id: [input_boolean.notify_pocket, input_boolean.notify_sign] }
