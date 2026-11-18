@@ -323,33 +323,10 @@
         data: {}
   mode: single
 - id: '1770171751479'
-  alias: Hue tap dial controls
-  description: ''
+  alias: Kitchen button controls
+  description: 'Kitchen button toggles the kitchen lights. The hallway Hue tap dial moved
+    to packages/hall_dial.yaml (ha-manager, 2026-11-18).'
   triggers:
-  - domain: mqtt
-    device_id: af63f89cb2a1e74b1f0cea4cb7b79210
-    type: action
-    subtype: button_1_press
-    trigger: device
-    id: press_1
-  - domain: mqtt
-    device_id: af63f89cb2a1e74b1f0cea4cb7b79210
-    type: action
-    subtype: button_2_press
-    trigger: device
-    id: press_2
-  - domain: mqtt
-    device_id: af63f89cb2a1e74b1f0cea4cb7b79210
-    type: action
-    subtype: button_3_press
-    trigger: device
-    id: press_3
-  - domain: mqtt
-    device_id: af63f89cb2a1e74b1f0cea4cb7b79210
-    type: action
-    subtype: button_4_press
-    trigger: device
-    id: press_4
   - domain: mqtt
     device_id: 6f6f1af56d533cb4b29169ea44b9b39b
     type: action
@@ -358,87 +335,13 @@
     id: kitch_button_single
   conditions: []
   actions:
-  - choose:
-    - conditions:
-      - condition: trigger
-        id:
-        - press_1
-      sequence:
-      - action: light.toggle
-        metadata: {}
-        target:
-          entity_id: light.hal_lt
-        data: {}
-    - conditions:
-      - condition: trigger
-        id:
-        - hall_motion_detected
-      sequence:
-      - action: light.turn_on
-        metadata: {}
-        target:
-          entity_id: light.hal_lt
-        data:
-          transition: 2
-    - conditions:
-      - condition: trigger
-        id:
-        - hall_motion_cleared
-      sequence:
-      - action: light.turn_off
-        metadata: {}
-        target:
-          entity_id: light.hal_lt
-        data:
-          transition: 7
-    - conditions:
-      - condition: trigger
-        id:
-        - kitch_button_single
-      sequence:
-      - action: switch.toggle
-        metadata: {}
-        target:
-          entity_id:
-          - switch.kit_se_lt
-          - switch.kit_sw_lt
-        data: {}
-    - conditions:
-      - condition: trigger
-        id:
-        - press_3
-      sequence:
-      - action: light.toggle
-        metadata: {}
-        target:
-          entity_id:
-          - light.off_lt1
-          - light.off_lt2
-          - light.off_lt3
-          - light.off_lt4
-        data: {}
-    - conditions:
-      - condition: trigger
-        id:
-        - press_2
-      sequence:
-      - action: homeassistant.toggle
-        metadata: {}
-        data: {}
-        target:
-          entity_id:
-          - light.bat_lt
-          - switch.bat_bot
-    - conditions:
-      - condition: trigger
-        id:
-        - press_4
-      sequence:
-      - action: light.toggle
-        metadata: {}
-        data: {}
-        target:
-          entity_id: light.family_room_ceiling
+  - action: switch.toggle
+    metadata: {}
+    target:
+      entity_id:
+      - switch.kit_se_lt
+      - switch.kit_sw_lt
+    data: {}
   mode: single
 - id: '1770232671725'
   alias: Play Local Music

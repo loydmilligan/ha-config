@@ -120,3 +120,27 @@ template:
           {% if p == 'vision_absent' %}false
           {% else %}{{ is_state('binary_sensor.office_presence_radar', 'on') or p in ['motion', 'vision_present'] }}
           {% endif %}
+
+# ───────────────────────── Phase 2: scheduled sleep mode (HC-001…003) ─────────────────────────
+# Matt, 2026-11-18: sleep 02:00 → 08:00. Only acts at the two boundaries, so a manual toggle
+# in between wins until the next boundary. Does nothing while sleep_auto_enabled is off.
+
+automation:
+  - id: controls_sleep_schedule
+    alias: "[House] Scheduled sleep mode"
+    mode: single
+    triggers:
+      - trigger: time
+        at: input_datetime.sleep_auto_start
+        id: start
+      - trigger: time
+        at: input_datetime.sleep_auto_end
+        id: end
+    conditions:
+      - condition: state
+        entity_id: input_boolean.sleep_auto_enabled
+        state: "on"
+    actions:
+      - action: "input_boolean.turn_{{ 'on' if trigger.id == 'start' else 'off' }}"
+        target:
+          entity_id: input_boolean.sleep_mode

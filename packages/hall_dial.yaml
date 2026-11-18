@@ -1,0 +1,181 @@
+# Hallway Hue Tap dial — room selector + brightness dial (ha-manager, 2026-11-18).
+# Replaces the dial part of the UI automation "Hue tap dial controls" (id 1770171751479), which
+# keeps only the kitchen button. Layout (Matt): top-left Hallway, bottom-left Office,
+# bottom-right Living room, top-right All off.
+#
+#   short press  -> toggle that room (fires on press_release so a hold never toggles)
+#   hold         -> select that room as the dial target, confirm, flash its lights
+#   rotate dial  -> brightness of the selected room (default Office)
+#   no activity for 10 min with a room other than Office selected -> back to Office
+#
+# "Hallway" as a dial target means hallway + bedroom lights together.
+
+input_select:
+  dial_target:
+    name: Dial target room
+    icon: mdi:knob
+    options:
+      - Office
+      - Hallway
+      - Living room
+    # no `initial:` so the choice survives restarts; set to Office once after creation
+
+timer:
+  dial_target_timeout:
+    name: Dial target back to Office
+    duration: "00:10:00"
+    restore: true
+
+script:
+  dial_flash_room:
+    alias: Dial — flash the selected room
+    mode: single
+    fields:
+      lights:
+        description: Light entities to flash
+    sequence:
+      - action: scene.create
+        data:
+          scene_id: dial_flash_restore
+          snapshot_entities: "{{ lights }}"
+      - repeat:
+          count: 2
+          sequence:
+            - action: light.turn_on
+              target: { entity_id: "{{ lights }}" }
+              data: { brightness_pct: 50, transition: 0 }
+            - delay: { milliseconds: 350 }
+            - action: light.turn_off
+              target: { entity_id: "{{ lights }}" }
+              data: { transition: 0 }
+            - delay: { milliseconds: 350 }
+      - action: scene.turn_on
+        target: { entity_id: scene.dial_flash_restore }
+
+automation:
+  - id: hall_dial_buttons
+    alias: "[Hallway] Tap dial buttons → toggle / select room / all off"
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - { trigger: device, domain: mqtt, device_id: af63f89cb2a1e74b1f0cea4cb7b79210, type: action, subtype: button_1_press_release, id: press_hallway }
+      - { trigger: device, domain: mqtt, device_id: af63f89cb2a1e74b1f0cea4cb7b79210, type: action, subtype: button_3_press_release, id: press_office }
+      - { trigger: device, domain: mqtt, device_id: af63f89cb2a1e74b1f0cea4cb7b79210, type: action, subtype: button_4_press_release, id: press_living }
+      - { trigger: device, domain: mqtt, device_id: af63f89cb2a1e74b1f0cea4cb7b79210, type: action, subtype: button_2_press_release, id: press_all_off }
+      - { trigger: device, domain: mqtt, device_id: af63f89cb2a1e74b1f0cea4cb7b79210, type: action, subtype: button_1_hold, id: hold_hallway }
+      - { trigger: device, domain: mqtt, device_id: af63f89cb2a1e74b1f0cea4cb7b79210, type: action, subtype: button_3_hold, id: hold_office }
+      - { trigger: device, domain: mqtt, device_id: af63f89cb2a1e74b1f0cea4cb7b79210, type: action, subtype: button_4_hold, id: hold_living }
+    variables:
+      rooms:
+        Hallway: [light.hal_lt, light.bed_lt]
+        Office: [light.off_lt1, light.off_lt2, light.off_lt3, light.off_lt4]
+        Living room: [light.living_room_lights]
+      by_id:
+        hallway: Hallway
+        office: Office
+        living: Living room
+    actions:
+      - choose:
+          # Short presses: toggle the room (Hallway press stays hallway-only, as today)
+          - conditions: "{{ trigger.id == 'press_hallway' }}"
+            sequence:
+              - action: light.toggle
+                target: { entity_id: light.hal_lt }
+          - conditions: "{{ trigger.id == 'press_office' }}"
+            sequence:
+              - action: light.toggle
+                target: { entity_id: "{{ rooms['Office'] }}" }
+          - conditions: "{{ trigger.id == 'press_living' }}"
+            sequence:
+              - action: light.toggle
+                target: { entity_id: light.living_room_lights }
+          - conditions: "{{ trigger.id == 'press_all_off' }}"
+            sequence:
+              - action: light.turn_off
+                target:
+                  entity_id:
+                    - light.hal_lt
+                    - light.bed_lt
+                    - light.off_lt1
+                    - light.off_lt2
+                    - light.off_lt3
+                    - light.off_lt4
+                    - light.living_room_lights
+                    - light.bat_lt
+                    - light.lug_lt
+                    - light.lau_n_lt
+                    - light.lau_s_lt
+              - action: switch.turn_off
+                target: { entity_id: [switch.kit_se_lt, switch.kit_sw_lt] }
+          # Holds: select the room, confirm the select changed, then flash that room
+          - conditions: "{{ trigger.id.startswith('hold_') }}"
+            sequence:
+              - variables:
+                  room: "{{ by_id[trigger.id[5:]] }}"
+              - action: input_select.select_option
+                target: { entity_id: input_select.dial_target }
+                data: { option: "{{ room }}" }
+              - wait_template: "{{ is_state('input_select.dial_target', room) }}"
+                timeout: "00:00:03"
+                continue_on_timeout: false
+              - if: "{{ room != 'Office' }}"
+                then:
+                  - action: timer.start
+                    target: { entity_id: timer.dial_target_timeout }
+                else:
+                  - action: timer.cancel
+                    target: { entity_id: timer.dial_target_timeout }
+              - action: script.dial_flash_room
+                data:
+                  # Hallway target = hallway + bedroom, but the blink uses the hallway bulb only
+                  lights: >-
+                    {% set r = states('input_select.dial_target') %}
+                    {{ ['light.hal_lt'] if r == 'Hallway' else rooms[r] }}
+
+  - id: hall_dial_rotate
+    alias: "[Hallway] Tap dial rotate → brightness of the selected room"
+    mode: queued
+    max: 4
+    max_exceeded: silent
+    triggers:
+      - { trigger: device, domain: mqtt, device_id: af63f89cb2a1e74b1f0cea4cb7b79210, type: action, subtype: dial_rotate_right_step, id: "5" }
+      - { trigger: device, domain: mqtt, device_id: af63f89cb2a1e74b1f0cea4cb7b79210, type: action, subtype: dial_rotate_right_slow, id: "10" }
+      - { trigger: device, domain: mqtt, device_id: af63f89cb2a1e74b1f0cea4cb7b79210, type: action, subtype: dial_rotate_right_fast, id: "20" }
+      - { trigger: device, domain: mqtt, device_id: af63f89cb2a1e74b1f0cea4cb7b79210, type: action, subtype: dial_rotate_left_step, id: "-5" }
+      - { trigger: device, domain: mqtt, device_id: af63f89cb2a1e74b1f0cea4cb7b79210, type: action, subtype: dial_rotate_left_slow, id: "-10" }
+      - { trigger: device, domain: mqtt, device_id: af63f89cb2a1e74b1f0cea4cb7b79210, type: action, subtype: dial_rotate_left_fast, id: "-20" }
+    variables:
+      rooms:
+        Hallway: [light.hal_lt, light.bed_lt]
+        Office: [light.off_lt1, light.off_lt2, light.off_lt3, light.off_lt4]
+        Living room: [light.living_room_lights]
+      room: "{{ states('input_select.dial_target') }}"
+    actions:
+      - action: light.turn_on
+        target: { entity_id: "{{ rooms.get(room, rooms['Office']) }}" }
+        data:
+          brightness_step_pct: "{{ trigger.id | int }}"
+          transition: 0.3
+      # Using the dial keeps a non-Office choice alive for another 10 minutes
+      - if: "{{ room != 'Office' }}"
+        then:
+          - action: timer.start
+            target: { entity_id: timer.dial_target_timeout }
+
+  - id: hall_dial_target_reset
+    alias: "[Hallway] Dial target → back to Office after 10 min idle"
+    mode: single
+    triggers:
+      - trigger: event
+        event_type: timer.finished
+        event_data: { entity_id: timer.dial_target_timeout }
+    conditions:
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.dial_target
+            state: Office
+    actions:
+      - action: input_select.select_option
+        target: { entity_id: input_select.dial_target }
+        data: { option: Office }
