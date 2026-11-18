@@ -13,8 +13,33 @@
 # Safety rails for later stages (logged now): away >= 10 min, came from beyond ~1 km, re-lock if the
 # door isn't opened within ~2 min of an unlock, log every unlock and near-miss.
 #
+# Modes: input_boolean.door_secure_mode off = hands-free, on = secure (tap to unlock). It turns
+# on by itself after 4 h away and back off once home and unlocked (only if it was set automatically).
+#
 # Adding Mara later: add her phone to the Proximity "Home" entry (Settings > Proximity > options),
 # copy the trip-max sensor and armed binary_sensor blocks below, and add one entry to `people` in both automations.
+
+input_boolean:
+  # Secure mode: presence checks still run, but nothing unlocks until Matt taps Unlock on the
+  # phone/watch notification. Off = hands-free (unlock once all checks pass, then auto-relock).
+  door_secure_mode:
+    name: Front door secure mode
+    icon: mdi:shield-lock
+  # Internal: secure mode was switched on automatically (away > 4 h), so it may switch itself off.
+  door_secure_by_auto:
+    name: Front door secure mode set automatically
+    icon: mdi:shield-sync
+
+input_number:
+  # iBeacon distance (m) that counts as "at the door" via the LED Matrix proxy. Tune from the logs.
+  door_ble_near_m:
+    name: Front door BLE near distance
+    min: 0.5
+    max: 15
+    step: 0.5
+    unit_of_measurement: m
+    mode: box
+    icon: mdi:bluetooth
 
 input_text:
   home_wifi_ssids:
@@ -57,6 +82,21 @@ template:
              and 0 <= d_m <= 2000 }}
         attributes:
           distance_m: "{{ (states('sensor.home_matt_mariani_distance') | float(0) * 0.3048) | round(0) }}"
+      # All presence checks for Matt: approaching (armed: away >= 10 min, towards, < 2 km) AND
+      # a confirmation: phone on a home Wi-Fi SSID, or iBeacon says it's within door_ble_near_m.
+      - name: Matt door checks pass
+        unique_id: matt_door_checks_pass
+        icon: mdi:shield-check
+        state: >-
+          {% set ssids = states('input_text.home_wifi_ssids').split(',') | map('trim') | reject('eq', '') | list %}
+          {% set ble = '' %}{# iBeacon estimated-distance sensor for the Pixel, set once it appears #}
+          {% set wifi_ok = states('sensor.pixel_11_pro_wi_fi_connection') in ssids %}
+          {% set ble_ok = ble != '' and states(ble) | float(99) <= states('input_number.door_ble_near_m') | float(3) %}
+          {{ is_state('binary_sensor.matt_arrival_armed', 'on') and (wifi_ok or ble_ok) }}
+        attributes:
+          confirmed_by: >-
+            {% set ssids = states('input_text.home_wifi_ssids').split(',') | map('trim') | reject('eq', '') | list %}
+            {{ 'wifi' if states('sensor.pixel_11_pro_wi_fi_connection') in ssids else 'ble' }}
 
 automation:
   - id: door_arrival_watch
@@ -90,6 +130,7 @@ automation:
       ssids: "{{ states('input_text.home_wifi_ssids').split(',') | map('trim') | reject('eq', '') | list }}"
     actions:
       - variables:
+          mode: "{{ 'secure' if is_state('input_boolean.door_secure_mode', 'on') else 'hands-free' }}"
           wifi_at_arrival: "{{ states(who.wifi) }}"
           lock_at_arrival: "{{ states('lock.front_door') }}"
       - event: ham_door_arrival
@@ -102,6 +143,7 @@ automation:
           came_from_m: "{{ came_from_m }}"
           wifi: "{{ wifi_at_arrival }}"
           lock: "{{ lock_at_arrival }}"
+          mode: "{{ mode }}"
       # Wait for the door to open (the real "I'm at the door" moment), up to 10 min.
       - wait_for_trigger:
           - trigger: state
@@ -133,12 +175,13 @@ automation:
           wifi_lag_s: "{{ wifi_lag_s }}"
           ble_m: "{{ ble_m }}"
           rails_ok: "{{ rails_ok }}"
+          mode: "{{ mode }}"
       - action: logbook.log
         data:
           name: Front door arrival
           entity_id: lock.front_door
           message: >-
-            {{ who.name }} arrived: away {{ away_min }} min, armed {{ 'yes (' ~ armed_for_min ~ ' min)' if was_armed else 'NO' }},
+            [{{ mode }}] {{ who.name }} arrived: away {{ away_min }} min, armed {{ 'yes (' ~ armed_for_min ~ ' min)' if was_armed else 'NO' }},
             from {{ came_from_m }} m; door opened {{ door_lag_s ~ ' s' if door_lag_s != -1 else 'not within 10 min' }};
             Wi-Fi {{ 'home' if wifi_home else wifi_state }} (lag {{ wifi_lag_s }} s); BLE {{ ble_m }} m;
             lock was {{ lock_at_arrival }}; stage-3 rails {{ 'PASS' if rails_ok else 'fail' }}
@@ -171,3 +214,111 @@ automation:
             Near-miss: {{ who.name }} was armed for
             {{ ((now() - trigger.from_state.last_changed).total_seconds() / 60) | round(1) }} min but did not arrive
             (now {{ states(who.person) }})
+
+  # ── Modes (stage 1: log what each mode WOULD do; no unlock, no notification yet) ──
+  - id: door_would_unlock
+    alias: "[Front door] Checks pass → log what the active mode would do (stage 1)"
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: [binary_sensor.matt_door_checks_pass]
+        from: "off"
+        to: "on"
+    variables:
+      people:
+        binary_sensor.matt_door_checks_pass: { name: Matt, person: person.matt_mariani }
+      who: "{{ people[trigger.entity_id] }}"
+      mode: "{{ 'secure' if is_state('input_boolean.door_secure_mode', 'on') else 'hands-free' }}"
+      by: "{{ state_attr(trigger.entity_id, 'confirmed_by') }}"
+    actions:
+      - event: ham_door_arrival
+        event_data:
+          phase: would_unlock
+          person: "{{ who.person }}"
+          mode: "{{ mode }}"
+          confirmed_by: "{{ by }}"
+          lock: "{{ states('lock.front_door') }}"
+          door: "{{ states('binary_sensor.front_door_door') }}"
+      - action: logbook.log
+        data:
+          name: Front door arrival
+          entity_id: lock.front_door
+          message: >-
+            [{{ mode }}] checks passed for {{ who.name }} (confirmed by {{ by }}):
+            {{ 'WOULD UNLOCK now, then re-lock if the door is not opened within 2 min' if mode == 'hands-free'
+               else 'WOULD SEND the Unlock notification (no tap, no unlock)' }}; lock is {{ states('lock.front_door') }}
+
+  - id: door_secure_auto
+    alias: "[Front door] Secure mode on after 4 h away; off again once home and unlocked"
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: person.matt_mariani
+        from: home
+        for: "04:00:00"
+        id: long_away
+      - trigger: state
+        entity_id: lock.front_door
+        to: unlocked
+        id: unlocked
+    actions:
+      - choose:
+          - conditions:
+              - "{{ trigger.id == 'long_away' and is_state('input_boolean.door_secure_mode', 'off') }}"
+              - "{{ not is_state('person.matt_mariani', 'home') }}"
+            sequence:
+              - action: input_boolean.turn_on
+                target: { entity_id: [input_boolean.door_secure_mode, input_boolean.door_secure_by_auto] }
+              - action: logbook.log
+                data:
+                  name: Front door arrival
+                  entity_id: input_boolean.door_secure_mode
+                  message: Secure mode switched ON automatically (away more than 4 h)
+          # Only undo what the automation did; a secure mode Matt set by hand stays on.
+          - conditions:
+              - "{{ trigger.id == 'unlocked' }}"
+              - "{{ is_state('person.matt_mariani', 'home') }}"
+              - "{{ is_state('input_boolean.door_secure_by_auto', 'on') }}"
+            sequence:
+              - action: input_boolean.turn_off
+                target: { entity_id: [input_boolean.door_secure_mode, input_boolean.door_secure_by_auto] }
+              - action: logbook.log
+                data:
+                  name: Front door arrival
+                  entity_id: input_boolean.door_secure_mode
+                  message: Secure mode switched OFF automatically (home and door unlocked)
+
+  - id: door_secure_manual
+    alias: "[Front door] Manual secure-mode change clears the auto flag"
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: input_boolean.door_secure_mode
+    conditions:
+      - "{{ trigger.to_state.context.user_id is not none }}"
+    actions:
+      - action: input_boolean.turn_off
+        target: { entity_id: input_boolean.door_secure_by_auto }
+      - action: logbook.log
+        data:
+          name: Front door arrival
+          entity_id: input_boolean.door_secure_mode
+          message: "Secure mode set {{ trigger.to_state.state | upper }} by hand"
+
+  # Log every lock change with the mode active at the time (who/what did it comes from the lock).
+  - id: door_lock_log
+    alias: "[Front door] Log every lock/unlock with the active mode"
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: lock.front_door
+        to: [locked, unlocked]
+    actions:
+      - action: logbook.log
+        data:
+          name: Front door arrival
+          entity_id: lock.front_door
+          message: >-
+            [{{ 'secure' if is_state('input_boolean.door_secure_mode', 'on') else 'hands-free' }}]
+            lock {{ trigger.to_state.state }} (by {{ state_attr('lock.front_door', 'changed_by') or 'unknown' }});
+            Matt {{ states('person.matt_mariani') }}
