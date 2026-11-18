@@ -1,0 +1,173 @@
+# Front door arrival — STAGE 1: WATCH ONLY (ha-manager, 2026-11-18). Matt approved the staged plan.
+# Nothing here locks or unlocks anything. It logs what each signal says on every arrival so the
+# later stages (2 ask-first, 3 hands-free) can be judged on real data.
+#
+# Signals (per person):
+#   proximity  sensor.home_<person>_distance (ft) + _direction_of_travel  -> "approaching" arms a
+#              get-ready state (binary_sensor.<name>_arrival_armed); it never unlocks on its own
+#   Wi-Fi      companion-app Wi-Fi connection sensor; home SSIDs live in input_text.home_wifi_ssids
+#              (set once by service call, kept out of this public repo). Confirmation, not trigger.
+#   BLE        companion-app BLE transmitter -> iBeacon Tracker via the LED Matrix proxy by the door
+#              (estimated distance entity is filled in below once iBeacon has seen the phone)
+#   door       binary_sensor.front_door_door (August DoorSense), lock.front_door
+# Safety rails for later stages (logged now): away >= 10 min, came from beyond ~1 km, re-lock if the
+# door isn't opened within ~2 min of an unlock, log every unlock and near-miss.
+#
+# Adding Mara later: add her phone to the Proximity "Home" entry (Settings > Proximity > options),
+# copy the trip-max sensor and armed binary_sensor blocks below, and add one entry to `people` in both automations.
+
+input_text:
+  home_wifi_ssids:
+    name: Home Wi-Fi SSIDs (comma-separated)
+    max: 255
+    icon: mdi:wifi-lock
+
+template:
+  # Farthest Matt got from home on the current trip (m); resets when he leaves home.
+  - triggers:
+      - trigger: state
+        entity_id: sensor.home_matt_mariani_distance
+      - trigger: state
+        entity_id: person.matt_mariani
+        from: home
+        id: left
+    sensor:
+      - name: Matt trip max distance
+        unique_id: matt_trip_max_distance
+        unit_of_measurement: m
+        icon: mdi:map-marker-distance
+        state: >-
+          {% set d = states('sensor.home_matt_mariani_distance') | float(0) * 0.3048 %}
+          {% if trigger.id == 'left' %}{{ d | round(0) }}
+          {% else %}{{ [this.state | float(0), d] | max | round(0) }}{% endif %}
+  - binary_sensor:
+      # Matt is approaching home: away >= 10 min, proximity says "towards", within ~2 km.
+      # On only after 2 min of that (delay_on); stays on 3 min after it stops (covers the moment of arrival).
+      - name: Matt arrival armed
+        unique_id: matt_arrival_armed
+        icon: mdi:home-import-outline
+        delay_on: "00:02:00"
+        delay_off: "00:03:00"
+        state: >-
+          {% set p = states.person.matt_mariani %}
+          {% set d_m = states('sensor.home_matt_mariani_distance') | float(-1) * 0.3048 %}
+          {{ p is not none and p.state != 'home'
+             and (now() - p.last_changed).total_seconds() >= 600
+             and is_state('sensor.home_matt_mariani_direction_of_travel', 'towards')
+             and 0 <= d_m <= 2000 }}
+        attributes:
+          distance_m: "{{ (states('sensor.home_matt_mariani_distance') | float(0) * 0.3048) | round(0) }}"
+
+automation:
+  - id: door_arrival_watch
+    alias: "[Front door] Arrival watch (stage 1, log only)"
+    description: Logs each arrival with what every signal said. Never locks or unlocks.
+    mode: parallel
+    max: 6
+    triggers:
+      - trigger: state
+        entity_id: [person.matt_mariani]
+        to: home
+        id: arrival
+    variables:
+      people:
+        person.matt_mariani:
+          name: Matt
+          armed: binary_sensor.matt_arrival_armed
+          trip_max: sensor.matt_trip_max_distance
+          wifi: sensor.pixel_11_pro_wi_fi_connection
+          ble_distance: ""   # iBeacon estimated-distance sensor for the Pixel, set once it appears
+      who: "{{ people[trigger.entity_id] }}"
+      t0: "{{ now().isoformat() }}"
+      away_min: >-
+        {{ ((now() - trigger.from_state.last_changed).total_seconds() / 60) | round(1)
+           if trigger.from_state is not none else -1 }}
+      came_from_m: "{{ states(who.trip_max) | float(-1) }}"
+      was_armed: "{{ is_state(who.armed, 'on') }}"
+      armed_for_min: >-
+        {% set a = states[who.armed] %}
+        {{ ((now() - a.last_changed).total_seconds() / 60) | round(1) if a is not none and a.state == 'on' else 0 }}
+      ssids: "{{ states('input_text.home_wifi_ssids').split(',') | map('trim') | reject('eq', '') | list }}"
+    actions:
+      - variables:
+          wifi_at_arrival: "{{ states(who.wifi) }}"
+          lock_at_arrival: "{{ states('lock.front_door') }}"
+      - event: ham_door_arrival
+        event_data:
+          phase: arrived
+          person: "{{ trigger.entity_id }}"
+          away_min: "{{ away_min }}"
+          armed: "{{ was_armed }}"
+          armed_for_min: "{{ armed_for_min }}"
+          came_from_m: "{{ came_from_m }}"
+          wifi: "{{ wifi_at_arrival }}"
+          lock: "{{ lock_at_arrival }}"
+      # Wait for the door to open (the real "I'm at the door" moment), up to 10 min.
+      - wait_for_trigger:
+          - trigger: state
+            entity_id: binary_sensor.front_door_door
+            to: "on"
+        timeout: "00:10:00"
+        continue_on_timeout: true
+      - variables:
+          door_lag_s: >-
+            {{ ((now() - as_datetime(t0)).total_seconds()) | round(0) if wait.trigger is not none else -1 }}
+          wifi_state: "{{ states(who.wifi) }}"
+          wifi_home: "{{ states(who.wifi) in ssids }}"
+          wifi_lag_s: >-
+            {% set w = states[who.wifi] %}
+            {{ ((w.last_changed - as_datetime(t0)).total_seconds()) | round(0)
+               if w is not none and w.state in ssids else 'n/a' }}
+          ble_m: "{{ states(who.ble_distance) if who.ble_distance else 'n/a' }}"
+          rails_ok: "{{ away_min | float(0) >= 10 and came_from_m | float(0) >= 1000 }}"
+      - event: ham_door_arrival
+        event_data:
+          phase: summary
+          person: "{{ trigger.entity_id }}"
+          away_min: "{{ away_min }}"
+          armed: "{{ was_armed }}"
+          came_from_m: "{{ came_from_m }}"
+          door_lag_s: "{{ door_lag_s }}"
+          wifi: "{{ wifi_state }}"
+          wifi_home: "{{ wifi_home }}"
+          wifi_lag_s: "{{ wifi_lag_s }}"
+          ble_m: "{{ ble_m }}"
+          rails_ok: "{{ rails_ok }}"
+      - action: logbook.log
+        data:
+          name: Front door arrival
+          entity_id: lock.front_door
+          message: >-
+            {{ who.name }} arrived: away {{ away_min }} min, armed {{ 'yes (' ~ armed_for_min ~ ' min)' if was_armed else 'NO' }},
+            from {{ came_from_m }} m; door opened {{ door_lag_s ~ ' s' if door_lag_s != -1 else 'not within 10 min' }};
+            Wi-Fi {{ 'home' if wifi_home else wifi_state }} (lag {{ wifi_lag_s }} s); BLE {{ ble_m }} m;
+            lock was {{ lock_at_arrival }}; stage-3 rails {{ 'PASS' if rails_ok else 'fail' }}
+
+  - id: door_arrival_near_miss
+    alias: "[Front door] Armed but no arrival (stage 1, log only)"
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: [binary_sensor.matt_arrival_armed]
+        from: "on"
+        to: "off"
+    variables:
+      people:
+        binary_sensor.matt_arrival_armed: { name: Matt, person: person.matt_mariani }
+      who: "{{ people[trigger.entity_id] }}"
+    conditions:
+      - "{{ not is_state(who.person, 'home') }}"
+    actions:
+      - event: ham_door_arrival
+        event_data:
+          phase: near_miss
+          person: "{{ who.person }}"
+          armed_min: "{{ ((now() - trigger.from_state.last_changed).total_seconds() / 60) | round(1) }}"
+      - action: logbook.log
+        data:
+          name: Front door arrival
+          entity_id: lock.front_door
+          message: >-
+            Near-miss: {{ who.name }} was armed for
+            {{ ((now() - trigger.from_state.last_changed).total_seconds() / 60) | round(1) }} min but did not arrive
+            (now {{ states(who.person) }})
