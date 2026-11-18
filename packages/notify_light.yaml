@@ -72,23 +72,36 @@ template:
 
 script:
   notify_light_theme_show:
-    alias: Notify light — daily theme cycle then pulse
+    alias: Notify light — daily theme "ding-dong" then pulse
     mode: restart
     sequence:
       - variables:
           rgbs: "{{ state_attr('sensor.daily_theme', 'rgb') or [[0, 179, 179], [255, 140, 0]] }}"
-          # ~10 s of smooth cross-fades: each colour fades in over 0.9 s and holds 0.3 s.
-          rounds: "{{ (10 / (1.2 * (rgbs | count))) | round(0, 'ceil') | int }}"
+      # Four "diiiing-dong"s (~11 s): a quick swell into colour A with a long decay (diiiing),
+      # a quick swell into colour B with a shorter decay to near-dark (dong), then a breath.
+      # With 3-4 theme colours the pairs rotate (A,B), (C,D), (A,B) ...
       - repeat:
-          count: "{{ rounds }}"
+          count: 4
           sequence:
-            - repeat:
-                for_each: "{{ rgbs }}"
-                sequence:
-                  - action: light.turn_on
-                    target: { entity_id: light.sensorguy_status_light }
-                    data: { rgb_color: "{{ repeat.item }}", brightness_pct: 80, effect: None, transition: 0.9 }
-                  - delay: { milliseconds: 1200 }
+            - variables:
+                a: "{{ rgbs[(2 * (repeat.index - 1)) % (rgbs | count)] }}"
+                b: "{{ rgbs[(2 * (repeat.index - 1) + 1) % (rgbs | count)] }}"
+            - action: light.turn_on
+              target: { entity_id: light.sensorguy_status_light }
+              data: { rgb_color: "{{ a }}", brightness_pct: 90, effect: None, transition: 0.2 }
+            - delay: { milliseconds: 250 }
+            - action: light.turn_on
+              target: { entity_id: light.sensorguy_status_light }
+              data: { rgb_color: "{{ a }}", brightness_pct: 35, transition: 1.1 }
+            - delay: { milliseconds: 1150 }
+            - action: light.turn_on
+              target: { entity_id: light.sensorguy_status_light }
+              data: { rgb_color: "{{ b }}", brightness_pct: 90, transition: 0.15 }
+            - delay: { milliseconds: 200 }
+            - action: light.turn_on
+              target: { entity_id: light.sensorguy_status_light }
+              data: { rgb_color: "{{ b }}", brightness_pct: 3, transition: 0.9 }
+            - delay: { milliseconds: 1200 }
       - action: light.turn_on
         target: { entity_id: light.sensorguy_status_light }
         data: { rgb_color: "{{ rgbs[0] }}", brightness_pct: 80, effect: Pulse }
