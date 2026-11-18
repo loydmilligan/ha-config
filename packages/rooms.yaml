@@ -111,15 +111,8 @@ input_text:
 # below list the member lights directly and do not depend on the groups.
 
 light:
-  - platform: group
-    name: Living room lights
-    unique_id: ham_living_room_lights
-    entities:
-      - light.liv_fire_lt1
-      - light.liv_fire_lt2
-      - light.liv_gal_lt1
-      - light.liv_gal_lt2
-      - light.liv_gal_lt3
+  # Living room: Matt's UI groups (light.living_room_lights, light.gallery_lights,
+  # light.fireplace_lights) are the ones in use; the YAML duplicate was removed 2026-11-18.
   # Laundry: two fixtures, each its own group; the room group holds both fixture groups.
   # Single bulbs are hidden (Matt, 2026-11-18). East fixture = colour bulbs, kept addressable
   # on its own so it can show information (status colours).
