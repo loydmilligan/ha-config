@@ -1,5 +1,7 @@
-# Front door arrival — STAGE 1: WATCH ONLY (ha-manager, 2026-11-18). Matt approved the staged plan.
-# Nothing here locks or unlocks anything. It logs what each signal says on every arrival so the
+# Front door arrival (ha-manager, 2026-11-18). Matt approved the staged plan; stage 2 (ask-first) approved
+# 2026-11-18 17:37. What may happen is set by input_select.door_unlock_stage (watch_only / ask_first /
+# hands_free) and the kill switch input_boolean.door_auto_unlock_enabled. The stage-1 loggers below
+# never lock or unlock anything. It logs what each signal says on every arrival so the
 # later stages (2 ask-first, 3 hands-free) can be judged on real data.
 #
 # Signals (per person):
@@ -25,6 +27,10 @@ input_boolean:
   door_secure_mode:
     name: Front door secure mode
     icon: mdi:shield-lock
+  # Master kill switch: off = nothing ever unlocks automatically or from a notification.
+  door_auto_unlock_enabled:
+    name: Front door auto-unlock enabled
+    icon: mdi:lock-open-alert
   # Internal: secure mode was switched on automatically (away > 4 h), so it may switch itself off.
   door_secure_by_auto:
     name: Front door secure mode set automatically
@@ -41,7 +47,20 @@ input_number:
     mode: box
     icon: mdi:bluetooth
 
+input_select:
+  # What the arrival logic is allowed to do. watch_only = log only (stage 1); ask_first = send the
+  # "Unlock front door?" notification, unlock only on a tap (stage 2); hands_free = unlock by itself
+  # unless secure mode is on, in which case it still asks (stage 3). Matt approved stage 2 2026-11-18.
+  door_unlock_stage:
+    name: Front door unlock stage
+    icon: mdi:stairs
+    options: [watch_only, ask_first, hands_free]
+
 input_text:
+  # One-time token for the pending "Unlock front door?" notification: "<token>|<expiry epoch>".
+  door_unlock_token:
+    name: Front door unlock token (internal)
+    max: 100
   home_wifi_ssids:
     name: Home Wi-Fi SSIDs (comma-separated)
     max: 255
@@ -134,6 +153,101 @@ template:
           confirmed_by: >-
             {% set ssids = states('input_text.home_wifi_ssids').split(',') | map('trim') | reject('eq', '') | list %}
             {{ 'wifi' if states('sensor.pixel_11_pro_wi_fi_connection') in ssids else 'ble' }}
+
+script:
+  # Unlock for an arrival, then re-lock if DoorSense doesn't see the door open within 2 min.
+  # Yale's own 4-min auto-lock stays on as a backstop.
+  door_arrival_unlock:
+    alias: Front door — arrival unlock with 2-min re-lock
+    mode: single
+    max_exceeded: silent
+    fields:
+      how: { description: "tap or hands_free" }
+      who: { description: "person name for the log" }
+    sequence:
+      - condition: state
+        entity_id: input_boolean.door_auto_unlock_enabled
+        state: "on"
+      - condition: state
+        entity_id: lock.front_door
+        state: locked
+      - action: lock.unlock
+        target: { entity_id: lock.front_door }
+      - event: ham_door_arrival
+        event_data: { phase: unlocked, how: "{{ how }}", person: "{{ who }}",
+                      mode: "{{ 'secure' if is_state('input_boolean.door_secure_mode', 'on') else 'hands-free' }}",
+                      stage: "{{ states('input_select.door_unlock_stage') }}" }
+      - action: logbook.log
+        data:
+          name: Front door arrival
+          entity_id: lock.front_door
+          message: >-
+            UNLOCKED for {{ who }} ({{ 'tapped Unlock' if how == 'tap' else 'hands-free' }};
+            stage {{ states('input_select.door_unlock_stage') }},
+            mode {{ 'secure' if is_state('input_boolean.door_secure_mode', 'on') else 'hands-free' }})
+      - wait_for_trigger:
+          - trigger: state
+            entity_id: binary_sensor.front_door_door
+            to: "on"
+        timeout: "00:02:00"
+        continue_on_timeout: true
+      - if: "{{ wait.trigger is none }}"
+        then:
+          - action: lock.lock
+            target: { entity_id: lock.front_door }
+          - action: notify.mobile_app_pixel_11_pro
+            data:
+              title: Front door
+              message: Re-locked — the door wasn't opened within 2 minutes of unlocking.
+              data: { tag: front_door_relock, channel: Front door, importance: high }
+          - action: logbook.log
+            data:
+              name: Front door arrival
+              entity_id: lock.front_door
+              message: RE-LOCKED — door not opened within 2 min of the arrival unlock
+        else:
+          - action: logbook.log
+            data:
+              name: Front door arrival
+              entity_id: lock.front_door
+              message: Door opened after the arrival unlock; Yale auto-lock (4 min) takes over
+
+  # Sends the actionable notification. test=true sends a TEST token that is logged but never unlocks.
+  door_ask_unlock:
+    alias: Front door — ask "Unlock front door?"
+    mode: single
+    fields:
+      who: { description: person name }
+      test: { description: true = test notification, a tap is logged but never unlocks }
+    sequence:
+      - variables:
+          is_test: "{{ test | default(false) | bool }}"
+          token: "{{ ('TEST_' if is_test else '') ~ 'UNLOCK_FRONT_DOOR_' ~ (range(100000, 999999) | random) }}"
+          expires: "{{ (now().timestamp() + 300) | int }}"
+      - action: input_text.set_value
+        target: { entity_id: input_text.door_unlock_token }
+        data: { value: "{{ token }}|{{ expires }}" }
+      - action: notify.mobile_app_pixel_11_pro
+        data:
+          title: "{{ 'TEST — ' if is_test else '' }}Front door"
+          message: "{{ 'Test only, tapping will NOT unlock. ' if is_test else '' }}Welcome home{{ ', ' ~ who if who else '' }}. Unlock the front door?"
+          data:
+            tag: front_door_unlock
+            channel: Front door
+            importance: high
+            priority: high
+            ttl: 0
+            timeout: 300
+            actions:
+              - action: "{{ token }}"
+                title: Unlock
+      - event: ham_door_arrival
+        event_data: { phase: asked, person: "{{ who }}", test: "{{ is_test }}" }
+      - action: logbook.log
+        data:
+          name: Front door arrival
+          entity_id: lock.front_door
+          message: "{{ 'TEST ' if is_test else '' }}Asked {{ who }}: Unlock front door? (valid 5 min)"
 
 automation:
   - id: door_arrival_watch
@@ -362,3 +476,110 @@ automation:
             [{{ 'secure' if is_state('input_boolean.door_secure_mode', 'on') else 'hands-free' }}]
             lock {{ trigger.to_state.state }} (by {{ state_attr('lock.front_door', 'changed_by') or 'unknown' }});
             Matt {{ states('person.matt_mariani') }}
+
+  # ── Stage 2/3: act when the checks pass ──
+  - id: door_arrival_act
+    alias: "[Front door] Checks pass → ask (stage 2) or unlock (stage 3, hands-free mode)"
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: state
+        entity_id: [binary_sensor.matt_door_checks_pass]
+        from: "off"
+        to: "on"
+    variables:
+      people:
+        binary_sensor.matt_door_checks_pass: { name: Matt, person: person.matt_mariani }
+      who: "{{ people[trigger.entity_id] }}"
+      stage: "{{ states('input_select.door_unlock_stage') }}"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.door_auto_unlock_enabled
+        state: "on"
+      - "{{ stage in ['ask_first', 'hands_free'] }}"
+      - condition: state
+        entity_id: lock.front_door
+        state: locked
+      - condition: state
+        entity_id: binary_sensor.front_door_door
+        state: "off"
+    actions:
+      - if: "{{ stage == 'hands_free' and is_state('input_boolean.door_secure_mode', 'off') }}"
+        then:
+          - action: script.turn_on
+            target: { entity_id: script.door_arrival_unlock }
+            data: { variables: { how: hands_free, who: "{{ who.name }}" } }
+          - action: notify.mobile_app_pixel_11_pro
+            data:
+              title: Front door
+              message: Unlocked for you. It re-locks in 2 minutes if the door isn't opened.
+              data: { tag: front_door_unlock, channel: Front door, importance: high }
+        else:
+          - action: script.door_ask_unlock
+            data: { who: "{{ who.name }}" }
+
+  # A tap on the notification. Only the current, unexpired token works, and only once.
+  - id: door_unlock_tap
+    alias: "[Front door] Unlock tapped on the notification"
+    mode: single
+    triggers:
+      - trigger: event
+        event_type: mobile_app_notification_action
+    variables:
+      action_id: "{{ trigger.event.data.action | default('') }}"
+      stored: "{{ states('input_text.door_unlock_token').split('|') }}"
+      valid: >-
+        {{ stored | count == 2 and action_id == stored[0] and now().timestamp() <= stored[1] | int(0) }}
+    conditions:
+      - "{{ 'UNLOCK_FRONT_DOOR_' in action_id }}"
+    actions:
+      - action: input_text.set_value
+        target: { entity_id: input_text.door_unlock_token }
+        data: { value: "used" }
+      - choose:
+          - conditions: "{{ not valid }}"
+            sequence:
+              - action: logbook.log
+                data:
+                  name: Front door arrival
+                  entity_id: lock.front_door
+                  message: Unlock tap IGNORED (old or unknown notification)
+          - conditions: "{{ action_id.startswith('TEST_') }}"
+            sequence:
+              - action: logbook.log
+                data:
+                  name: Front door arrival
+                  entity_id: lock.front_door
+                  message: TEST tap received from the notification — would have unlocked (nothing changed)
+              - action: notify.mobile_app_pixel_11_pro
+                data:
+                  title: Front door
+                  message: Test tap received. Nothing was unlocked.
+                  data: { tag: front_door_unlock }
+        default:
+          - action: notify.mobile_app_pixel_11_pro
+            data: { message: clear_notification, data: { tag: front_door_unlock } }
+          - action: script.turn_on
+            target: { entity_id: script.door_arrival_unlock }
+            data: { variables: { how: tap, who: Matt } }
+
+  # Log a notification that was never tapped.
+  - id: door_ask_expired
+    alias: "[Front door] Unlock notification expired without a tap"
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: input_text.door_unlock_token
+    conditions:
+      - "{{ '|' in trigger.to_state.state and not trigger.to_state.state.startswith('TEST_') }}"
+    actions:
+      - delay: "00:05:05"
+      - condition: "{{ states('input_text.door_unlock_token') == trigger.to_state.state }}"
+      - action: input_text.set_value
+        target: { entity_id: input_text.door_unlock_token }
+        data: { value: "expired" }
+      - action: logbook.log
+        data:
+          name: Front door arrival
+          entity_id: lock.front_door
+          message: Unlock notification expired after 5 min without a tap (no unlock)
