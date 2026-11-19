@@ -314,12 +314,14 @@
         id:
         - single
       sequence:
-      - action: switch.toggle
+      - action: "switch.turn_{{ 'off' if ['switch.kit_se_lt', 'switch.kit_sw_lt', 'switch.kit_n_lt']
+          | select('is_state', 'on') | list | count > 0 else 'on' }}"
         metadata: {}
         target:
           entity_id:
           - switch.kit_se_lt
           - switch.kit_sw_lt
+          - switch.kit_n_lt
         data: {}
   mode: single
 - id: '1770171751479'
@@ -335,12 +337,14 @@
     id: kitch_button_single
   conditions: []
   actions:
-  - action: switch.toggle
+  - action: "switch.turn_{{ 'off' if ['switch.kit_se_lt', 'switch.kit_sw_lt', 'switch.kit_n_lt']
+      | select('is_state', 'on') | list | count > 0 else 'on' }}"
     metadata: {}
     target:
       entity_id:
       - switch.kit_se_lt
       - switch.kit_sw_lt
+      - switch.kit_n_lt
     data: {}
   mode: single
 - id: '1770232671725'

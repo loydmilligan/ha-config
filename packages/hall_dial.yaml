@@ -108,7 +108,7 @@ automation:
                     - light.lau_ne_lt
                     - light.lau_se_lt
               - action: switch.turn_off
-                target: { entity_id: [switch.kit_se_lt, switch.kit_sw_lt] }
+                target: { entity_id: [switch.kit_se_lt, switch.kit_sw_lt, switch.kit_n_lt] }
           # Holds: select the room, confirm the select changed, then flash that room
           - conditions: "{{ trigger.id.startswith('hold_') }}"
             sequence:
