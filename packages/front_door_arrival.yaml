@@ -31,6 +31,14 @@ input_boolean:
   door_auto_unlock_enabled:
     name: Front door auto-unlock enabled
     icon: mdi:lock-open-alert
+  # Internal: the short-walk path already asked during this absence from home Wi-Fi.
+  door_short_walk_prompted:
+    name: Front door short-walk prompt sent (internal)
+    icon: mdi:walk
+  # Watch-only trip: the watch's beacon has been gone from home 10+ min while the phone stayed home.
+  matt_watch_only_away:
+    name: Matt out with only the watch
+    icon: mdi:watch-variant
   # Internal: secure mode was switched on automatically (away > 4 h), so it may switch itself off.
   door_secure_by_auto:
     name: Front door secure mode set automatically
@@ -121,7 +129,31 @@ template:
             {% endfor %}
             {{ {'24:DC:C3:C4:CE:36': 'led-matrix (door)', 'C0:FB:F9:61:B1:E3': 'CM4 dongle',
                 'E0:5A:1B:6C:3C:46': 'sensorguy', 'EC:C9:FF:CA:DB:3E': 'office presence'}.get(ns.src, ns.src) }}
+      # Same for Matt's Pixel Watch beacon (UUID 7e4c9895-…1b46); it rotates its address too.
+      - name: Matt watch door BLE distance
+        unique_id: matt_watch_door_ble_distance
+        unit_of_measurement: m
+        icon: mdi:watch-variant
+        state: >-
+          {% set uuid = '7e4c9895-042f-46c2-94a1-66bf0f0d1b46' %}
+          {% set door = '24:DC:C3:C4:CE:36' %}
+          {% set ns = namespace(d=[]) %}
+          {% for s in states.sensor if s.entity_id.endswith('_estimated_distance')
+               and s.attributes.get('uuid') == uuid and s.attributes.get('source') == door and s.state | is_number %}
+            {% set ns.d = ns.d + [s.state | float * 0.3048] %}
+          {% endfor %}
+          {# 99 = the door proxy does not hear the watch right now #}
+          {{ (ns.d | min) | round(1) if ns.d else 99 }}
   - binary_sensor:
+      # Any home Bluetooth proxy currently hears Matt's watch beacon (across its rotating addresses).
+      - name: Matt watch beacon heard
+        unique_id: matt_watch_beacon_heard
+        icon: mdi:watch-variant
+        state: >-
+          {% set uuid = '7e4c9895-042f-46c2-94a1-66bf0f0d1b46' %}
+          {{ states.sensor | selectattr('entity_id', 'search', '_estimated_distance$')
+             | selectattr('attributes.uuid', 'defined') | selectattr('attributes.uuid', 'eq', uuid)
+             | rejectattr('state', 'in', ['unavailable', 'unknown']) | list | count > 0 }}
       # Matt is approaching home: away >= 10 min, proximity says "towards", within ~2 km.
       # On only after 2 min of that (delay_on); stays on 3 min after it stops (covers the moment of arrival).
       - name: Matt arrival armed
@@ -218,6 +250,7 @@ script:
     mode: single
     fields:
       who: { description: person name }
+      notify_watch: { description: "also send straight to the watch (watch-only trip)" }
       test: { description: "true = test notification; a tap is logged but never unlocks" }
     sequence:
       - variables:
@@ -241,8 +274,20 @@ script:
             actions:
               - action: "{{ token }}"
                 title: Unlock
+      - if: "{{ notify_watch | default(false) | bool }}"
+        then:
+          - action: notify.mobile_app_matt_s_watch
+            continue_on_error: true
+            data:
+              title: "{{ 'TEST — ' if is_test else '' }}Front door"
+              message: "{{ 'Test only. ' if is_test else '' }}Unlock the front door?"
+              data:
+                tag: front_door_unlock
+                actions:
+                  - action: "{{ token }}"
+                    title: Unlock
       - event: ham_door_arrival
-        event_data: { phase: asked, person: "{{ who }}", test: "{{ is_test }}" }
+        event_data: { phase: asked, person: "{{ who }}", test: "{{ is_test }}", watch: "{{ notify_watch | default(false) }}" }
       - action: logbook.log
         data:
           name: Front door arrival
@@ -528,8 +573,10 @@ automation:
     variables:
       action_id: "{{ trigger.event.data.action | default('') }}"
       stored: "{{ states('input_text.door_unlock_token').split('|') }}"
+      allowed: !secret door_tap_webhooks
+      from_matt: "{{ (trigger.event.data.webhook_id | default('')) in allowed.split(',') }}"
       valid: >-
-        {{ stored | count == 2 and action_id == stored[0] and now().timestamp() <= stored[1] | int(0) }}
+        {{ from_matt and stored | count == 2 and action_id == stored[0] and now().timestamp() <= stored[1] | int(0) }}
     conditions:
       - "{{ 'UNLOCK_FRONT_DOOR_' in action_id }}"
     actions:
@@ -543,7 +590,7 @@ automation:
                 data:
                   name: Front door arrival
                   entity_id: lock.front_door
-                  message: Unlock tap IGNORED (old or unknown notification)
+                  message: "Unlock tap IGNORED ({{ 'not from Matt''s phone or watch' if not from_matt else 'old or unknown notification' }})"
           - conditions: "{{ action_id.startswith('TEST_') }}"
             sequence:
               - action: logbook.log
@@ -583,3 +630,132 @@ automation:
           name: Front door arrival
           entity_id: lock.front_door
           message: Unlock notification expired after 5 min without a tap (no unlock)
+
+  # ── Short-walk path (ask only, never hands-free) ──
+  # Phone off home Wi-Fi for 1+ min, then the LED Matrix hears it at the door -> ask once per absence.
+  - id: door_short_walk_ask
+    alias: "[Front door] Short walk: off Wi-Fi 1+ min, heard at the door → ask"
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.matt_phone_door_ble_distance
+        below: input_number.door_ble_near_m
+    variables:
+      ssids: "{{ states('input_text.home_wifi_ssids').split(',') | map('trim') | reject('eq', '') | list }}"
+      wifi: "{{ states.sensor.pixel_11_pro_wi_fi_connection }}"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.door_auto_unlock_enabled
+        state: "on"
+      - "{{ states('input_select.door_unlock_stage') in ['ask_first', 'hands_free'] }}"
+      - "{{ wifi is not none and wifi.state not in ssids and (now() - wifi.last_changed).total_seconds() >= 60 }}"
+      - condition: state
+        entity_id: input_boolean.door_short_walk_prompted
+        state: "off"
+      - "{{ '|' not in states('input_text.door_unlock_token') or states('input_text.door_unlock_token').startswith('TEST_') }}"
+      - condition: state
+        entity_id: lock.front_door
+        state: locked
+      - condition: state
+        entity_id: binary_sensor.front_door_door
+        state: "off"
+    actions:
+      - action: input_boolean.turn_on
+        target: { entity_id: input_boolean.door_short_walk_prompted }
+      - action: logbook.log
+        data:
+          name: Front door arrival
+          entity_id: lock.front_door
+          message: >-
+            Short walk: phone off Wi-Fi {{ ((now() - wifi.last_changed).total_seconds() / 60) | round(1) }} min,
+            heard at the door {{ states('sensor.matt_phone_door_ble_distance') }} m → asking
+      - action: script.door_ask_unlock
+        data: { who: Matt }
+
+  - id: door_short_walk_reset
+    alias: "[Front door] Short walk: re-arm when the phone leaves home Wi-Fi"
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: sensor.pixel_11_pro_wi_fi_connection
+    conditions:
+      - "{{ trigger.from_state is not none and trigger.from_state.state in states('input_text.home_wifi_ssids').split(',') | map('trim') | list
+            and trigger.to_state.state not in states('input_text.home_wifi_ssids').split(',') | map('trim') | list }}"
+    actions:
+      - action: input_boolean.turn_off
+        target: { entity_id: input_boolean.door_short_walk_prompted }
+
+  # ── Watch-only trips (ask only, never hands-free) ──
+  # Watch beacon gone from every home proxy for 10 min while the phone is still home -> out with only the watch.
+  - id: door_watch_only_away
+    alias: "[Front door] Watch-only trip detection"
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.matt_watch_beacon_heard
+        to: "off"
+        for: "00:10:00"
+        id: gone
+      - trigger: state
+        entity_id: binary_sensor.matt_watch_beacon_heard
+        to: "on"
+        for: "00:05:00"
+        id: back
+    actions:
+      - choose:
+          - conditions:
+              - "{{ trigger.id == 'gone' }}"
+              - "{{ is_state('device_tracker.matt_phone_beacon', 'home')
+                    or states('sensor.pixel_11_pro_wi_fi_connection') in states('input_text.home_wifi_ssids').split(',') | map('trim') | list }}"
+            sequence:
+              - action: input_boolean.turn_on
+                target: { entity_id: input_boolean.matt_watch_only_away }
+              - action: logbook.log
+                data:
+                  name: Front door arrival
+                  entity_id: input_boolean.matt_watch_only_away
+                  message: Watch-only trip — watch beacon gone 10 min, phone still home
+          # Watch back for 5 min without a door prompt (e.g. came in another way): clear quietly.
+          - conditions: "{{ trigger.id == 'back' and is_state('input_boolean.matt_watch_only_away', 'on') }}"
+            sequence:
+              - action: input_boolean.turn_off
+                target: { entity_id: input_boolean.matt_watch_only_away }
+              - action: logbook.log
+                data:
+                  name: Front door arrival
+                  entity_id: input_boolean.matt_watch_only_away
+                  message: Watch back home (no front-door prompt) — watch-only trip cleared
+
+  - id: door_watch_only_ask
+    alias: "[Front door] Watch-only trip: watch heard at the door → ask on watch + phone"
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.matt_watch_door_ble_distance
+        below: input_number.door_ble_near_m
+    conditions:
+      - condition: state
+        entity_id: input_boolean.matt_watch_only_away
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.door_auto_unlock_enabled
+        state: "on"
+      - "{{ states('input_select.door_unlock_stage') in ['ask_first', 'hands_free'] }}"
+      - condition: state
+        entity_id: lock.front_door
+        state: locked
+      - condition: state
+        entity_id: binary_sensor.front_door_door
+        state: "off"
+    actions:
+      - action: input_boolean.turn_off
+        target: { entity_id: input_boolean.matt_watch_only_away }
+      - action: logbook.log
+        data:
+          name: Front door arrival
+          entity_id: lock.front_door
+          message: "Watch-only arrival: watch heard at the door {{ states('sensor.matt_watch_door_ble_distance') }} m → asking on watch + phone"
+      - action: script.door_ask_unlock
+        data: { who: Matt, notify_watch: true }
