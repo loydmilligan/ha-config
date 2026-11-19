@@ -222,7 +222,7 @@ script:
     sequence:
       - variables:
           is_test: "{{ test | default(false) | bool }}"
-          token: "{{ ('TEST_' if is_test else '') ~ 'UNLOCK_FRONT_DOOR_' ~ (range(100000, 999999) | random) }}"
+          token: "{{ ('TEST_' if is_test else '') ~ 'UNLOCK_FRONT_DOOR_' ~ (now().timestamp() * 1000) | int ~ '_' ~ (range(1000, 9999) | random) }}"
           expires: "{{ (now().timestamp() + 300) | int }}"
       - action: input_text.set_value
         target: { entity_id: input_text.door_unlock_token }
