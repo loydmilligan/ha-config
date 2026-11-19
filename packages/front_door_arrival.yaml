@@ -218,7 +218,7 @@ script:
     mode: single
     fields:
       who: { description: person name }
-      test: { description: true = test notification, a tap is logged but never unlocks }
+      test: { description: "true = test notification; a tap is logged but never unlocks" }
     sequence:
       - variables:
           is_test: "{{ test | default(false) | bool }}"
