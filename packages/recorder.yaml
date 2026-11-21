@@ -1,0 +1,67 @@
+# Recorder history exclusions (ha-manager, approved by Matt 2026-11-20).
+#
+# Roomba+ creates ~94 entities. Kept in history: vacuum state, battery, phase,
+# error, readiness, connection, bin, mission active/result, maintenance due,
+# switches, selects and all mission/stuck events.
+# Excluded below: lifetime counters, 30-day rates, part counters, firmware,
+# diagnostics and the map images. device_tracker.roomba is excluded because it
+# reports position about once a second while cleaning (~5,000 rows per run);
+# the live state still works and Roomba+ keeps its own path/coverage maps.
+# Rollback: delete this file, restart HA.
+
+recorder:
+  exclude:
+    entities:
+      - device_tracker.roomba
+      - image.roomba_map
+      - image.roomba_coverage_map
+      - image.roomba_rooms_map
+      - calendar.roomba_schedule
+      - todo.roomba_maintenance
+      - update.roomba
+      - binary_sensor.roomba_cloud_connected
+      - binary_sensor.roomba_firmware_updated
+      - binary_sensor.roomba_layout_change_detected
+      - binary_sensor.roomba_map_saving
+      - binary_sensor.roomba_mqtt_stale
+      - sensor.roomba_average_mission_time
+      - sensor.roomba_battery_capacity_retention
+      - sensor.roomba_battery_cycles
+      - sensor.roomba_brush_remaining_hours
+      - sensor.roomba_canceled_missions
+      - sensor.roomba_clean_streak
+      - sensor.roomba_completion_rate_30d
+      - sensor.roomba_dock_firmware_version
+      - sensor.roomba_estimated_battery_eol
+      - sensor.roomba_failed_missions
+      - sensor.roomba_filter_remaining_hours
+      - sensor.roomba_firmware_version
+      - sensor.roomba_integration_health
+      - sensor.roomba_last_error_at
+      - sensor.roomba_last_error_zone
+      - sensor.roomba_last_mission
+      - sensor.roomba_last_mission_area
+      - sensor.roomba_last_mission_duration
+      - sensor.roomba_last_mission_summary
+      - sensor.roomba_lifetime_completion_rate
+      - sensor.roomba_mission_elapsed_time
+      - sensor.roomba_mission_expire_time
+      - sensor.roomba_mission_recharge_time
+      - sensor.roomba_mission_start_time
+      - sensor.roomba_missions_last_30d
+      - sensor.roomba_mop_ars_behavior
+      - sensor.roomba_next_clean
+      - sensor.roomba_next_likely_clean_window
+      - sensor.roomba_part_dirt_bag
+      - sensor.roomba_part_edge_brush
+      - sensor.roomba_presence_clean_opportunities_7d
+      - sensor.roomba_presence_clean_utilisation_7d
+      - sensor.roomba_recent_edge_coverage_ratio
+      - sensor.roomba_reset_diagnostics
+      - sensor.roomba_room_cleaning_history
+      - sensor.roomba_stuck_count_30d
+      - sensor.roomba_successful_missions
+      - sensor.roomba_total_cleaned_area
+      - sensor.roomba_total_cleaning_time
+      - sensor.roomba_total_energy_consumed
+      - sensor.roomba_total_missions
