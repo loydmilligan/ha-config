@@ -1,0 +1,564 @@
+"""Base entity class for Roomba+ integration."""
+from __future__ import annotations
+
+import datetime
+import logging
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
+
+from homeassistant.const import ATTR_CONNECTIONS
+from homeassistant.helpers import device_registry as dr
+from homeassistant.core import callback
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.entity import Entity
+
+from . import roomba_reported_state
+from .availability import is_locally_available, local_availability_signal
+from .const import (
+    DOMAIN,
+    maintenance_changed_signal,
+    maintenance_items_signal,
+    mission_store_changed_signal,
+)
+
+if TYPE_CHECKING:
+    from .models import RoombaConfigEntry
+
+_LOGGER = logging.getLogger(__name__)
+
+
+#: Phases in which a robot whose cycle is still set is no longer on a mission.
+_MISSION_ENDED_PHASES: frozenset[str] = frozenset({"stop", "cancelled", ""})
+
+
+def mission_in_progress(status: Mapping[str, Any]) -> bool:
+    """Whether the robot is on a mission, judged from `cleanMissionStatus`.
+
+    The one answer shared by the Mission active binary sensor and the
+    mission start and elapsed time sensors, so the three cannot disagree.
+
+    `cycle` decides first: "none" means no mission, whatever the phase.
+    A mid-mission recharge reports `charge` with the cycle still set and
+    counts as a mission. `mssnStrtTm` is NOT a signal: the firmware keeps
+    it after the mission ends, so an elapsed time computed from it alone
+    kept counting on the dock (reported by nareso).
+    """
+    if status.get("cycle", "none") == "none":
+        return False
+    return status.get("phase", "") not in _MISSION_ENDED_PHASES
+
+
+class IRobotEntity(Entity):
+    """Base class for all iRobot entities in Roomba+.
+
+    Provides:
+    - Device info construction from master_state
+    - Convenience properties for commonly accessed state sub-dicts
+    - MQTT callback registration via roombapy
+    - Proper unique_id and has_entity_name wiring
+
+    All entity updates are driven by the MQTT push callback from roombapy —
+    there is no polling. Subclasses override on_message() and/or
+    new_state_filter() to react only to relevant state changes.
+    """
+
+    _attr_should_poll = False
+    _attr_has_entity_name = True
+
+    #: LIVE STATE — what the robot is doing and reporting right now.
+    #: True makes the entity unavailable once a Classic robot's local
+    #: connection has been down for the grace period (availability.py).
+    #: False, the default, keeps the last value: history, counters,
+    #: configuration and the last mission are still true while the
+    #: robot is away. @mdarocha: before this, every entity counted as
+    #: always available, so a dead-battery robot read "cleaning, 99 %"
+    #: for three and a half hours. Set on the class, or per instance
+    #: (RoombaSensor takes it from its description).
+    _live_state: bool = False
+    #: Re-render when the maintenance entries are recomputed (4.5.0).
+    _shows_maintenance: bool = False
+
+    def __init__(
+        self,
+        roomba: Any,
+        blid: str,
+        config_entry: "RoombaConfigEntry | None" = None,
+    ) -> None:
+        """Initialise the entity with the roombapy Roomba object and BLID.
+
+        config_entry is optional and, before this session, was never
+        actually used here at all -- every Prime entity passes
+        roomba=None (there is no roombapy Roomba object for a
+        cloud-only device) and stored its OWN config_entry separately,
+        AFTER calling this __init__, meaning this method always built
+        DeviceInfo from roomba_reported_state(None) == {} for every
+        single Prime entity.
+
+        REAL BUG THIS FIXES (found during an architecture review, not
+        a field report -- no test or entity behavior surfaced it,
+        since every individual Prime entity's OWN sensor/switch state
+        looked completely correct; only the DEVICE PAGE itself, a
+        separate part of the HA UI few of this project's own tests
+        ever touch, was affected): every Prime robot's device showed
+        up in Settings -> Devices with a generic "Roomba XXXX" name
+        (last 4 chars of the BLID, from _resolve_name({}, blid)'s own
+        fallback), no model, no serial number, and no firmware version
+        -- despite PrimeFirmwareVersionSensor and others already
+        showing the SAME underlying data correctly as individual
+        sensors. The device-level info and the sensor-level info come
+        from entirely separate code paths, and only the sensor one was
+        ever fixed.
+
+        Now, when config_entry is provided and roomba is None (the
+        Prime case), builds DeviceInfo from three sources instead:
+          - name: config_entry.title, which has ALWAYS correctly held
+            the real robot name (or blid fallback) since this
+            project's very first Prime release -- config_flow.py's own
+            _async_create_prime_entry() sets this at onboarding time,
+            for every entry, old or new, so no migration is needed for
+            already-configured installs.
+          - model/model_id/serial_number: config_entry.runtime_data.
+            prime_serial_info (RobotSerialInfo, from
+            get_serial_number_data() -- best-effort, fetched once
+            during setup; None for any entry where that fetch failed
+            or hasn't happened yet, same graceful-degradation
+            reasoning as prime_household_id).
+          - sw_version: config_entry.runtime_data.
+            prime_status_coordinator.data's own "rw-software" shadow
+            content (already flowing for every Prime entity's other
+            sensors; no new fetch needed here).
+        """
+        self.vacuum = roomba
+        self._blid = blid
+
+        #: ONE FIELD, SET ONCE. Fifty-three subclass constructors write
+        #: `self._config_entry = config_entry` themselves, after calling
+        #: this one -- so the attribute existed everywhere and was
+        #: declared nowhere, which is why mypy reported seventy-one
+        #: reads of it as errors on `IRobotEntity`.
+        #:
+        #: The duplicated assignments are harmless and left in place;
+        #: this makes the field part of the base class rather than a
+        #: convention every subclass has to remember.
+        #: NON-OPTIONAL, because every reader is guaranteed one.
+        #:
+        #: The parameter keeps its None default: 81 subclasses call
+        #: `super().__init__(roomba, blid)` and set the field themselves
+        #: afterwards, and rewriting all of those is a separate change.
+        #:
+        #: But the ATTRIBUTE is never None where it is read. Every class
+        #: that reads `_config_entry` or `_entry` either takes it as a
+        #: required parameter and assigns it, or inherits an `__init__`
+        #: from one that does -- checked across all 131 entity classes
+        #: including inheritance chains.
+        #:
+        #: Declaring it Optional produced 214 mypy errors, one at every
+        #: read, for a condition that cannot occur. The cast is the
+        #: narrow lie; the alternative was 214 checks for the same.
+        self._config_entry: RoombaConfigEntry = config_entry  # type: ignore[assignment]
+        self.vacuum_state = roomba_reported_state(roomba)
+
+        if roomba is None and config_entry is not None:
+            self._attr_device_info = self._build_prime_device_info(blid, config_entry)
+        else:
+            self._attr_device_info = DeviceInfo(
+                identifiers={(DOMAIN, self.robot_unique_id)},
+                serial_number=(
+                    (self.vacuum_state.get("hwPartsRev") or {}).get("navSerialNo")
+                ),
+                manufacturer="iRobot",
+                model=self.vacuum_state.get("sku"),
+                model_id=self.vacuum_state.get("sku"),   # IA74-MI: full SKU in device registry
+                name=self._resolve_name(self.vacuum_state, blid),
+                sw_version=self.vacuum_state.get("softwareVer"),
+                hw_version=str(self.vacuum_state.get("hardwareRev", "")),
+            )
+
+        # Add MAC address connection if available.
+        # NOTE: do NOT let the MAC become the device name — HA picks up the
+        # DeviceInfo name field, not the connection tuple, so this is safe as
+        # long as `name` above is set correctly.
+        mac_address: str | None = (
+            (self.vacuum_state.get("hwPartsRev") or {}).get("wlan0HwAddr")
+            or self.vacuum_state.get("mac")
+        )
+        if mac_address:
+            self._attr_device_info[ATTR_CONNECTIONS] = {
+                (dr.CONNECTION_NETWORK_MAC, mac_address)
+            }
+
+    def _build_prime_device_info(self, blid: str, config_entry: "RoombaConfigEntry") -> DeviceInfo:
+        """See __init__'s own docstring for the full reasoning. Every
+        field here is best-effort/optional -- a still-generic name or
+        missing model/serial is a real, visible gap, but never a
+        reason to fail entity setup outright."""
+        data = config_entry.runtime_data
+        serial_info = getattr(data, "prime_serial_info", None)
+        status_coordinator = getattr(data, "prime_status_coordinator", None)
+        coordinator_data = getattr(status_coordinator, "data", None) or {}
+        software_shadow = coordinator_data.get("rw-software") or {}
+
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.robot_unique_id)},
+            serial_number=getattr(serial_info, "serial_number", None),
+            manufacturer="iRobot",
+            model=getattr(serial_info, "sku", None) or getattr(serial_info, "family", None),
+            model_id=getattr(serial_info, "sku", None),
+            name=config_entry.title or f"Roomba {blid[-4:]}",
+            sw_version=software_shadow.get("softwareVer"),
+        )
+
+    # ── Identity ──────────────────────────────────────────────────────────────
+
+    @property
+    def robot_unique_id(self) -> str:
+        """Stable device identifier based on BLID."""
+        return f"roomba_plus_{self._blid}"
+
+    @property
+    def suggested_object_id(self) -> str | None:
+        """Return a locale-independent entity_id suffix for all subclasses.
+
+        HA derives the entity_id at first registration from slugify(entity.name),
+        which is the *translated* name in the user's locale.  On a DE-locale
+        install this produces German slugs (e.g. 'akkualter' instead of
+        'battery_age_days'), making entity_ids installation-locale-dependent and
+        impossible to document or reference reliably.
+
+        All Roomba+ entities follow the pattern:
+            _attr_unique_id = f"{self.robot_unique_id}_{english_key}"
+
+        This property strips the robot-specific prefix and returns the English
+        key, which HA then uses as the suggested entity_id suffix regardless of
+        the user's locale.  Subclasses that use EntityDescription should
+        override this to return ``self.entity_description.key`` directly.
+
+        NAMING CONVENTION (enforced by the locale-slug guard in test_translations.py):
+        - NEVER set ``_attr_name`` alongside ``_attr_translation_key`` on a class.
+        - ALWAYS set ``_attr_unique_id = f"{self.robot_unique_id}_{english_key}"``.
+        - The English key must match the translation file key exactly.
+        """
+        uid: str | None = getattr(self, "_attr_unique_id", None)
+        if uid:
+            prefix = f"{self.robot_unique_id}_"
+            if uid.startswith(prefix):
+                return uid[len(prefix):]
+        return None
+
+    # ── State sub-dict properties ─────────────────────────────────────────────
+
+    @property
+    def run_stats(self) -> dict[str, Any]:
+        """Lifetime run statistics — merged from runtimeStats (i/s/j) and bbrun (900-series).
+
+        On i/s/j-series (lewis firmware) hr, sqft, and min live in the separate
+        runtimeStats MQTT key. On 900-series they appear in bbrun directly.
+        Merging both sources with runtimeStats taking priority gives a single
+        consistent interface for all sensor code regardless of firmware variant.
+
+        Event counters (nPanics, nCliffsF, nScrubs, nStuck etc.) come exclusively
+        from bbrun and are unaffected by the merge.
+        """
+        bbrun = self.vacuum_state.get("bbrun", {})
+        runtime = self.vacuum_state.get("runtimeStats", {})
+        return {**bbrun, **runtime}  # runtimeStats wins on key collision (hr, sqft, min)
+
+    @property
+    def mission_stats(self) -> dict[str, Any]:
+        """Lifetime mission statistics (bbmssn)."""
+        return dict(self.vacuum_state.get("bbmssn", {}))
+
+    @property
+    def nav_stats(self) -> dict[str, Any]:
+        """Navigation subsystem statistics (bbnav).
+
+        Available on 9-series (980/960/900) firmware. Contains map tracking
+        quality (aMtrack) and landmark counts (nGoodLmrks) used by L9-MAP.
+        Returns empty dict on i/s/j-series firmware where bbnav is absent.
+        """
+        return self.vacuum_state.get("bbnav") or {}
+
+    @property
+    def battery_stats(self) -> dict[str, Any]:
+        """Battery charge cycle statistics (bbchg3)."""
+        return dict(self.vacuum_state.get("bbchg3", {}))
+
+    @property
+    def dock_stats(self) -> dict[str, Any]:
+        """Dock charging session statistics (bbchg).
+
+        Distinct from bbchg3 (battery cycle statistics).
+        Contains dock contact health counters:
+          nChatters  — contact bounce events (worn contacts)
+          nKnockoffs — unintended undocking events
+          nAborts    — aborted charging sessions
+          smberr     — SMBus communication errors (already used by SMBERR repair)
+        """
+        return self.vacuum_state.get("bbchg") or {}
+
+    @property
+    def clean_mission_status(self) -> dict[str, Any]:
+        """Current mission status."""
+        return dict(self.vacuum_state.get("cleanMissionStatus", {}))
+
+    @property
+    def tank_level(self) -> int | None:
+        """Tank fill level (Braava only)."""
+        return self.vacuum_state.get("tankLvl")
+
+    @property
+    def dock_tank_level(self) -> int | None:
+        """Dock tank fill level."""
+        return (self.vacuum_state.get("dock") or {}).get("tankLvl")
+
+    @property
+    def last_mission(self) -> Any | None:
+        """Start time of the current or last mission from live MQTT state, or None.
+
+        Returns None when mssnStrtTm is 0 (robot on dock, 900-series firmware).
+        The last_mission sensor uses MissionStore instead of this property to
+        avoid the permanent-None problem on 900-series — this property is kept
+        for other uses (e.g. mission duration display during active missions).
+        """
+        ts = self.clean_mission_status.get("mssnStrtTm")
+        if ts is None or ts == 0:
+            return None
+        return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+
+    # ── Push update wiring ────────────────────────────────────────────────────
+
+    async def async_added_to_hass(self) -> None:
+        """Register the MQTT message callback and fix the device name.
+
+        At __init__ time the vacuum_state snapshot may be sparse (the robot
+        hasn't finished its full state dump yet). By the time async_added_to_hass
+        runs, the 2 s wait in async_connect_or_timeout has passed and the full
+        state is available.
+
+        Critically: updating _attr_device_info alone is NOT enough to rename
+        the device — HA only reads DeviceInfo on the first registry write.
+        Subsequent renames must go through dr.async_update_device() directly.
+
+        BUG FOUND (bug-hunt round, V4/Prime): self.vacuum is None for a
+        CLOUD_ONLY entity -- this method is called unconditionally by HA
+        for every entity built on IRobotEntity, so a Prime vacuum entity
+        crashed immediately on being added to Home Assistant (AttributeError
+        on None.register_on_message_callback), the very first time HA's own
+        entity lifecycle touched it. Guarded below; the vacuum_state refresh
+        is skipped too since roomba_reported_state(None) would just
+        re-derive the same {} __init__ already set.
+        """
+        if self.vacuum is not None:
+            # UNSUBSCRIBE ON REMOVAL (quality scale: entity-event-setup).
+            # `register_on_message_callback` returns an Unsubscribe; it was
+            # discarded, so an entity removed or disabled at runtime stayed
+            # registered on the client and kept receiving every message.
+            self.async_on_remove(
+                self.vacuum.register_on_message_callback(self.on_message)
+            )
+            # Refresh snapshot — full state available now
+            self.vacuum_state = roomba_reported_state(self.vacuum)
+        if self._live_state:
+            # Classic and Prime. The signal also fires on RECONNECT, which
+            # matters: many entities re-render only when their own key
+            # arrives, and would otherwise sit unavailable after the robot
+            # came back.
+            self.async_on_remove(
+                async_dispatcher_connect(
+                    self.hass,
+                    local_availability_signal(self._blid),
+                    self._on_local_availability,
+                )
+            )
+        # MAINTENANCE CHANGED OUTSIDE A ROBOT MESSAGE (a reset button or
+        # action). Every entity of the robot re-renders from its stores; a
+        # list of chosen keys would miss the next sensor that depends on
+        # maintenance data, and resets are rare enough for that to cost
+        # nothing.
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                maintenance_changed_signal(self._blid),
+                self._on_maintenance_changed,
+            )
+        )
+        # THE MAINTENANCE ENTRIES WERE RECOMPUTED (4.5.0) -- only for the
+        # entities that show them; they change with every hour run.
+        if self._shows_maintenance:
+            self.async_on_remove(
+                async_dispatcher_connect(
+                    self.hass,
+                    maintenance_items_signal(self._blid),
+                    self._on_maintenance_changed,
+                )
+            )
+        # MISSION RECORDS CHANGED OUTSIDE A ROBOT MESSAGE (4.2.14): the
+        # cloud's room events and results merged in after a mission. Same
+        # reasoning as maintenance: every entity re-renders from its
+        # stores, and it happens a few times a day at most.
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                mission_store_changed_signal(self._blid),
+                self._on_maintenance_changed,
+            )
+        )
+        # Patch DeviceInfo and the live DeviceRegistry entry
+        await self._async_update_device_name()
+        # Force a state write so sensors don't show 'unavailable' on first render
+        self.schedule_update_ha_state()
+
+    @callback
+    def _on_maintenance_changed(self) -> None:
+        """Re-render from the stores after a maintenance reset or a
+        cloud merge into the mission records."""
+        self.async_write_ha_state()
+
+    @callback
+    def _on_local_availability(self, _available: bool) -> None:
+        """Re-render when the local connection crosses the grace period."""
+        self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        """Unavailable only for LIVE state of an unreachable robot.
+
+        Classic and Prime alike since 4.2.11 — each generation's watcher
+        in availability.py decides from its own signals. Non-live entities
+        are never affected; subclasses with their own `available` keep it.
+        """
+        if not super().available:
+            return False
+        if not self._live_state:
+            return True
+        return is_locally_available(self._blid)
+
+    async def _async_update_device_name(self) -> None:
+        """Resolve the robot's name and write it to the DeviceRegistry.
+
+        HA stores the device name in the DeviceRegistry, not in DeviceInfo
+        after the first setup. The only way to rename an already-registered
+        device is to call dr.async_update_device(). Without this call the
+        device keeps whatever name HA stored at first-setup time — which may
+        be the MAC address if vacuum_state['name'] was empty at that point.
+
+        Fallback chain:
+          1. vacuum_state['name'] — user-assigned name from the iRobot app
+          2. 'Roomba {blid[-4:]}' — BLID suffix for unnamed robots
+        """
+        # PRIME NEVER FILLS `vacuum_state`, SO THIS RENAMED THE DEVICE TO
+        # A FALLBACK ON EVERY SETUP.
+        #
+        # `roomba_reported_state(None)` returns `{}` on a CLOUD_ONLY entry
+        # by design, so `_resolve_name` fell through to
+        # `Roomba {blid[-4:]}` -- while `_build_prime_device_info` names
+        # the device from `config_entry.title`, which is the robot's own
+        # name. Two sources, and this one runs from EVERY entity's
+        # `async_added_to_hass`.
+        #
+        # @ratpic83 caught it from the far end: `friendly_name` flipping
+        # between "MalleHausMaus" and "Roomba 6099" on 72 entities at
+        # once, four times in an hour, each flip a 72-entity state burst
+        # that dropped every websocket client with "4096 pending
+        # messages". A wall-mounted tablet and two browser sessions went
+        # down together, which is what ruled out a slow client.
+        #
+        # Prime has nothing to resolve here: the name is decided once, at
+        # config entry level, and re-asserting a fallback over it is
+        # strictly destructive.
+        if self.vacuum is None:
+            return
+
+        name = self._resolve_name(self.vacuum_state, self._blid)
+
+        # 1. Keep _attr_device_info in sync (used when HA re-registers)
+        self._attr_device_info = DeviceInfo(
+            **{**(self._attr_device_info or {}), "name": name}
+        )
+
+        # 2. Patch the live DeviceRegistry entry so the UI updates immediately
+        registry = dr.async_get(self.hass)
+
+        # THE ENTITY'S OWN DEVICE, not a registry lookup.
+        #
+        # Home Assistant's own migration note says it plainly: "Inside
+        # an entity, prefer `self.device_entry` over a registry lookup."
+        # It has been on `Entity` for years, so it works on every
+        # supported version, and it sidesteps the whole question of
+        # which lookup method to call.
+        #
+        # WHY THIS IS WORTH A COMMENT: 4.1.3 shipped a shim preferring
+        # `async_get_device_by_identifier()` and broke EVERY entity on
+        # every robot for anyone on HA 2026.x --
+        #
+        #     TypeError: async_get_device_by_identifier() missing 1
+        #     required positional argument: 'config_entry_id'
+        #
+        # -- because I wrote that call from the method's name. It takes
+        # `(identifier, config_entry_id)`, both positional. The method
+        # does not exist in HA 2025.5, the minimum supported here, so
+        # nothing in this project's test environment could have caught
+        # it (@ScenicSystemsLLC, @mcrath1201).
+        #
+        # The registry fallback below stays for the case
+        # `device_entry` is not populated yet -- it is set when the
+        # entity is added to the platform, and this runs from
+        # `async_added_to_hass`, so it normally is. `async_get_device`
+        # is deprecated with a 2027.8 deadline; for a custom
+        # integration it logs a warning and keeps working until then.
+        device = self.device_entry
+        if device is None:
+            device = registry.async_get_device(
+                identifiers={(DOMAIN, self.robot_unique_id)}
+            )
+        if device is None:
+            _LOGGER.debug(
+                "IRobotEntity: device not yet in registry, skipping name patch"
+            )
+            return
+
+        if device.name_by_user:
+            # User has manually renamed the device — respect their choice silently.
+            return
+
+        if device.name == name:
+            return  # Nothing to do
+
+        registry.async_update_device(device.id, name=name)
+        _LOGGER.debug("IRobotEntity: device name updated to %r", name)
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _resolve_name(state: dict[str, Any], blid: str) -> str:
+        """Return the best available device name for the given state snapshot."""
+        return state.get("name", "").strip() or f"Roomba {blid[-4:]}"
+
+    # ── State filter / message handler ────────────────────────────────────────
+
+    def new_state_filter(self, new_state: dict[str, Any]) -> bool:
+        """Return True if this state update is relevant to this entity.
+
+        Default implementation: ignore pure WiFi signal updates (single-key
+        messages that only contain 'signal'). Subclasses override to be more
+        selective and avoid unnecessary HA state writes.
+        """
+        return len(new_state) > 1 or "signal" not in new_state
+
+    def on_message(self, json_data: dict[str, Any]) -> None:
+        """Handle an incoming MQTT message from the Roomba.
+
+        Refreshes the local vacuum_state snapshot and schedules a HA state
+        write if new_state_filter() returns True.
+
+        Disabled entities are skipped entirely — HA raises a warning if
+        schedule_update_ha_state() is called on a disabled entity, and there
+        is no point updating state that will not be written to the state machine.
+        """
+        if not self.enabled:
+            return
+        state = json_data.get("state", {}).get("reported", {})
+        if self.new_state_filter(state):
+            self.vacuum_state = roomba_reported_state(self.vacuum)
+            self.schedule_update_ha_state()

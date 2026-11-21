@@ -1,0 +1,1043 @@
+"""Sensor platform for Roomba+.
+
+SENSOR-SPLIT (v3.4.0): this file used to be a 5.812-line monolith
+holding every sensor class. It is now the thin platform entry point
+(HA loads sensor.py::async_setup_entry by convention — that can't
+move) plus a facade that re-exports everything from the five domain
+modules below, so every existing import path (tests, callbacks.py,
+device_tracker.py, repairs.py, services.py) keeps working unchanged:
+
+  sensor_helpers.py      — descriptor value-functions (pure functions)
+  sensor_core.py         — RoombaSensorDescription, SENSORS, RoombaSensor
+  sensor_cloud.py        — cloud-history/-raw/-analytics/-health sensors
+  sensor_rooms.py        — mission/room/zone sensors + room helpers
+  sensor_diagnostics.py  — raw-state/firmware/integration-health/reset sensors
+
+Sensors are arranged in four logical groups that determine their visibility
+and placement on the HA device page:
+
+GROUP 1 — Primary Status (EntityCategory = None)
+  Appears under "Sensoren" alongside the vacuum control.
+  Always visible, daily-use values: battery, phase, error.
+
+GROUP 2 — Operational (EntityCategory.DIAGNOSTIC, enabled)
+  Appears under "Diagnose". Useful for automations and troubleshooting.
+
+GROUP 3 — Maintenance (EntityCategory.DIAGNOSTIC, enabled)
+  Filter/brush life and battery wear — actionable values.
+
+GROUP 4 — Statistics (EntityCategory.DIAGNOSTIC, enabled)
+  Mission counters and timing — informational.
+
+GROUP 5 — Opt-in (EntityCategory.DIAGNOSTIC, disabled)
+  Hidden until user explicitly enables.
+
+DEVICE-SPECIFIC (capability-gated)
+  Created only when the robot reports the relevant hardware.
+"""
+from __future__ import annotations
+
+from homeassistant.components.sensor import (
+    SensorDeviceClass,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    SensorEntity,
+    SensorStateClass,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+)
+from collections.abc import Callable
+from typing import Any
+
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+# ir/dt_util: not used by this module's own code. Kept importable here as
+# `sensor.ir`/`sensor.dt_util` purely so that tests using
+# mock.patch("...sensor.ir.async_get", ...) or
+# mock.patch("...sensor.dt_util.utcnow", ...) still resolve — both are
+# shared HA singleton modules, so patching a sub-attribute on them here
+# also affects the sensor_helpers.py code that actually calls them. Do not
+# remove as "unused" without checking test_repairs.py/test_sensor.py first.
+from homeassistant.helpers import issue_registry as ir  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+from homeassistant.util import dt as dt_util  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+
+from . import roomba_reported_state
+from .entity_cleanup import async_remove_stale_entities
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
+
+from .const import (
+    CARE_ENTITY_KEYS,
+    CONF_CORRELATION_ENTITIES,
+    care_reminders_enabled,
+    CONF_REGION_SENSORS,
+    DEFAULT_REGION_SENSORS,
+)
+from .prime_room_map import SIGNAL_PRIME_ROOM_NAMES
+from .entity import IRobotEntity
+from .maintenance_model import LEVEL_DUE, LEVEL_OVERDUE, LEVEL_SOON, LEVELS
+from .models import ConnectionType, RoombaConfigEntry
+from .sensor_prime import (
+    PrimeBatterySensor,
+    PrimeCanceledMissionsSensor,
+    PrimeChargeCyclesErrorSensor,
+    PrimeChargeCyclesOkSensor,
+    PrimeConnectionHealthSensor,
+    PrimeStreamSeenSensor,
+    PrimeCleaningModeSensor,
+    PrimeDetectedPadSensor,
+    PrimeDockStatusSensor,
+    PrimeErrorSensor,
+    PrimePhaseSensor,
+    PrimeReadinessSensor,
+    PrimeFailedMissionsSensor,
+    PrimeFirmwareVersionSensor,
+    PrimeConsumablePartSensor,
+    PrimeMissionEventSensor,
+    PrimeNavigationResetsSensor,
+    PrimeDockTankLevelSensor,
+    PrimeRegionLastCleanedSensor,
+    PrimePadDryStatusSensor,
+    PrimeJobInitiatorSensor,
+    PrimePadWashStatusSensor,
+    PrimeRuntimeHoursSensor,
+    PrimeSerialNumberSensor,
+    PrimeSuccessfulMissionsSensor,
+    PrimeSuctionLevelSensor,
+    PrimeSystemUptimeSensor,
+    PrimeTotalMissionsSensor,
+)
+
+from .prime_coordinator import add_prime_entities_when_available, prime_reported_state
+from .sensor_core import (
+    RoombaSensor,
+    RoombaSensorDescription,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    SENSORS,
+)
+from .sensor_helpers import (
+    _area_cleaned_today,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _battery_age_days,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _battery_capacity_retention,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _completion_rate_30d,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _compute_integration_health,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _estimated_battery_eol,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _expire_minutes_remaining,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _health_band,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _integration_health_plain_status,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _last_error_code_value,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _last_mission_team_id,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _mission_elapsed_value,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _mission_store_last_started_at,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _mission_store_value,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _mop_behavior,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _mop_clean_mode,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _mop_tank_status,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _next_likely_clean_window,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _parse_netinfo_addr,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _phase_value,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _presence_opportunities,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _presence_utilisation,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _problem_zone_value,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _raw_wifi_floor,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _raw_wifi_quality_pct,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _raw_wifi_stability,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _recharge_minutes_remaining,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _robot_health_plain_status,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _total_energy_consumed_kwh,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _ts_or_none,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+)
+from .sensor_cloud import (
+    CLOUD_HISTORY_SENSORS,
+    CloudHistorySensor,
+    CloudHistorySensorDescription,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    RoombaCleaningAnalytics30dSensor,
+    RoombaCleaningPerformanceSensor,
+    RoombaEventCounts30dSensor,
+    RoombaHealthScoreTrendSensor,
+    RoombaMissionsPerChargeSensor,
+    RoombaRobotHealthSensor,
+    RoombaWifiChannelStabilitySensor,
+    RoombaWifiHealthSensor,
+    RoombaWifiLastChannelSensor,
+    _channel_to_band,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _mh_sqft_to_m2,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _mh_total_minutes,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _mh_total_missions,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _raw_cleaning_speed,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _raw_cleaning_speed_trend,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _raw_cloud_last_error_attrs,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _raw_cloud_last_error_code,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _raw_cloud_last_error_time,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _raw_completion_rate,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _raw_dirt_density,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _raw_dirt_events,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _raw_evacuations,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _raw_recharge_fraction,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _raw_recharges,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+)
+from .sensor_rooms import (
+    RoombaDirtCorrelationSensor,
+    RoombaEdgeCoverageSensor,
+    RoombaLastMissionSummarySensor,
+    RoombaLearningPercentageSensor,
+    RoombaMissionProgress,
+    RoombaCurrentRoomSensor,
+    RoombaEstimatedEndSensor,
+    RoombaRelocalisationRateSensor,
+    RoombaRoomAccessibilityScoresSensor,
+    RoombaRoomAreasSensor,
+    RoombaRoomCleaningHistorySensor,
+    PrimeRoomCleaningHistorySensor,
+    PrimeRoomsOverdueSensor,
+    RoombaRoomsOverdueSensor,
+    RoombaZoneSummarySensor,
+    _compute_room_time_estimates,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _get_planned_room_order,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _id_to_display_name,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _region_maps_for,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+    _resolve_smart_tier_room_state,  # noqa: F401 — SENSOR-SPLIT facade re-export, see test_sensor_module_split.py
+)
+from .sensor_areas import async_setup_area_sensors
+from .sensor_diagnostics import (
+    RawStateSensor,
+    RoombaFirmwareVersionSensor,
+    RoombaIntegrationHealthSensor,
+    RoombaOptimalCleanWindow,
+    RoombaResetDiagnosticsSensor,
+)
+
+#: RE-EXPORTED ON PURPOSE. Four private helpers here are imported by
+#: callbacks.py, services.py and sensor_rooms.py -- they live in this
+#: module because that is where the sensor definitions using them are,
+#: not because they are meant to be private to it.
+#:
+#: Under mypy strict, importing a name a module does not explicitly
+#: export is an error. Naming them says the sharing is deliberate.
+__all__ = [
+    "_compute_room_time_estimates",
+    "_region_maps_for",
+    "_resolve_smart_tier_room_state",
+]
+
+
+PARALLEL_UPDATES = 0
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: RoombaConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up all applicable sensors for this Roomba."""
+    data = config_entry.runtime_data
+
+    # NEW (this session): CLOUD_ONLY (V4/Prime) branch -- deliberately
+    # separate from the classic path below, not routed through
+    # SENSORS/RoombaSensor (see sensor_prime.py's own module docstring
+    # for why). Returns early; none of the classic-specific code below
+    # (roomba_reported_state(), SENSORS filter_fn list, cloud-history/
+    # edge-coverage/learning/zone sensors -- all cloud_coordinator-based,
+    # a different coordinator entirely) applies to a CLOUD_ONLY entry.
+    # B14 (4.6.0): when each HA area was last vacuumed and mopped, across
+    # every robot -- both generations, before the Prime branch returns.
+    async_setup_area_sensors(
+        hass, config_entry, async_add_entities,
+        None if data.connection_type is ConnectionType.CLOUD_ONLY else data.roomba,
+    )
+    if data.connection_type is ConnectionType.CLOUD_ONLY:
+        from .prime_coordinator import (  # noqa: PLC0415
+            PRIME_STREAMS,
+            _dock_reports_itself,
+            add_prime_entities_when_available,
+            get_prime_capability_flags,
+        )
+
+        cap, dock_cap = get_prime_capability_flags(config_entry)
+
+        entities: list[SensorEntity] = [
+            PrimeMissionEventSensor(data.blid, config_entry),
+            PrimeConnectionHealthSensor(data.blid, config_entry),
+            # B16 (4.6.0): when each cloud stream last spoke.
+            *(PrimeStreamSeenSensor(data.blid, config_entry, s) for s in PRIME_STREAMS),
+            PrimeBatterySensor(data.blid, config_entry),
+            PrimeRuntimeHoursSensor(data.blid, config_entry),
+            PrimeFirmwareVersionSensor(data.blid, config_entry),
+            PrimeDockStatusSensor(data.blid, config_entry),
+            PrimeErrorSensor(data.blid, config_entry),
+            # The most basic state sensor there is, and Prime did not
+            # have it -- found by comparing Classic value_fns against a
+            # real Prime shadow, not by anyone reporting it.
+            PrimePhaseSensor(data.blid, config_entry),
+            PrimeReadinessSensor(data.blid, config_entry),
+            # NEW (this session): ro-stats-backed lifetime stats,
+            # confirmed with real values (see StatsShadow's own
+            # docstring). Four mission-outcome sensors reuse Classic's
+            # own translation_keys (same confirmed field family);
+            # charge/uptime/reset sensors use new keys -- see each
+            # class's own docstring for why.
+            PrimeTotalMissionsSensor(data.blid, config_entry),
+            PrimeSuccessfulMissionsSensor(data.blid, config_entry),
+            PrimeCanceledMissionsSensor(data.blid, config_entry),
+            PrimeFailedMissionsSensor(data.blid, config_entry),
+            PrimeChargeCyclesOkSensor(data.blid, config_entry),
+            PrimeChargeCyclesErrorSensor(data.blid, config_entry),
+            PrimeSystemUptimeSensor(data.blid, config_entry),
+            PrimeNavigationResetsSensor(data.blid, config_entry),
+            # NEW (this session): ro-configinfo-backed, confirmed real
+            # value (see ConfigInfoShadow's own docstring).
+            PrimeSerialNumberSensor(data.blid, config_entry),
+        ]
+        # NEW (this session): capability-gated -- see
+        # get_prime_capability_flags()'s own docstring for the "None
+        # means unknown, only explicit 0 means absent" contract.
+        # NO CAPABILITY GATE. Every robot vacuums, so the sensor is
+        # meaningful even on one that cannot mop -- it just never
+        # reports "mopping". Gating on scrub would hide the vacuum half
+        # from exactly the robots where it is the only half.
+        entities.append(PrimeCleaningModeSensor(data.blid, config_entry))
+        if cap is None or cap.scrub != 0:
+            entities.append(PrimeDetectedPadSensor(data.blid, config_entry))
+        if cap is None or cap.suction_lvl != 0:
+            entities.append(PrimeSuctionLevelSensor(data.blid, config_entry))
+        # A PRESENT dock.cap WITHOUT the key means the dock cannot do
+        # it -- which is different from having no dock.cap at all.
+        #
+        # The "None means unknown" contract above is right for the ROBOT
+        # capabilities, where a missing cap object means the shadow has
+        # not arrived. It is wrong here: @jouwdan's evac-only dock
+        # reports `cap: {"evac": 1}` -- the object is there, and the
+        # absence of `pw` inside it is a statement, not a gap.
+        #
+        # Failing open gave a vacuum-only Roomba Max 705 a pad-wash and
+        # a pad-dry sensor, both permanently meaningless. His own
+        # diagnostics said so: "created (capability unknown -- failing
+        # open)".
+        # A DOCK THE ROBOT SAYS IT DOES NOT KNOW IS NOT AN UNKNOWN DOCK.
+        #
+        # @utkjmitch's Y351020 reports
+        # `dock: {"known": false, "error": 0, "fwVer": ""}` -- no `cap`
+        # object at all. NOT a plain charge dock, corrected by the
+        # tester: it is an auto-empty dock with a bag, and
+        # `cap.autoevac = 1`. `known: false` is narrower than "no dock".
+        # See button_prime.py's gate for what that does and does not
+        # justify. The rule below reads a missing cap as "shadow
+        # has not arrived, fail open", which is right when the shadow
+        # really is incomplete and wrong here.
+        #
+        # WHAT `known` ACTUALLY MEANS: a dock has been IDENTIFIED, not
+        # that one exists or where it is. This line used to say "the
+        # robot stating there is no such dock", which the evidence does
+        # not support.
+        #
+        # @Thonno's i7+ is the clearest case. `known: true` arrives
+        # carrying `pn`, `id`, `fwVer`, `hwRev` and `varID` -- part
+        # number, firmware, hardware revision. Identity fields, and no
+        # position anywhere near them. The platform shadows agree:
+        # wherever `known` is true the object carries some of that set,
+        # and where it is false (atlantis) the object is bare.
+        #
+        # @utkjmitch's is the other half. `fwVer: ""` is an identity
+        # slot that EXISTS and is empty -- a robot with nothing to write
+        # into it, not a robot reporting an absence of hardware. His
+        # dock is real; the robot simply has not identified it.
+        #
+        # AND IT IS NOT STABLE. @AlakazipLabs logged 15 true-to-false
+        # flips across 24,900 messages, 11 within seconds of a user
+        # `dock` command and returning on their own minutes later with
+        # no dock contact. A field describing identity, which comes and
+        # goes, is a poor gate for whether an entity exists -- which is
+        # why the entities are added as evidence arrives and never
+        # removed (see add_prime_entities_when_available).
+        #
+        # THE GATE STILL USES IT ANYWAY, because nothing better exists.
+        # `dock.cap` is the right source and is usually absent. The dock
+        # part number looked like a third option and is not: across the
+        # seven platform shadows exactly one carries a real `pn`, three
+        # report the literal string "unknown", and three omit the field.
+        #
+        # It produced pad wash and pad dry sensors, plus the wash and dry
+        # buttons, on a robot that can do neither. Same family as the
+        # a17 Max 705 fix and a different trigger -- there the cap object
+        # was present and the key absent, here the object never comes.
+        # NOT GATED. Every robot reports `cleanMissionStatus.initiator`,
+        # and a household that only ever starts from the app still gets
+        # a useful answer -- the sensor exists to distinguish `schedule`
+        # from `alexa` from `dockBtn`, not to detect a capability.
+        entities.append(PrimeJobInitiatorSensor(data.blid, config_entry))
+        # PRESENCE, not capability. See PrimeDockTankLevelSensor's
+        # docstring: which docks report tankLvl is not decidable from
+        # dock.cap, and a sensor reading "unknown" forever is worse than
+        # no sensor.
+        coordinator = getattr(config_entry.runtime_data,
+                              "prime_status_coordinator", None)
+        raw_dock = ((getattr(coordinator, "data", None) or {})
+                    .get("ro-currentstate") or {}).get("dock") or {}
+        if isinstance(raw_dock, dict) and raw_dock.get("tankLvl") is not None:
+            entities.append(PrimeDockTankLevelSensor(data.blid, config_entry))
+
+        # OVERDUE ROOMS, which Prime did not have.
+        #
+        # The Classic sensor sits behind `map_capability == "smart"` in
+        # the branch below, which a CLOUD_ONLY entry never reaches --
+        # not a decision, just the order things were built in. It reads
+        # the mission store and the region names, and it matters MORE
+        # here: Prime robots have zones as well as rooms, so there is
+        # more to fall behind.
+        #
+        # GATED ON THE MISSION STORE, NOT ON `has_cloud`. `has_cloud`
+        # means the Classic cloud coordinator, which a Prime entry never
+        # has -- the region names come from `prime_room_names` instead,
+        # and `_region_maps_for` already reads them. Behind the old gate
+        # neither sensor was ever created on a real Prime entry, while
+        # the setup test passed: its MagicMock runtime data answered
+        # every attribute with something truthy.
+        if data.mission_store is not None:
+            entities.append(PrimeRoomsOverdueSensor(data.blid, config_entry))
+            # The single-sensor history, which is what Classic ships and
+            # Prime had no equivalent of. One entity carrying
+            # {region_name: timestamp}, rather than one entity each.
+            entities.append(
+                PrimeRoomCleaningHistorySensor(data.blid, config_entry)
+            )
+
+        # ONE "LAST CLEANED" SENSOR PER ROOM AND ZONE.
+        #
+        # @chairstacker: "have a date/time entity that stores this value
+        # for each room and cleaning zone automatically and I don't have
+        # to build helpers for each room/cleaning zone". Built from the
+        # cloud region list, which already covers every map on the
+        # account -- so a two-map robot gets entities for both floors.
+        #
+        # Keyed by map AND region: region ids repeat across maps, and
+        # merging them would attribute one floor's clean to another's
+        # room (the same fault @dduff617 found in the history sensor).
+        #
+        # ADDED AS THEY APPEAR, not once at setup. @chairstacker adds
+        # and renames zones regularly -- he had gone from eight to
+        # twelve between two reports. A list frozen at startup would
+        # leave every new zone without an entity until he reloaded the
+        # integration, which is exactly the manual step this feature
+        # exists to remove. Same pattern as the schedule switches.
+        # A PRIME ENTRY HAS NO `cloud_coordinator`. That is the Classic
+        # cloud client; Prime keeps its region names in
+        # `runtime_data.prime_room_names`, keyed `{region_id: name}`.
+        #
+        # Gating this block on a coordinator that cannot exist here made
+        # the option do nothing at all on Prime -- @chairstacker ticked
+        # it, ran a zone mission, reloaded, and got not one entity
+        # (#84). The same wrong source appears in the Classic branch
+        # below, where it is correct.
+        if config_entry.options.get(
+            CONF_REGION_SENSORS, DEFAULT_REGION_SENSORS
+        ):
+            known: set[str] = set()
+
+            # ON THE LOOP (4.2.13): a dispatcher target that is neither a
+            # coroutine nor a @callback runs in HA's thread pool, and
+            # `async_add_entities` must not be called from there.
+            @callback
+            def _sync_region_sensors() -> None:
+                new: list[SensorEntity] = []
+                # FLAT, not per-map. `prime_room_names` is
+                # {region_id: name} for every region the coordinator has
+                # seen -- rooms and zones together, which is what makes
+                # this cover zones at all.
+                names = getattr(data, "prime_room_names", None)
+                if not isinstance(names, dict) or not names:
+                    return
+                for region_id, region_name in sorted(names.items()):
+                    key = str(region_id)
+                    if key in known:
+                        continue
+                    known.add(key)
+                    new.append(
+                        PrimeRegionLastCleanedSensor(
+                            data.blid, config_entry,
+                            # No pmap here: `prime_room_names` is flat,
+                            # and a Prime robot's regions are unique
+                            # across its maps -- the ids in a command
+                            # carry no map either.
+                            None, region_id, region_name,
+                        )
+                    )
+                if new:
+                    async_add_entities(new)
+
+            _sync_region_sensors()
+            # RE-RUN WHEN NAMES ARRIVE. `prime_room_names` fills from
+            # the status coordinator, so a robot that has not reported
+            # regions yet at setup time gets its sensors on the first
+            # update rather than never.
+            # LISTEN WHERE THE NAMES ARE WRITTEN. They are filled during
+            # a map build, not by the status coordinator -- so a
+            # coordinator listener fired plenty and never with names
+            # present. The sensors therefore appeared only when a map
+            # happened to be built before this platform set up, and
+            # vanished on reload when it was not.
+            config_entry.async_on_unload(
+                async_dispatcher_connect(
+                    hass,
+                    SIGNAL_PRIME_ROOM_NAMES.format(config_entry.entry_id),
+                    _sync_region_sensors,
+                )
+            )
+
+        if data.maintenance is not None:
+            entities.append(RoombaMaintenanceStatusSensor(None, data.blid, config_entry))
+        async_add_entities(entities)
+
+        # DOCK-DERIVED SENSORS, added as evidence arrives rather than
+        # once at setup. These were gated on `dock.known`, which
+        # describes dock identity and is not stable -- @AlakazipLabs
+        # logged 15 true-to-false flips, 11 of them within seconds of a
+        # user `dock` command, returning on their own minutes later. A
+        # restart inside one of those windows cost a real AutoWash dock
+        # its pad sensors until the next reload fell elsewhere.
+        def _build_dock_sensors() -> list[SensorEntity]:
+            # THE GATE RULE IS UNCHANGED, on purpose. `dock.known` still
+            # decides, and a present `dock.cap` still suppresses only on
+            # an explicit 0. An evidence-based rule was tried here --
+            # fall back to whether the dock reports `pwState`/`pdState`
+            # when `dock.cap` is absent -- and withdrawn: no capture in
+            # this repo shows either key arriving at rest, so it would
+            # have silently removed the pad sensors from every dock that
+            # simply has not washed yet. @jouwdan's evac-only dock is
+            # also the reminder that `dock.cap` is NOT usually absent in
+            # the field, whatever the vendor platform samples suggest.
+            #
+            # WHAT CHANGED IS WHEN THIS RUNS. Read once at setup, a
+            # `known` that dips false -- which @AlakazipLabs logged 15
+            # times, 11 within seconds of a user dock command -- cost a
+            # real dock its sensors until the next reload. Re-read on
+            # every shadow, with add-only semantics, the dip costs
+            # nothing and the recovery needs no reload.
+            _, live_dock_cap = get_prime_capability_flags(config_entry)
+            if not _dock_reports_itself(config_entry):
+                return []
+            built: list[SensorEntity] = []
+            if live_dock_cap is None or live_dock_cap.pad_wash not in (0, None):
+                built.append(PrimePadWashStatusSensor(data.blid, config_entry))
+            if live_dock_cap is None or live_dock_cap.pad_dry not in (0, None):
+                built.append(PrimePadDryStatusSensor(data.blid, config_entry))
+            return built
+
+        add_prime_entities_when_available(
+            config_entry, async_add_entities, _build_dock_sensors
+        )
+
+        # Consumable parts: one sensor per part the ROBOT reports,
+        # discovered rather than hard-coded.
+        #
+        # The set differs by model -- a vacuum-only robot has no mop
+        # pads, one without a self-emptying base has no dirt bag. A
+        # fixed list would invent entities for hardware that lacks them
+        # and miss whatever exists on hardware nobody here owns.
+        #
+        # ADDED VIA A LISTENER, not just once at setup. The parts fetch
+        # is best-effort: if it fails during startup -- a cloud hiccup,
+        # a rate limit -- there is no data yet and nothing to create.
+        # Adding them only here would mean those users never get the
+        # sensors until they reload the config entry, for a failure
+        # that resolves itself within hours.
+        #
+        # The listener also covers a part appearing later for a real
+        # reason: a dirt bag showing up after someone attaches a
+        # self-emptying base.
+        _add_discovered_parts(hass, data, config_entry, async_add_entities)
+        _add_prime_mission_sensors(data, config_entry, async_add_entities)
+        _add_prime_shared_sensors(config_entry, async_add_entities)
+        # 4.6.0, parity: the debug view of the robot's state, from the
+        # shadows; and the presence window, where presence is on.
+        shared: list[SensorEntity] = [PrimeRawStateSensor(data.blid, config_entry)]
+        if getattr(data, "mission_store", None) is not None:
+            shared.append(RoombaLastMissionSummarySensor(None, data.blid, config_entry))
+        if getattr(data, "presence_manager", None) is not None:
+            shared.append(RoombaOptimalCleanWindow(None, data.blid, config_entry))
+        async_add_entities(shared)
+        return
+
+    roomba = config_entry.runtime_data.roomba
+    blid = config_entry.runtime_data.blid
+    state = roomba_reported_state(roomba)
+
+    # Care reminders are opt-in (4.3.2): their sensor exists only when
+    # the option is on.
+    care_off = not care_reminders_enabled(config_entry.options)
+    entities = [
+        RoombaSensor(roomba, blid, description, config_entry)
+        for description in SENSORS
+        if description.filter_fn(state)
+        and not (care_off and description.key in CARE_ENTITY_KEYS)
+    ]
+
+    # Cloud history sensors: lifetime stats from /missionhistory.
+    # Available for all robots when cloud credentials are configured.
+    # Data comes from the cloud coordinator (daily poll) — not from MQTT.
+    cc = data.cloud_coordinator
+    if cc is not None and cc.data is not None:
+        entities.extend([
+            CloudHistorySensor(roomba, blid, cc, desc)
+            for desc in CLOUD_HISTORY_SENSORS
+        ])
+        # SC1 (v3.0): CloudRawSensor descriptors removed — deprecated sensors
+        # deactivated. Consolidated replacements: cleaning_performance,
+        # cleaning_analytics_30d, wifi_health, event_counts_30d.
+        pass
+
+    # F12d — recent_edge_coverage_ratio (map-capable robots with GridStore)
+    if data.grid_store is not None and data.map_capability.value != "none":
+        entities.append(RoombaEdgeCoverageSensor(roomba, blid, config_entry))
+
+    # IA74-LP (v2.6.0) — learning_percentage (SMART + cloud only)
+    if data.map_capability.value == "smart" and data.cloud_coordinator is not None:
+        entities.append(RoombaLearningPercentageSensor(roomba, blid, config_entry))
+
+    # IA74-ZONE (v2.6.0) — zone summary (SMART + cloud only)
+    if data.map_capability.value == "smart" and data.cloud_coordinator is not None:
+        entities.append(RoombaZoneSummarySensor(roomba, blid, config_entry))
+
+    # v3.3.0 ROOM-SCHED — rooms_overdue (SMART + cloud only: room data
+    # source is timeline.finEvents from cloud-enriched records)
+    if data.map_capability.value == "smart" and data.cloud_coordinator is not None:
+        entities.append(RoombaRoomsOverdueSensor(roomba, blid, config_entry))
+
+    # v3.3.0 CROSS-CORR — opt-in: only when correlation entities are
+    # configured; cloud required (dirt field is cloud-enriched)
+    if (
+        config_entry.options.get(CONF_CORRELATION_ENTITIES)
+        and data.cloud_coordinator is not None
+    ):
+        entities.append(RoombaDirtCorrelationSensor(roomba, blid, config_entry))
+
+    # F12a — optimal_clean_window sensor (presence scheduling active)
+    if data.presence_manager is not None:
+        entities.append(RoombaOptimalCleanWindow(roomba, blid, config_entry))
+
+    # MP1 (v2.6.0) — mission progress (SMART + cloud + timer store)
+    if (
+        data.map_capability.value == "smart"
+        and data.cloud_coordinator is not None
+        and data.mission_timer_store is not None
+    ):
+        entities.append(RoombaMissionProgress(roomba, blid, config_entry))
+        # B5 (4.6.0): the room and the end of the running mission as states.
+        entities.append(RoombaCurrentRoomSensor(roomba, blid, config_entry))
+        entities.append(RoombaEstimatedEndSensor(roomba, blid, config_entry))
+
+    # SC1 (v2.7.0) — consolidated analytics sensors (cloud credentials required)
+    cc = data.cloud_coordinator
+    if cc is not None and cc.data is not None:
+        entities.extend([
+            RoombaCleaningPerformanceSensor(roomba, blid, cc, config_entry),
+            RoombaCleaningAnalytics30dSensor(roomba, blid, cc, config_entry),
+            RoombaWifiHealthSensor(roomba, blid, cc, config_entry),
+            RoombaEventCounts30dSensor(roomba, blid, cc, config_entry),
+        ])
+        # BAT-ARCH (v2.8.0) — archive-sourced WiFi + charge sensors
+        entities.extend([
+            RoombaWifiLastChannelSensor(roomba, blid, cc, config_entry),
+            RoombaWifiChannelStabilitySensor(roomba, blid, cc, config_entry),
+            RoombaMissionsPerChargeSensor(roomba, blid, cc, config_entry),
+        ])
+
+    # L8 (v2.7.0) — composite robot health score (cloud credentials required)
+    if data.has_cloud and data.cloud_coordinator is not None:
+        entities.append(
+            RoombaRobotHealthSensor(roomba, blid, data.cloud_coordinator, config_entry)
+        )
+        # v3.2.0 L10 — self-calibrating health score trend, same gate as L8
+        # itself (the trend has nothing to track without the score it's
+        # derived from).
+        entities.append(
+            RoombaHealthScoreTrendSensor(roomba, blid, data.cloud_coordinator, config_entry)
+        )
+
+    # 4.5.0 -- the maintenance status, one entity for every entry.
+    if data.maintenance is not None:
+        entities.append(RoombaMaintenanceStatusSensor(roomba, blid, config_entry))
+
+    # Raw state sensor: opt-in, always created, exposes full MQTT state as attributes.
+    entities.append(RawStateSensor(roomba, blid))
+
+    # v2.8.3 FW-SENSOR — firmware version, always created (universal across all robot families).
+    entities.append(RoombaFirmwareVersionSensor(roomba, blid))
+
+    # v2.9.0 INTEG-HEALTH — integration health meta-sensor, always created.
+    entities.append(RoombaIntegrationHealthSensor(roomba, blid, config_entry))
+
+    # v3.1.0 LAST-MISSION-SUMMARY — always created; shows None when no record exists.
+    entities.append(RoombaLastMissionSummarySensor(roomba, blid, config_entry))
+
+    # v3.1.0 ROOM-CLEANING-HISTORY — per-room last-clean timestamps (SMART, cloud).
+    # Only created when mission_store is available; no tier gate — any robot that
+    # accumulates room data in last_cleaned_rooms will populate this sensor.
+    if data.mission_store is not None:
+        entities.append(RoombaRoomCleaningHistorySensor(roomba, blid, config_entry))
+
+        # THE SAME OPTION AS PRIME, and it has to be the same one.
+        # Giving one generation per-region entities and the other only
+        # attributes for identical data is the kind of split this
+        # project keeps having to unpick later. Off by default on both:
+        # @dduff617's four maps would mean dozens of entities nobody
+        # asked for.
+        if config_entry.options.get(CONF_REGION_SENSORS, DEFAULT_REGION_SENSORS):
+            by_pmap = (
+                data.cloud_coordinator.regions_by_pmap
+                if data.has_cloud and data.cloud_coordinator is not None
+                else {}
+            )
+            for pmap_id, names in (by_pmap or {}).items():
+                for region_id, region_name in sorted(names.items()):
+                    entities.append(
+                        PrimeRegionLastCleanedSensor(
+                            blid, config_entry, pmap_id, region_id, region_name,
+                        )
+                    )
+
+    # v3.1.0 ROOM-SIZE — per-room floor area in m² from UMF polygons (SMART only).
+    if data.umf_aligner is not None:
+        entities.append(RoombaRoomAreasSensor(roomba, blid, config_entry))
+
+    # v3.2.0 ROOM-ACCESS — same gate as ROOM-SIZE (room polygons come from
+    # the same UmfAligner source).
+    if data.umf_aligner is not None:
+        entities.append(RoombaRoomAccessibilityScoresSensor(roomba, blid, config_entry))
+
+    # v3.2.0 RESET-DIAGNOSTICS — reset-cause breakdown, previously unread.
+    if "bbrstinfo" in state:
+        entities.append(RoombaResetDiagnosticsSensor(roomba, blid))
+
+    # v3.1.0 L9-MAP — relocalisation rate (SMART only, mssnNavStats confirmed
+    # absent on EPHEMERAL tier).
+    if data.umf_aligner is not None:
+        entities.append(RoombaRelocalisationRateSensor(roomba, blid, config_entry))
+
+    async_add_entities(entities)
+
+
+#: Mission-history sensors that work for Prime robots.
+#:
+#: NAMED EXPLICITLY rather than filtered. The Classic path decides which
+#: sensors to create by running every description's filter_fn against
+#: roomba_reported_state(), and Prime has no such state -- so a filter
+#: would either pass everything or nothing.
+#:
+#: It is also the safer shape. All filter_fn calls happen inside one
+#: list comprehension, so a single crash takes down the entire sensor
+#: platform. An explicit list cannot crash.
+#:
+#: Each of these was checked against a real Prime mission record and
+#: returns a correct value. Deliberately absent:
+#:   - area_cleaned_today: gated on has_pose(), a Classic capability,
+#:     even though Prime does report square footage. Reachable later,
+#:     but it needs the gate rewritten rather than bypassed.
+#:   - problem_zone: reads zone data Prime has no equivalent for.
+_PRIME_MISSION_SENSOR_KEYS: frozenset[str] = frozenset({
+    # Gated on has_pose() in the shared SENSORS list, which is a Classic
+    # capability -- but that gate is about the 600-series not reporting
+    # square footage at all, and Prime does report it. The mission
+    # records carry area_sqft, so the sensor works; only the Classic-side
+    # filter would have excluded it.
+    "area_cleaned_today",
+    "last_mission",
+    "last_mission_result",
+    "last_mission_duration",
+    "clean_streak",
+    "consecutive_mission_anomalies",
+    # 4.6.0 (parity inventory P1): read only the mission store, which
+    # Prime fills from its cloud history.
+    "missions_last_30d",
+    # 4.6.0: the newest mission that ended in error, kept by
+    # mission_result.note_last_error at setup and after each sync.
+    "last_error_code",
+    "last_error_at",
+    # The room of that mission, where it was sent to one room only.
+    "last_error_zone",
+    # 4.6.0: the gaps between missions, from the mission store alone.
+    "presence_clean_opportunities_7d",
+    "presence_clean_utilisation_7d",
+    "next_likely_clean_window",
+    "completion_rate_30d",
+    "last_mission_area",
+})
+
+#: SHARED SENSORS FROM THE PRIME SHADOWS (4.6.0, parity inventory P1).
+#:
+#: Their value functions read the Classic state (`cleanMissionStatus`,
+#: `bbmssn`, `bbchg`), and a Prime robot reports these fields under the
+#: same names in its named shadows. `PrimeSharedSensor` hands them the
+#: shadows in the Classic shape (prime_coordinator.prime_reported_state),
+#: so the description, the unit and the translation are Classic's.
+#:
+#: CREATED WHEN THE FIELD ARRIVES, never before. Of these, only
+#: `cleanMissionStatus` and `bbmssn`'s counters have been seen with real
+#: values on a Prime robot (chairstacker); `expireTm`, `rechrgTm`,
+#: `aMssnM`, `nChatters` and `nKnockoffs` are declared by the Prime app
+#: and not yet seen. A sensor that would read "unknown" for ever is
+#: worse than none, so each is added the first time its field is in a
+#: shadow, and stays (add-only, like the dock entities).
+#:
+#: Each key with the field that has to be present, as (block, field).
+#: Deliberately absent, see claude/PARITAET_CLASSIC_PRIME.md:
+#:   - `dock_charge_aborts`: Classic reads `bbchg.nAborts`, the Prime app
+#:     declares `bbchg.aborts`; same thing or not is unknown;
+#:   - `bbrun`, `bbnav`, `mssnNavStats`, `bbchg3.estCap`, `batInfo`
+#:     sensors: their meaning on Prime is unconfirmed beyond the name;
+#:   - `stuck_count_30d`, `last_error_code`, `last_error_at`: see the
+#:     inventory (no stuck result on Prime; Classic-only source).
+_PRIME_SHADOW_SENSOR_FIELDS: dict[str, tuple[str, str]] = {
+    "mission_start_time": ("cleanMissionStatus", "mssnStrtTm"),
+    "mission_elapsed_time": ("cleanMissionStatus", "mssnStrtTm"),
+    "mission_recharge_time": ("cleanMissionStatus", "rechrgTm"),
+    "mission_recharge_minutes": ("cleanMissionStatus", "rechrgTm"),
+    "mission_expire_time": ("cleanMissionStatus", "expireTm"),
+    "mission_expire_minutes": ("cleanMissionStatus", "expireTm"),
+    "mission_id": ("cleanMissionStatus", "missionId"),
+    "lifetime_completion_rate": ("bbmssn", "nMssnOk"),
+    "average_mission_time": ("bbmssn", "aMssnM"),
+    "dock_contact_chatters": ("bbchg", "nChatters"),
+    "dock_knockoffs": ("bbchg", "nKnockoffs"),
+    # The dock's own firmware, in `ro-currentstate.dock` as in the local
+    # state (4.6.0); empty on the one Prime dock seen so far.
+    "dock_firmware_version": ("dock", "fwVer"),
+}
+_PRIME_SHADOW_SENSOR_KEYS: frozenset[str] = frozenset(_PRIME_SHADOW_SENSOR_FIELDS)
+
+
+def _add_prime_shared_sensors(
+    config_entry: RoombaConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """The shared descriptions whose field a Prime shadow carries (4.6.0)."""
+    data = config_entry.runtime_data
+    if getattr(data, "prime_status_coordinator", None) is None:
+        return
+
+    def _build() -> list[Any]:
+        state = prime_reported_state(data)
+        return [
+            PrimeSharedSensor(None, data.blid, description, config_entry)
+            for description in SENSORS
+            if (fields := _PRIME_SHADOW_SENSOR_FIELDS.get(description.key)) is not None
+            and isinstance(state.get(fields[0]), dict)
+            and fields[1] in state[fields[0]]
+        ]
+
+    add_prime_entities_when_available(config_entry, async_add_entities, _build)
+
+
+class PrimeSharedSensor(RoombaSensor):
+    """A shared sensor description, read from the Prime shadows (4.6.0)."""
+
+    @property
+    def vacuum_state(self) -> dict[str, Any]:
+        return prime_reported_state(self._config_entry.runtime_data)
+
+    @vacuum_state.setter
+    def vacuum_state(self, _value: dict[str, Any]) -> None:
+        """The base class assigns the local state; Prime has none."""
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        coordinator = getattr(
+            self._config_entry.runtime_data, "prime_status_coordinator", None
+        )
+        if coordinator is not None:
+            self.async_on_remove(
+                coordinator.async_add_listener(self.async_write_ha_state)
+            )
+
+
+class PrimeRawStateSensor(RawStateSensor):
+    """The raw-state sensor on Prime: the shadows, merged into the local
+    shape (prime_reported_state), as the diagnostics show them. Opt-in
+    as on Classic (4.6.0)."""
+
+    def __init__(self, blid: str, config_entry: RoombaConfigEntry) -> None:
+        IRobotEntity.__init__(self, None, blid, config_entry)
+        self._attr_unique_id = f"{self.robot_unique_id}_raw_state"
+
+    @property
+    def vacuum_state(self) -> dict[str, Any]:
+        return prime_reported_state(self._config_entry.runtime_data)
+
+    @vacuum_state.setter
+    def vacuum_state(self, _value: dict[str, Any]) -> None:
+        """The base class assigns the local state; Prime has none."""
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        coordinator = getattr(
+            self._config_entry.runtime_data, "prime_status_coordinator", None
+        )
+        if coordinator is not None:
+            self.async_on_remove(
+                coordinator.async_add_listener(self.async_write_ha_state)
+            )
+
+
+#: Maintenance-date sensors that work for Prime robots.
+#:
+#: These record when the USER last changed a part, not anything the
+#: robot reports -- so unlike every other store, MaintenanceStore is
+#: generation-independent by nature. The reset service handler was
+#: already written without a Classic assumption; it only checked whether
+#: the store existed, and for Prime it never did.
+#:
+#: Deliberately absent:
+#:   - bin_last_cleaned, contact_last_cleaned, wheel_last_cleaned: their
+#:     reset services exist, but a Prime robot's own consumable sensors
+#:     already track the dirt bag, and the contact/wheel cleaning
+#:     reminders are 900-series concepts. Offering a date field for
+#:     something nothing prompts you about is clutter.
+#:   - consecutive_clean_skips: counts schedule skips detected from the
+#:     Classic MQTT stream. Prime has schedule data but no skip
+#:     detection, so this would sit at 0 forever and read as a fact.
+_PRIME_MAINTENANCE_SENSOR_KEYS: frozenset[str] = frozenset({
+    "filter_last_replaced",
+    "brush_last_replaced",
+    "pad_last_replaced",
+    "battery_last_replaced",
+})
+
+
+def _add_prime_mission_sensors(
+    data: Any,
+    config_entry: RoombaConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Mission-history sensors for Prime robots.
+
+    MissionStore was left at None for Prime since v4.0.0a0, so these
+    were empty even though the data was reachable over REST. Filling the
+    store was only half the fix: the Prime branch of async_setup_entry
+    returns before the mission sensors are ever created, so nothing read
+    it.
+
+    That is the same shape as two other bugs this project has had --
+    working data that no entity consumes. PrimeMapImage was unreachable
+    for a whole release because IMAGE was missing from PRIME_PLATFORMS,
+    and CLEAN_AREA was advertised without the method that supplies the
+    room list.
+    """
+    wanted: set[str] = set()
+    if getattr(data, "mission_store", None) is not None:
+        wanted |= _PRIME_MISSION_SENSOR_KEYS
+    if getattr(data, "maintenance_store", None) is not None:
+        wanted |= _PRIME_MAINTENANCE_SENSOR_KEYS
+    entities: list[Any] = [
+        RoombaSensor(None, data.blid, description, config_entry)
+        for description in SENSORS
+        if description.key in wanted
+    ]
+
+    # Mission progress: elapsed time, current room, remaining estimate.
+    # Not part of SENSORS -- it is its own entity class, and Classic
+    # gates it on map_capability == SMART plus a cloud coordinator,
+    # neither of which describes a Prime robot. What it actually needs is
+    # the timer store, and the phase transitions that feed it now come
+    # from PrimeStatusCoordinator.
+    if getattr(data, "mission_timer_store", None) is not None:
+        from .sensor_rooms import RoombaMissionProgress  # noqa: PLC0415
+
+        entities.append(RoombaMissionProgress(None, data.blid, config_entry))
+        entities.append(RoombaCurrentRoomSensor(None, data.blid, config_entry))
+        entities.append(RoombaEstimatedEndSensor(None, data.blid, config_entry))
+
+    if entities:
+        async_add_entities(entities)
+
+
+def _add_discovered_parts(
+    hass: HomeAssistant,
+    data: Any,
+    config_entry: RoombaConfigEntry,
+    async_add_entities: Callable[..., None],
+) -> None:
+    """Creates a sensor for each consumable part, now and as they appear.
+
+    Entities are added exactly once per part_id. `known` is captured by
+    the closure rather than stored on the coordinator, so a reload
+    starts clean -- Home Assistant builds fresh entities on reload
+    anyway, and a stale set would silently suppress them.
+    """
+    coordinator = getattr(data, "prime_parts_coordinator", None)
+    if coordinator is None:
+        return
+
+    known: set[str] = set()
+
+    @callback
+    def _add_new() -> None:
+        parts = coordinator.data or {}
+        new = [pid for pid in sorted(parts) if pid not in known]
+        if not new:
+            return
+        known.update(new)
+        async_add_entities(
+            PrimeConsumablePartSensor(data.blid, pid, config_entry) for pid in new
+        )
+
+        # A part the robot stopped reporting leaves a registry row
+        # behind forever. Scoped to `_prime_part_`, and skipped
+        # entirely when the coordinator returned nothing -- see
+        # entity_cleanup for why an empty list must not sweep.
+
+        robot_uid = f"roomba_plus_{data.blid}"
+        async_remove_stale_entities(
+            hass,
+            config_entry,
+            prefix="_prime_part_",
+            live_unique_ids={
+                f"{robot_uid}_prime_part_{pid}" for pid in parts
+            },
+        )
+
+    _add_new()
+    config_entry.async_on_unload(coordinator.async_add_listener(_add_new))
+
+
+class RoombaMaintenanceStatusSensor(IRobotEntity, SensorEntity):
+    """What maintenance the robot needs, on both generations (4.5.0).
+
+    The worst level of the entries that are not snoozed -- ok, soon,
+    due, overdue -- with every entry in `items`. The one entity a
+    dashboard or an automation needs for maintenance; the part sensors
+    keep their numbers.
+    """
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "maintenance_status"
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = list(LEVELS)
+    # The entries are the point of the entity, but not of its history:
+    # a list of dicts on every hour run would fill the recorder.
+    _unrecorded_attributes = frozenset({"items"})
+    _shows_maintenance = True
+
+    def __init__(self, roomba: Any, blid: str, config_entry: RoombaConfigEntry) -> None:
+        super().__init__(roomba, blid, config_entry)
+        self._config_entry = config_entry
+        self._attr_unique_id = f"{self.robot_unique_id}_maintenance"
+
+    def new_state_filter(self, new_state: dict[str, Any]) -> bool:
+        """Never on a robot message: the entries change on a recompute."""
+        return False
+
+    @property
+    def _tracker(self) -> Any:
+        return getattr(self._config_entry.runtime_data, "maintenance", None)
+
+    @property
+    def native_value(self) -> str | None:
+        tracker = self._tracker
+        return tracker.level if tracker is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        tracker = self._tracker
+        if tracker is None:
+            return {}
+        items = tracker.items
+        return {
+            "items": [item.as_dict() for item in items],
+            **{
+                level: sorted(i.id for i in items if i.level == level)
+                for level in (LEVEL_SOON, LEVEL_DUE, LEVEL_OVERDUE)
+            },
+        }

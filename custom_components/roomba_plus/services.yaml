@@ -1,0 +1,516 @@
+# The names and descriptions of the actions and their fields are in
+# strings.json and the translations: one source, in every language.
+clean_room:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum
+  fields:
+    room_name:
+      required: false
+      example: "Kitchen"
+      selector:
+        text:
+    ordered:
+      required: false
+      default: true
+      selector:
+        boolean:
+    cleaning_mode:
+      selector:
+        select:
+          translation_key: cleaning_mode
+          options: [vacuum, mop, vacuum_and_mop, vacuum_then_mop]
+    two_pass:
+      required: false
+      selector:
+        boolean:
+    smart_scrub:
+      selector:
+        boolean:
+    pad_wetness:
+      selector:
+        select:
+          translation_key: pad_wetness
+          options: ["1", "2", "3"]
+    room_passes:
+      required: false
+      example: '[{"name": "Kitchen", "two_pass": true}, {"name": "Hallway"}]'
+      selector:
+        object:
+
+smart_start:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum
+  fields:
+    rooms:
+      required: false
+      selector:
+        text:
+          multiple: true
+    override_blocking:
+      required: false
+      default: false
+      selector:
+        boolean:
+
+clean_sequence:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          domain: vacuum
+    target_entity_id:
+      required: true
+      selector:
+        entity:
+          domain: vacuum
+    require_completed:
+      required: false
+      default: true
+      selector:
+        boolean:
+    delay_minutes:
+      required: false
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 60
+          step: 1
+          unit_of_measurement: min
+
+reset_robot_profile:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum
+
+advance_room:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum
+
+explain_mission:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          domain: vacuum
+    mission_id:
+      required: false
+      selector:
+        text:
+
+retry_missed_rooms:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          domain: vacuum
+          integration: roomba_plus
+    mission_id:
+      required: false
+      selector:
+        text:
+
+get_rooms:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          domain: vacuum
+          integration: roomba_plus
+
+get_missions:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          domain: vacuum
+          integration: roomba_plus
+    limit:
+      required: false
+      default: 20
+      selector:
+        number:
+          min: 1
+          max: 200
+          mode: box
+    days:
+      required: false
+      selector:
+        number:
+          min: 1
+          max: 3650
+          mode: box
+
+get_mission:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          domain: vacuum
+          integration: roomba_plus
+    mission_id:
+      required: false
+      selector:
+        text:
+
+plan_clean:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          domain: vacuum
+          integration: roomba_plus
+    room_name:
+      required: false
+      example: "Kitchen"
+      selector:
+        text:
+          multiple: true
+    end_by:
+      required: false
+      selector:
+        datetime:
+
+debug_capture_start:
+  fields:
+    minutes:
+      required: false
+      default: 30
+      selector:
+        number:
+          min: 1
+          max: 240
+          unit_of_measurement: min
+
+debug_capture_stop:
+debug_capture_get:
+clean_overdue_rooms:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          domain: vacuum
+          integration: roomba_plus
+    max_rooms:
+      required: false
+      selector:
+        number:
+          min: 1
+          max: 20
+          mode: box
+
+auto_clean_dirty_rooms:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          domain: vacuum
+          integration: roomba_plus
+    max_rooms:
+      required: false
+      selector:
+        number:
+          min: 1
+          max: 20
+          mode: box
+
+create_backup:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          domain: vacuum
+          integration: roomba_plus
+
+restore_backup:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          domain: vacuum
+          integration: roomba_plus
+    path:
+      required: true
+      selector:
+        text:
+
+maintenance_done:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum
+  fields:
+    item:
+      required: true
+      example: "replace.filter"
+      selector:
+        text:
+    action:
+      required: false
+      selector:
+        select:
+          translation_key: maintenance_action
+          options: [replace, clean]
+
+maintenance_snooze:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum
+  fields:
+    item:
+      required: true
+      example: "replace.filter"
+      selector:
+        text:
+    days:
+      required: false
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 90
+          step: 1
+          unit_of_measurement: days
+
+maintenance_forget_learned:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum
+  fields:
+    item:
+      required: false
+      example: "replace.filter"
+      selector:
+        text:
+          multiple: true
+
+run_favorite:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum
+  fields:
+    favorite_id:
+      required: true
+      example: "01KRQ4S1RP493P1WKCG71C90D9"
+      selector:
+        text:
+
+create_schedule:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          integration: roomba_plus
+          domain: vacuum
+    name:
+      example: Kitchen, weekday mornings
+      selector:
+        text:
+    days:
+      required: true
+      selector:
+        select:
+          multiple: true
+          translation_key: weekday
+          options: [mon, tue, wed, thu, fri, sat, sun]
+    time:
+      required: true
+      selector:
+        time:
+    frequency:
+      default: weekly
+      selector:
+        select:
+          translation_key: schedule_frequency
+          options: [weekly, bi_weekly, monthly, once]
+    rooms:
+      example: '["Kitchen", "Hallway"]'
+      selector:
+        object:
+    pad_wetness:
+      selector:
+        number:
+          min: 1
+          max: 3
+          mode: slider
+    enabled:
+      default: true
+      selector:
+        boolean:
+
+update_schedule:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: switch
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          integration: roomba_plus
+          domain: switch
+    name:
+      selector:
+        text:
+    days:
+      selector:
+        select:
+          multiple: true
+          translation_key: weekday
+          options: [mon, tue, wed, thu, fri, sat, sun]
+    time:
+      selector:
+        time:
+    frequency:
+      selector:
+        select:
+          translation_key: schedule_frequency
+          options: [weekly, bi_weekly, monthly, once]
+    rooms:
+      example: '["Kitchen", "Hallway"]'
+      selector:
+        object:
+    pad_wetness:
+      selector:
+        number:
+          min: 1
+          max: 3
+          mode: slider
+    enabled:
+      selector:
+        boolean:
+
+delete_schedule:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: switch
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          integration: roomba_plus
+          domain: switch
+
+set_quiet_hours:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum
+  fields:
+    start:
+      example: "22:00:00"
+      selector:
+        time:
+    end:
+      example: "07:00:00"
+      selector:
+        time:
+    ends_at:
+      example: "2026-08-15 07:00:00"
+      selector:
+        datetime:
+clean_zone:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum
+  fields:
+    zone_name:
+      example: '["Clean Kitchen", "Under Table"]'
+      selector:
+        text:
+          multiple: true
+    cleaning_mode:
+      selector:
+        select:
+          translation_key: cleaning_mode
+          options: [vacuum, mop, vacuum_and_mop, vacuum_then_mop]
+    smart_scrub:
+      selector:
+        boolean:
+    pad_wetness:
+      selector:
+        select:
+          translation_key: pad_wetness
+          options: ["1", "2", "3"]
+    two_pass:
+      required: false
+      selector:
+        boolean:
+    zone_id:
+      example: '["100", "101"]'
+      selector:
+        text:
+          multiple: true
+reset_filter:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum
+reset_brush:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum
+reset_battery:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum
+reset_pad:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum
+reset_wheel_cleaning:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum
+reset_contact_cleaning:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum
+reset_bin_cleaning:
+  target:
+    entity:
+      integration: roomba_plus
+      domain: vacuum

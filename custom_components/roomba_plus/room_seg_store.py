@@ -1,0 +1,1274 @@
+"""RoomSegStore — persisted room/door segmentation results for EPHEMERAL
+robots, computed from GridStore's visited-cell grid via room_segmentation.py
+(dependency-free distance-transform + watershed pipeline).
+
+Only used for EPHEMERAL map capability (900-series robots like the Roomba 980).
+
+This is a COMPLEMENT to ZoneStore, not a replacement. ZoneStore's per-mission
+gap-split zones remain the live system that the room-naming UI, select
+entities, etc. read from. RoomSegStore is the new watershed-based
+segmentation engine, exposed for now via diagnostics only, while the two
+approaches are compared in the field on real installations before any
+decision to replace ZoneStore's room detection.
+
+Identity stability: every recompute can shift cell-set boundaries slightly
+as more missions accumulate. A new room candidate is matched against
+EXISTING persisted rooms by Jaccard overlap (intersection / union of cell
+sets) so that a user-assigned name or confirmation survives across
+recomputations rather than being silently discarded and recreated as a
+fresh, unnamed room each time. Existing rooms with no good match in a new
+recompute are KEPT as-is, never auto-deleted — removal is left as an
+explicit future user action, not something a noisy single mission should
+trigger on its own.
+
+Storage key: roomba_plus_roomseg_{entry_id}
+Storage version: 1
+"""
+from __future__ import annotations
+
+import logging
+import math
+import statistics
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any
+
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.storage import Store
+
+from .room_layout import AreaInput, DoorInput
+from .room_segmentation import RoomSegmentationResult, find_doors, segment_rooms
+
+_LOGGER = logging.getLogger(__name__)
+
+STORAGE_KEY_PREFIX = "roomba_plus_roomseg"
+_HA_STORE_VERSION = 1
+PAYLOAD_VERSION = 1
+
+# Must match GridStore's CELL_MM — kept as a separate constant rather than
+# importing grid_store.py, since this module takes the cell dict as a
+# plain argument (caller already has it) and shouldn't need to know
+# GridStore's internal layout to do so.
+CELL_MM = 150.0
+
+# Recompute gating: the pipeline is CPU-bound (~100ms-1.5s depending on
+# home size, see ROOM_SEGMENTATION_NOTES.md) — skip recomputation if the
+# grid has barely grown since last time, rather than re-running on every
+# single mission end.
+#: How many COMPLETED missions before rooms are derived at all.
+#:
+#: Three is a compromise, not a measurement. On this project's own data
+#: the room count was still moving at four missions and settled later,
+#: so three is early rather than safe -- but waiting longer means a new
+#: install shows no rooms for over a week, and a user who sees nothing
+#: assumes the feature is broken. Refining this needs more archives than
+#: one robot's.
+MIN_MISSIONS_BEFORE_SEGMENTING = 3
+
+MIN_NEW_CELLS_TO_RECOMPUTE = 30
+
+# A new room candidate is "the same" as an existing persisted room if
+# their cell sets overlap by at least this Jaccard ratio. Below this,
+# it's treated as a newly-discovered room.
+ROOM_MATCH_JACCARD = 0.30
+
+# ZoneStore migration (Stage 2): a SegRoom is considered "the same room"
+# as a ZoneStore zone if at least this fraction of the SegRoom's actual
+# cells fall within the zone's (EMA-approximated, less precise) bounding
+# box. Deliberately stricter than ROOM_MATCH_JACCARD above — ZoneStore's
+# bboxes are known to be imprecise (containment-trap merging, see
+# project history), so a generous-but-not-trivial threshold avoids
+# migrating a name onto the wrong room.
+MIGRATION_MATCH_THRESHOLD = 0.5
+
+# v3.2.1 STALE-ROOM CLEANUP — field-confirmed bug: a persisted room that
+# lost every match this round (see ROOM_MATCH_JACCARD above) is normally
+# kept forever, by design — GridStore cells can drop out of a recompute's
+# clusters from ordinary grid churn without the room having genuinely
+# disappeared. But when an unmatched room's ENTIRE former territory has
+# been reclaimed by a DIFFERENT room that WAS matched this round, that is
+# a different situation: the old room's cells now overlap a currently-
+# live room, not merely "absent this round". On a real OG this produced
+# a 122-cell phantom room 100% contained inside a 521-cell live room,
+# complete with 3 doors connecting the phantom to rooms it no longer
+# bordered anywhere. STALE_ABSORPTION_RATIO is the fraction of an
+# unmatched room's cells that must now belong to one single currently-
+# matched room before it's deleted as absorbed, rather than kept as
+# possibly-just-decayed. Conservative (0.8, not the whole cell set) so a
+# room that merely SHARES a large fringe with its neighbour after a
+# recompute boundary wobble isn't deleted — only near-total absorption is.
+STALE_ABSORPTION_RATIO = 0.8
+
+# v3.2.1 DOOR-DISTANCE-GATE — _match_doors previously kept exactly ONE
+# SegDoor per unordered room-pair, matched purely on which two rooms it
+# connects. In an open-plan layout, two rooms can share more than one
+# real doorway/opening; on a real OG two door observations for the same
+# pair measured 2.35 m and 1.96 m apart — almost certainly two distinct
+# physical openings, not sensor noise around one. A newly-detected
+# crossing only merges into an existing door of that pair if it falls
+# within this radius of it; otherwise it becomes a new, additional door
+# for the same pair. 800mm is comfortably larger than the largest
+# genuine single-doorway measurement jitter seen in the field data
+# (max spread among doors NOT suspected of being two openings: 765mm)
+# while remaining well under the two suspect pairs' 1956mm/2348mm gaps.
+DOOR_MERGE_DISTANCE_MM = 800.0
+
+# v3.2.1 BOUNDARY-HISTORY — rolling window of room-pair adjacency sets
+# across recomputes, for a future temporal-stability confidence signal.
+# Simulated (BFS-growth-approximated) end-to-end testing against real
+# field data showed NO effect versus the current single-snapshot
+# behaviour — every room-pair boundary was already 60-100% stable once
+# aggregated per pair, not per individual cell edge. Kept as cheap
+# scaffolding for re-evaluation once genuine multi-week recompute
+# history exists (the simulation could only approximate growth, not
+# replace real time), not because a benefit is expected here.
+MAX_BOUNDARY_HISTORY = 15
+
+#: TWO NAMED ROOMS ARE NEVER ONE AREA (4.5.0). When a recompute puts at
+#: least this share of each of two differently named rooms' cells into
+#: one area, the area is divided between them again. On the maintainer's
+#: 980 a mission carried back to the dock smeared the grid, the hall's
+#: area took in the next room, and that room's name was gone: the name
+#: only ever moves to an area that has none (_carry_name_on_absorption).
+NAMED_SPLIT_SHARE = 0.5
+
+#: A DOOR IS WHERE A PATH WENT THROUGH (4.5.0). Two areas touching is
+#: not enough: either side of a wall the robot cleans up to the wall,
+#: and its footprint marks cells a wall's width apart as neighbours. On
+#: the maintainer's 980 four of ten doors found that way were walls --
+#: and not one mission's path crossed any of the four, while each real
+#: door was crossed in at least one. A crossing counts once the robot
+#: was this many cells deep in the area it left and in the one it
+#: entered, so that a path along a boundary does not count.
+PASSAGE_DEPTH_CELLS = 3
+#: How far from a door a crossing of the same two areas may lie and still
+#: be that door's. The crossing is where the path entered the other area;
+#: the door is where the boundary is narrowest, which on a wide opening
+#: or a slanted boundary is a step or two away.
+PASSAGE_TO_DOOR_MM = 1200.0
+#: Mission keys kept per door as evidence it is driven.
+MAX_DRIVEN_BY = 20
+#: Crossings kept per door, for its direction and width (room_layout).
+MAX_CROSSINGS = 40
+#: Points over which the direction of a crossing is taken.
+DIRECTION_POINTS = 6
+
+#: An unmatched door is kept only while it still lies on the boundary of
+#: the two areas it connects (4.5.0), within this many cells of both. The
+#: areas move with every recompute; a door left where they used to touch
+#: is a door into a wall (the maintainer's 980: door_3).
+STALE_DOOR_REACH_CELLS = 2
+
+
+def area_number(room_id: str) -> str:
+    """The number an area is shown with: `room_3` -> `3`.
+
+    The Cleaning path map draws it on an area that has no name yet, and
+    the naming form labels that area's field with it, so the two can be
+    read side by side. The ids are this store's own; a robot without a
+    Smart Map keeps no map, so the iRobot app has nothing to match them
+    against.
+    """
+    return room_id.removeprefix("room_")
+
+
+@dataclass
+class SegRoom:
+    id: str
+    cells: set[tuple[int, int]] = field(default_factory=set)
+    name: str = ""
+    confirmed: bool = False
+    hidden: bool = False  # parity with ZoneStore.Zone.hidden (v1.7.0 L7)
+    recompute_count: int = 0  # ZoneStore-confidence equivalent — see `confidence`
+
+    @property
+    def area_m2(self) -> float:
+        return len(self.cells) * (CELL_MM / 1000.0) ** 2
+
+    @property
+    def confidence(self) -> float:
+        """0.0-1.0, grows with the number of recomputes this room has
+        survived a match through — same role and same /10 scaling as
+        ZoneStore.Zone.confidence (min(1.0, observations/10))."""
+        return min(1.0, self.recompute_count / 10.0)
+
+    @property
+    def bbox(self) -> tuple[float, float, float, float]:
+        """(x_min, x_max, y_min, y_max) in mm, dock-relative — computed
+        directly from the actual occupied cells, not an EMA approximation
+        like ZoneStore.Zone.bbox. Always exact for whatever cells this
+        room currently has, even though it isn't a rectangle."""
+        if not self.cells:
+            return (0.0, 0.0, 0.0, 0.0)
+        xs = [c[0] for c in self.cells]
+        ys = [c[1] for c in self.cells]
+        return (
+            min(xs) * CELL_MM, (max(xs) + 1) * CELL_MM,
+            min(ys) * CELL_MM, (max(ys) + 1) * CELL_MM,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "cells": [[x, y] for x, y in sorted(self.cells)],
+            "name": self.name,
+            "confirmed": self.confirmed,
+            "hidden": self.hidden,
+            "recompute_count": self.recompute_count,
+        }
+
+    @staticmethod
+    def from_dict(d: dict[str, Any]) -> SegRoom:
+        return SegRoom(
+            id=d["id"],
+            cells={(int(p[0]), int(p[1])) for p in d.get("cells", [])},
+            name=d.get("name", ""),
+            confirmed=bool(d.get("confirmed", False)),
+            hidden=bool(d.get("hidden", False)),
+            recompute_count=int(d.get("recompute_count", 0)),
+        )
+
+
+# Mirrors GeometryStore.DoorMarker's MAX_MARKER_OBSERVATIONS exactly —
+# same cap, same reasoning (bounded memory, recent-biased without a full
+# decay scheme).
+MAX_DOOR_OBSERVATIONS = 20
+
+
+@dataclass
+class SegDoor:
+    id: str
+    room_a: str
+    room_b: str
+    cell: tuple[int, int]
+    saddle_mm: float
+    cx: float = 0.0
+    cy: float = 0.0
+    observations: list[list[float]] = field(default_factory=list)
+    # observations stored as [[x_mm, y_mm], ...] — plain lists for JSON round-trip.
+    #: Diagnostics only (4.3.1): the opening at its widest and how much it
+    #: narrows the floor -- see room_segmentation.segment_rooms.
+    opening_mm: float = 0.0
+    constriction: float = 0.0
+    #: Keys of the missions whose path went through this door (4.5.0,
+    #: PASSAGE_DEPTH_CELLS). Empty: never driven, possibly a wall.
+    driven_by: list[str] = field(default_factory=list)
+    #: The crossings through it, [x_mm, y_mm, dx, dy] each (4.5.0): which
+    #: way the robot went through says which way the door runs, their
+    #: spread how wide it is (room_layout).
+    crossings: list[list[float]] = field(default_factory=list)
+
+    def note_crossings(self, crossings: list[list[float]]) -> None:
+        self.crossings.extend(crossings)
+        if len(self.crossings) > MAX_CROSSINGS:
+            self.crossings = self.crossings[-MAX_CROSSINGS:]
+
+    @property
+    def driven(self) -> bool:
+        return bool(self.driven_by)
+
+    def note_driven(self, mission_key: str) -> bool:
+        """Record a mission that went through; True if it is new."""
+        if mission_key in self.driven_by:
+            return False
+        self.driven_by.append(mission_key)
+        if len(self.driven_by) > MAX_DRIVEN_BY:
+            self.driven_by = self.driven_by[-MAX_DRIVEN_BY:]
+        return True
+
+    def update_position(self, cell: tuple[int, int]) -> None:
+        """Record this recompute's door-crossing cell and recompute the
+        median (cx, cy) in mm across recent observations.
+
+        Mirrors DoorMarker.update() exactly — the same median-of-recent-
+        observations approach that makes the position robust to a door
+        being at a different swing angle (and therefore a slightly
+        different measured crossing point) from one mission to the next,
+        rather than jumping to whatever the single latest recompute
+        happened to measure.
+        """
+        self.cell = cell
+        x_mm, y_mm = cell[0] * CELL_MM, cell[1] * CELL_MM
+        self.observations.append([x_mm, y_mm])
+        if len(self.observations) > MAX_DOOR_OBSERVATIONS:
+            self.observations = self.observations[-MAX_DOOR_OBSERVATIONS:]
+        self.cx = statistics.median(p[0] for p in self.observations)
+        self.cy = statistics.median(p[1] for p in self.observations)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "room_a": self.room_a,
+            "room_b": self.room_b,
+            "cell": [self.cell[0], self.cell[1]],
+            "saddle_mm": self.saddle_mm,
+            "cx": self.cx,
+            "cy": self.cy,
+            "observations": self.observations,
+            "opening_mm": self.opening_mm,
+            "constriction": self.constriction,
+            "driven_by": list(self.driven_by),
+            "crossings": [list(c) for c in self.crossings],
+        }
+
+    @staticmethod
+    def from_dict(d: dict[str, Any]) -> SegDoor:
+        return SegDoor(
+            id=d["id"],
+            room_a=d["room_a"],
+            room_b=d["room_b"],
+            cell=(int(d["cell"][0]), int(d["cell"][1])),
+            saddle_mm=float(d.get("saddle_mm", 0.0)),
+            cx=float(d.get("cx", 0.0)),
+            cy=float(d.get("cy", 0.0)),
+            observations=[[float(p[0]), float(p[1])] for p in d.get("observations", [])],
+            opening_mm=float(d.get("opening_mm", 0.0)),
+            constriction=float(d.get("constriction", 0.0)),
+            driven_by=[str(k) for k in d.get("driven_by") or []],
+            crossings=[
+                [float(v) for v in c]
+                for c in d.get("crossings") or []
+                if isinstance(c, list) and len(c) == 4
+            ],
+        )
+
+
+def _unordered_key(a: str, b: str) -> tuple[str, str]:
+    return (a, b) if a <= b else (b, a)
+
+
+class RoomSegStore:
+    def __init__(
+        self,
+        min_distance_cells: float = 8.0,
+        merge_ratio: float = 0.55,
+    ) -> None:
+        self._min_distance_cells = min_distance_cells
+        self._merge_ratio = merge_ratio
+        #: A segmentation is running in the executor (4.5.0).
+        self._segmenting = False
+        self._reset()
+
+    def _reset(self) -> None:
+        """Back to an empty store, keeping the tuning parameters.
+
+        Called from `__init__` and from the load path when a stored
+        payload will not parse -- a half-loaded store is worse than an
+        empty one.
+
+        This used to be `self.__init__()`, which **discarded
+        min_distance_cells and merge_ratio** and put them back to their
+        defaults. A store built with non-default tuning silently lost it
+        the first time a load failed.
+        """
+        self.rooms: dict[str, SegRoom] = {}
+        self.doors: list[SegDoor] = []
+        self.last_cell_count: int = 0
+        self._next_room_n: int = 1
+        self._next_door_n: int = 1
+        self.migrated_from_zonestore: bool = False
+        #: Whether any mission's path has been checked for door passages
+        #: (4.5.0). Until one has, nothing says which doors are walls, and
+        #: every door counts as driven (driven_doors).
+        self.path_evidence: bool = False
+        #: Counts every change to areas, names or doors (4.5.0), so that
+        #: what is derived from them (the room layout) is rebuilt only
+        #: then. Not stored.
+        self.revision: int = 0
+        # v3.2.1 BOUNDARY-HISTORY — see MAX_BOUNDARY_HISTORY docstring.
+        # Each entry: sorted list of [room_a, room_b] pairs adjacent
+        # (connected by a door) at that recompute.
+        self._boundary_history: deque[list[list[str]]] = deque(maxlen=MAX_BOUNDARY_HISTORY)
+
+    # ── Recompute ────────────────────────────────────────────────────────────
+
+    def maybe_recompute(
+        self,
+        cells: dict[tuple[int, int], float],
+        missions_seen: int | None = None,
+        paths: list[tuple[str, list[list[tuple[float, float]]]]] | None = None,
+    ) -> bool:
+        """Re-run segmentation if there is enough coverage to justify it.
+
+        TWO GATES, and only one of them existed.
+
+        The growth gate below stops needless recomputation once rooms
+        are known. It does nothing on the FIRST run, because `self.rooms`
+        is empty and the condition short-circuits -- so segmentation ran
+        after a single mission, on the sparsest map the robot will ever
+        produce.
+
+        That is the worst possible moment for this algorithm family.
+        Distance-transform-plus-watershed is measurably unstable on
+        incomplete coverage: an unvisited threshold is indistinguishable
+        from a wall, so it splits a room that is not split. More
+        missions cross the threshold and the false split disappears.
+
+        Observed on a real 980's own archives: 7 rooms after one
+        mission, 6 after four, 5 once coverage settled. A user saw seven
+        rooms appear as entities and two of them later vanish.
+
+        COMPLETED missions, not all of them. A run that ended early has
+        no perimeter pass -- the second phase of the coverage strategy,
+        where the robot traces obstacle outlines -- so its mask edge is
+        rougher and further from the real walls. Counting it towards
+        readiness would defeat the point of waiting.
+
+        `missions_seen=None` keeps the old behaviour for callers that
+        cannot count, rather than silently blocking them forever.
+
+        MISSIONS THE GRID LEARNED FROM, not the robot's lifetime (4.5.0).
+        The caller passes GridStore.missions_learned. The mission store's
+        count of completed runs never starts again: after the grid was
+        emptied the maintainer's 980 had hundreds, and its areas were cut
+        from the first mission -- one carried back to the dock.
+
+        `paths`: the recent learned missions' paths, (key, runs of
+        points), checked for door passages against the new areas -- see
+        note_paths().
+        """
+        if not self._should_recompute(cells, missions_seen):
+            return False
+        self._recompute(cells)
+        self.last_cell_count = len(cells)
+        if paths:
+            self.note_paths(paths)
+        return True
+
+    async def async_maybe_recompute(
+        self,
+        hass: HomeAssistant,
+        cells: dict[tuple[int, int], float],
+        missions_seen: int | None = None,
+        paths: list[tuple[str, list[list[tuple[float, float]]]]] | None = None,
+    ) -> bool:
+        """maybe_recompute() with the segmentation in the executor (4.5.0).
+
+        The watershed pipeline is pure and CPU-bound -- about 0.1 s on a
+        real 980 grid, about 1.5 s on a large home -- and ran on the
+        event loop. Everything that touches this store stays on the
+        loop: the gates, matching the new areas to the known rooms, the
+        doors and the path evidence. The executor gets a copy of the
+        cells, so the grid can change meanwhile without the segmentation
+        reading a dict being written.
+
+        One at a time: a second call while one runs returns False, and
+        the next mission end tries again.
+        """
+        if self._segmenting or not self._should_recompute(cells, missions_seen):
+            return False
+        snapshot = dict(cells)
+        self._segmenting = True
+        try:
+            result = await hass.async_add_executor_job(self._segment, snapshot)
+        finally:
+            self._segmenting = False
+        self._apply_segmentation(result)
+        self.last_cell_count = len(snapshot)
+        if paths:
+            self.note_paths(paths)
+        return True
+
+    def _should_recompute(
+        self, cells: dict[tuple[int, int], float], missions_seen: int | None
+    ) -> bool:
+        """The two gates described in maybe_recompute()."""
+        if (
+            not self.rooms
+            and missions_seen is not None
+            and missions_seen < MIN_MISSIONS_BEFORE_SEGMENTING
+        ):
+            return False
+        if self.rooms and not self._grid_changed(cells):
+            return False
+        return bool(cells)
+
+    def _grid_changed(self, cells: dict[tuple[int, int], float]) -> bool:
+        """Whether the grid moved far enough from the areas to recompute.
+
+        GROWTH WAS THE ONLY MEASURE, and the grid also shrinks: cells
+        nothing visits again decay and are pruned. A grid that had once
+        been larger never grew past its old count again, and the areas
+        stayed as drawn from it. On the maintainer's own 980 they held
+        5817 cells over a grid of 3056: half the map on screen was floor
+        the grid no longer had, and nothing recomputed for weeks (4.3.2).
+
+        So: the count moved by the threshold either way, or the grid
+        holds that many cells no area has (new floor, or cells that
+        replaced pruned ones at an unchanged count). Right after a
+        recompute both are zero: the areas cover the grid exactly.
+        """
+        if abs(len(cells) - self.last_cell_count) >= MIN_NEW_CELLS_TO_RECOMPUTE:
+            return True
+        held: set[tuple[int, int]] = set()
+        for room in self.rooms.values():
+            held |= room.cells
+        return len(cells.keys() - held) >= MIN_NEW_CELLS_TO_RECOMPUTE
+
+    def _recompute(self, cells: dict[tuple[int, int], float]) -> None:
+        self._apply_segmentation(self._segment(cells))
+
+    def _segment(self, cells: dict[tuple[int, int], float]) -> RoomSegmentationResult:
+        """The pure, CPU-bound part; safe in the executor. Reads only the
+        two tuning values, which nothing changes after construction."""
+        return segment_rooms(
+            cells,
+            cell_mm=CELL_MM,
+            min_distance_cells=self._min_distance_cells,
+            merge_ratio=self._merge_ratio,
+        )
+
+    def _apply_segmentation(self, result: RoomSegmentationResult) -> None:
+        """Take a segmentation into the store. On the event loop."""
+        self.revision += 1
+        result = self._keep_named_apart(result)
+        label_to_id = self._match_rooms(result)
+        self._match_doors(result, label_to_id)
+        # v3.2.1 BOUNDARY-HISTORY — snapshot this recompute's room-pair
+        # adjacency (from the just-updated door list) into the rolling
+        # window. See MAX_BOUNDARY_HISTORY docstring for status.
+        pairs = sorted({_unordered_key(d.room_a, d.room_b) for d in self.doors})
+        self._boundary_history.append([[a, b] for a, b in pairs])
+
+    def _keep_named_apart(
+        self, result: RoomSegmentationResult
+    ) -> RoomSegmentationResult:
+        """Divide an area that took in two differently named rooms.
+
+        See NAMED_SPLIT_SHARE. The named rooms' own cells in the area
+        stay theirs; every other cell of it goes to the nearest of them,
+        stepping through the area itself. Several areas with ONE name are
+        one room by the user's choice and are not divided.
+        """
+        named: dict[str, set[tuple[int, int]]] = {}
+        for room in self.rooms.values():
+            if room.confirmed and room.name and room.cells:
+                named.setdefault(room.name, set()).update(room.cells)
+        if len(named) < 2:
+            return result
+        rooms = {label: set(cells) for label, cells in result.rooms.items()}
+        next_label = max(rooms, default=-1) + 1
+        divided = False
+        for label in list(rooms):
+            cells = rooms[label]
+            holders = [
+                name for name, own in named.items()
+                if len(own & cells) >= NAMED_SPLIT_SHARE * len(own)
+            ]
+            if len(holders) < 2:
+                continue
+            parts = _divide_by_seeds(
+                cells, [named[name] & cells for name in holders]
+            )
+            _LOGGER.info(
+                "RoomSegStore: kept %d named rooms apart that one area took in",
+                len(holders),
+            )
+            rooms[label] = parts[0]
+            for part in parts[1:]:
+                rooms[next_label] = part
+                next_label += 1
+            divided = True
+        if not divided:
+            return result
+        field_ = result.dist_smooth or result.dist
+        return RoomSegmentationResult(
+            rooms=rooms,
+            doors=find_doors(rooms, field_, CELL_MM),
+            dist=result.dist,
+            seeds=result.seeds,
+            dist_smooth=result.dist_smooth,
+        )
+
+    # ── Door passages ────────────────────────────────────────────────────────
+
+    @property
+    def driven_doors(self) -> list[SegDoor]:
+        """The doors a mission's path went through (4.5.0).
+
+        Every door until any path has been checked: without evidence, a
+        door is not taken for a wall.
+        """
+        if not self.path_evidence:
+            return list(self.doors)
+        return [d for d in self.doors if d.driven]
+
+    def note_paths(
+        self, paths: list[tuple[str, list[list[tuple[float, float]]]]]
+    ) -> int:
+        """Mark the doors these missions' paths went through.
+
+        `paths`: (mission key, runs of (x_mm, y_mm) points). Each run is
+        one stretch whose positions hang together; nothing is counted
+        across the gap between two. Returns how many door/mission pairs
+        were new.
+        """
+        if not paths:
+            return 0
+        self.path_evidence = True
+        room_of: dict[tuple[int, int], str] = {}
+        for rid, room in self.rooms.items():
+            for c in room.cells:
+                room_of[c] = rid
+        depth = _depth_from_boundaries(room_of)
+        by_pair: dict[tuple[str, str], list[SegDoor]] = {}
+        for door in self.doors:
+            by_pair.setdefault(
+                _unordered_key(door.room_a, door.room_b), []
+            ).append(door)
+        added = 0
+        for key, runs in paths:
+            through: dict[str, tuple[SegDoor, list[list[float]]]] = {}
+            for pair, (gx, gy), vector in _passages(runs, room_of, depth):
+                best, best_d = None, None
+                for door in by_pair.get(pair, []):
+                    d = math.hypot(door.cx - gx * CELL_MM, door.cy - gy * CELL_MM)
+                    if best_d is None or d < best_d:
+                        best, best_d = door, d
+                if best is not None and best_d is not None and best_d <= PASSAGE_TO_DOOR_MM:
+                    through.setdefault(best.id, (best, []))[1].append(vector)
+            for door, vectors in through.values():
+                # Once per mission: a window of missions is checked again
+                # at every recompute.
+                if door.note_driven(key):
+                    door.note_crossings(vectors)
+                    added += 1
+        if added:
+            self.revision += 1
+        return added
+
+    def layout_inputs(self) -> tuple[list[AreaInput], list[DoorInput]]:
+        """The areas and driven doors as room_layout takes them (4.5.0).
+
+        An area is its room by name once it has one: several areas under
+        one name are one room. Hidden areas are no room anyone wants.
+        """
+        key_of: dict[str, str] = {}
+        areas: list[AreaInput] = []
+        for room in self.rooms.values():
+            if room.hidden or not room.cells:
+                continue
+            key = room.name if (room.confirmed and room.name) else room.id
+            key_of[room.id] = key
+            areas.append(AreaInput(key=key, cells=frozenset(room.cells)))
+        doors: list[DoorInput] = []
+        for door in self.driven_doors:
+            a, b = key_of.get(door.room_a), key_of.get(door.room_b)
+            if a is None or b is None or a == b:
+                continue
+            doors.append(DoorInput(
+                room_a=a, room_b=b, cx=door.cx, cy=door.cy,
+                crossings=tuple(
+                    (c[0], c[1], c[2], c[3]) for c in door.crossings
+                ),
+            ))
+        return areas, doors
+
+    def _door_at_boundary(self, door: SegDoor) -> bool:
+        """Whether a door still lies where its two areas meet."""
+        a = self.rooms.get(door.room_a)
+        b = self.rooms.get(door.room_b)
+        if a is None or b is None:
+            return False
+        gx = int(math.floor(door.cx / CELL_MM))
+        gy = int(math.floor(door.cy / CELL_MM))
+        reach = STALE_DOOR_REACH_CELLS
+        near = {
+            (gx + dx, gy + dy)
+            for dx in range(-reach, reach + 1)
+            for dy in range(-reach, reach + 1)
+        }
+        return bool(near & a.cells) and bool(near & b.cells)
+
+    def _match_rooms(self, result: RoomSegmentationResult) -> dict[int, str]:
+        """Match each new cluster (keyed by its segment_rooms() integer
+        label) to an existing persisted room id, or assign a fresh one.
+        Returns the label -> persisted-id mapping (used by _match_doors)."""
+        matched_existing: set[str] = set()
+        #: Rooms this round created. They are 100% inside one of this
+        #: round's clusters by construction, so the staleness check
+        #: below would delete every one of them immediately.
+        created_this_round: set[str] = set()
+        label_to_id: dict[int, str] = {}
+
+        # Match in descending cluster-size order: bigger, more confident
+        # clusters claim their best-matching existing room first.
+        labels_by_size = sorted(result.rooms.keys(), key=lambda lbl: -len(result.rooms[lbl]))
+
+        for label in labels_by_size:
+            new_cells = result.rooms[label]
+            best_id, best_ratio = None, 0.0
+            for rid, room in self.rooms.items():
+                if rid in matched_existing:
+                    continue
+                inter = len(new_cells & room.cells)
+                if inter == 0:
+                    continue
+                union = len(new_cells | room.cells)
+                ratio = inter / union if union else 0.0
+                if ratio > best_ratio:
+                    best_ratio, best_id = ratio, rid
+            if best_id is not None and best_ratio >= ROOM_MATCH_JACCARD:
+                label_to_id[label] = best_id
+                matched_existing.add(best_id)
+                self.rooms[best_id].cells = set(new_cells)
+                self.rooms[best_id].recompute_count += 1
+            else:
+                rid = f"room_{self._next_room_n}"
+                self._next_room_n += 1
+                self.rooms[rid] = SegRoom(id=rid, cells=set(new_cells))
+                created_this_round.add(rid)
+                label_to_id[label] = rid
+
+        # v3.2.1 STALE-ROOM CLEANUP — see STALE_ABSORPTION_RATIO docstring
+        # above. Runs AFTER matching so `self.rooms[mid].cells` already
+        # reflects THIS round's freshly-matched cell sets, not last
+        # round's. Deletion happens before _match_doors runs (called
+        # right after this method in _recompute()), so the existing
+        # "both connected rooms still exist" door-preservation guard in
+        # _match_doors automatically drops any door that pointed at a
+        # room deleted here — no separate cascade-delete needed.
+        #
+        # v3.2.1 FIELD FIX — generalised from "one single absorber
+        # reaches the ratio" to "the UNION of everything absorbed by
+        # matched rooms reaches the ratio". Field-confirmed gap in the
+        # original single-absorber version: a real post-3.2.1 recompute
+        # produced a room 100% claimed elsewhere but split across THREE
+        # different matched rooms (72.7% / 10.0% / 17.2%) — no single
+        # absorber crossed 80%, so the original `any(...)` check missed
+        # a case that was, in aggregate, exactly as stale as the
+        # original single-absorber room_7 case this cleanup was built
+        # for. Union (not sum) of the per-absorber overlaps, in case a
+        # cell were ever double-claimed by two matched rooms at once
+        # (shouldn't happen post-recompute, but a union costs nothing
+        # extra and is correct either way).
+        stale_ids = []
+        for rid, room in self.rooms.items():
+            if (
+                rid in matched_existing
+                or rid in created_this_round
+                or not room.cells
+            ):
+                continue
+            # EVERY NEW CLUSTER, not only the matched ones.
+            #
+            # `maybe_recompute()` is handed `grid_store.cells` -- the
+            # whole cumulative visited grid, not one mission's slice. So
+            # a room that fails to match was NOT unobserved: its cells
+            # were in the input and the segmentation chose to divide
+            # them differently. It is refuted, not merely unseen.
+            #
+            # Checking only matched rooms missed the case where those
+            # cells are now spread across clusters that are themselves
+            # new -- none of them absorbs 80%, so nothing absorbs 80%,
+            # and the old room survives forever.
+            #
+            # Field evidence (R980040, 445 missions): four rooms with
+            # `recompute_count == 0` and 931 cells between them, never
+            # once re-recognised. Total room cells 8814 against a grid
+            # of 6614 -- a third of the room list was stale.
+            #
+            # This is the same widening as the v3.2.1 fix below, one
+            # step further: from "one absorber" to "all matched rooms"
+            # to "all of this round's output".
+            absorbed = set()
+            for mid in matched_existing:
+                absorbed |= (room.cells & self.rooms[mid].cells)
+            for new_cells in result.rooms.values():
+                absorbed |= (room.cells & new_cells)
+            if len(absorbed) / len(room.cells) >= STALE_ABSORPTION_RATIO:
+                stale_ids.append(rid)
+        for rid in stale_ids:
+            self._carry_name_on_absorption(
+                self.rooms[rid], matched_existing | created_this_round
+            )
+            _LOGGER.debug(
+                "RoomSegStore: deleting %s — %d cells absorbed into another room",
+                rid, len(self.rooms[rid].cells),
+            )
+            del self.rooms[rid]
+
+        self._settle_unmatched(matched_existing | created_this_round)
+        return label_to_id
+
+    def _settle_unmatched(self, live_ids: set[str]) -> None:
+        """What happens to an area this round neither matched nor absorbed.
+
+        It is one the grid has largely lost. Until 4.3.2 it was kept
+        whole: its old cells, drawn over the areas that now cover the
+        same floor, and over floor the grid no longer has at all. On the
+        maintainer's 980 a recompute kept all eleven old areas and added
+        four new ones on top.
+
+        - CELLS ANOTHER AREA NOW COVERS are that area's. An area is
+          never drawn twice.
+        - AN UNNAMED AREA GOES. Nothing is lost: if its floor comes back
+          it comes back as an area, as it first did.
+        - A NAMED OR HIDDEN AREA STAYS with what is left: the floor
+          behind a door kept shut for two weeks decays like any other,
+          and the room keeps its name and its place until the robot is
+          back. The user named or hid it; only the user removes it.
+        """
+        claimed: set[tuple[int, int]] = set()
+        for lid in live_ids:
+            room = self.rooms.get(lid)
+            if room is not None:
+                claimed |= room.cells
+        for rid in [r for r in self.rooms if r not in live_ids]:
+            room = self.rooms[rid]
+            room.cells -= claimed
+            kept = room.hidden or (room.confirmed and bool(room.name))
+            if room.cells and kept:
+                continue
+            _LOGGER.debug(
+                "RoomSegStore: removing %s -- the grid no longer has its floor",
+                rid,
+            )
+            del self.rooms[rid]
+
+    def _carry_name_on_absorption(self, gone: SegRoom, live_ids: set[str]) -> None:
+        """A name the user gave is not deleted with the area that held it.
+
+        When a recompute divides the floor differently, an area can be
+        absorbed by another -- most often an unnamed one this round
+        created, which then asked to be named again (a tester's 980, where
+        his kitchen and dining room are several areas each). The name
+        goes to whichever live area took most of the old one's cells, if
+        that area has none of its own. An area with its own name keeps
+        it; the old name is logged, not lost silently. Hidden is not
+        carried: hiding a real room because a phantom overlapped it would
+        be worse than showing the phantom's replacement.
+        """
+        if not (gone.confirmed and gone.name):
+            return
+        best_id, best_overlap = None, 0
+        for lid in live_ids:
+            live = self.rooms.get(lid)
+            if live is None:
+                continue
+            overlap = len(gone.cells & live.cells)
+            if overlap > best_overlap:
+                best_id, best_overlap = lid, overlap
+        if best_id is None:
+            return
+        heir = self.rooms[best_id]
+        if heir.confirmed and heir.name:
+            if heir.name != gone.name:
+                _LOGGER.info(
+                    "RoomSegStore: area named %r merged into %r, which keeps its name",
+                    gone.name, heir.name,
+                )
+            return
+        heir.name = gone.name
+        heir.confirmed = True
+
+    def _match_doors(
+        self, result: RoomSegmentationResult, label_to_id: dict[int, str]
+    ) -> None:
+        # v3.2.1 DOOR-DISTANCE-GATE — see DOOR_MERGE_DISTANCE_MM docstring.
+        # Was dict[pair, SegDoor] (exactly one door per pair); now
+        # dict[pair, list[SegDoor]] so genuinely distinct openings between
+        # the same two rooms (open-plan layouts) can coexist.
+        existing_by_pair: dict[tuple[str, str], list[SegDoor]] = {}
+        for d in self.doors:
+            existing_by_pair.setdefault(_unordered_key(d.room_a, d.room_b), []).append(d)
+
+        matched_door_ids: set[str] = set()
+        new_doors: list[SegDoor] = []
+        # `raw`, NOT `d`: the loop above binds `d` to a SegDoor and
+        # this one to a raw dict from the segmenter. One name for
+        # two shapes made every subscript below look like an error
+        # on the dataclass.
+        for raw in result.doors:
+            room_a = label_to_id.get(raw["a"])
+            room_b = label_to_id.get(raw["b"])
+            if room_a is None or room_b is None:
+                continue
+            key = _unordered_key(room_a, room_b)
+            new_x_mm, new_y_mm = raw["cell"][0] * CELL_MM, raw["cell"][1] * CELL_MM
+
+            # Find the CLOSEST existing door of this pair, if any is
+            # within DOOR_MERGE_DISTANCE_MM — closest, not first, so a
+            # pair with two existing doors merges into whichever one this
+            # detection actually belongs to.
+            best_existing, best_dist = None, None
+            for existing in existing_by_pair.get(key, []):
+                dist = ((existing.cx - new_x_mm) ** 2 + (existing.cy - new_y_mm) ** 2) ** 0.5
+                if best_dist is None or dist < best_dist:
+                    best_existing, best_dist = existing, dist
+
+            if (
+                best_existing is not None
+                and best_dist is not None
+                and best_dist <= DOOR_MERGE_DISTANCE_MM
+            ):
+                best_existing.update_position(raw["cell"])
+                best_existing.saddle_mm = raw["saddle_mm"]
+                best_existing.opening_mm = float(raw.get("opening_mm", 0.0))
+                best_existing.constriction = float(raw.get("constriction", 0.0))
+                matched_door_ids.add(best_existing.id)
+                new_doors.append(best_existing)
+            else:
+                door = SegDoor(
+                    id=f"door_{self._next_door_n}",
+                    room_a=room_a, room_b=room_b,
+                    cell=raw["cell"], saddle_mm=raw["saddle_mm"],
+                    opening_mm=float(raw.get("opening_mm", 0.0)),
+                    constriction=float(raw.get("constriction", 0.0)),
+                )
+                door.update_position(raw["cell"])
+                self._next_door_n += 1
+                matched_door_ids.add(door.id)
+                new_doors.append(door)
+
+        # Mirror the room-preservation policy (module docstring + see
+        # test_unmatched_existing_room_is_kept_not_deleted): a door whose
+        # room pair wasn't re-detected this round is NOT auto-deleted.
+        # GridStore decays/prunes low-traffic cells every mission (see
+        # grid_store.py) — a narrow, infrequently-crossed doorway can
+        # drop out of the visited-cell set for one recompute without
+        # having genuinely stopped existing. Wiping the door in that
+        # case loses its entire `observations` history and stable `id`,
+        # defeating the point of update_position()'s median smoothing.
+        # Kept only while both connected rooms still exist — rooms ARE
+        # now auto-deleted on absorption (v3.2.1 STALE-ROOM CLEANUP,
+        # _match_rooms above), which is exactly the case this guard
+        # exists to cascade into: a door pointing at a just-deleted
+        # phantom room is dropped here, no separate cleanup needed.
+        #
+        # AND ONLY WHERE THE TWO AREAS STILL MEET (4.5.0). Both areas
+        # existing was the whole test, so a door stayed where the areas
+        # once touched after the boundary had moved: on the maintainer's
+        # 980, door_3 into what had become a wall.
+        for door in self.doors:
+            if (
+                door.id not in matched_door_ids
+                and self._door_at_boundary(door)
+            ):
+                new_doors.append(door)
+
+        self.doors = new_doors
+
+    def migrate_from_zone_store(self, zones: list[Any]) -> int:
+        """One-time migration of names/confirmed/hidden from ZoneStore's
+        zones into matching SegRooms, by bounding-box overlap.
+
+        Takes a plain list of zone-like objects (duck-typed: needs
+        .x_min/.x_max/.y_min/.y_max/.name/.confirmed/.hidden) rather than
+        importing ZoneStore directly, keeping the two stores decoupled —
+        the caller (typically __init__.py's setup flow) already has both.
+
+        Guarded by self.migrated_from_zonestore so this only ever runs
+        once per store: re-running on every load would silently overwrite
+        a user's RoomSegStore-side renames with stale ZoneStore data after
+        the fact, which is exactly the kind of silent-overwrite this
+        module's docstring already promises never happens for room
+        identity in general.
+
+        Only migrates zones the user actually confirmed/named in
+        ZoneStore — there is nothing useful to carry over from an
+        unconfirmed, auto-generated zone name. Each zone is matched to
+        whichever SegRoom has the highest fraction of its OWN cells
+        falling inside that zone's bounding box; below
+        MIGRATION_MATCH_THRESHOLD, no migration happens for that zone.
+
+        Returns the number of rooms that received migrated data.
+        """
+        if self.migrated_from_zonestore:
+            return 0
+        self.migrated_from_zonestore = True  # one-shot attempt, even if 0 zones match well enough
+
+        migrated = 0
+        for zone in zones:
+            if not getattr(zone, "confirmed", False):
+                continue
+            x_min = getattr(zone, "x_min", 0.0) / CELL_MM
+            x_max = getattr(zone, "x_max", 0.0) / CELL_MM
+            y_min = getattr(zone, "y_min", 0.0) / CELL_MM
+            y_max = getattr(zone, "y_max", 0.0) / CELL_MM
+
+            best_room, best_frac = None, 0.0
+            for room in self.rooms.values():
+                if not room.cells:
+                    continue
+                inside = sum(
+                    1 for (gx, gy) in room.cells
+                    if x_min <= gx < x_max and y_min <= gy < y_max
+                )
+                frac = inside / len(room.cells)
+                if frac > best_frac:
+                    best_frac, best_room = frac, room
+
+            if best_room is not None and best_frac >= MIGRATION_MATCH_THRESHOLD:
+                best_room.name = getattr(zone, "name", best_room.name)
+                best_room.confirmed = True
+                best_room.hidden = getattr(zone, "hidden", False)
+                migrated += 1
+
+        return migrated
+
+    # ── User edits ───────────────────────────────────────────────────────────
+    # Method names/behaviour mirror ZoneStore's rename_zone/hide_zone/
+    # unhide_zone exactly (same "rename also confirms" semantics) so a
+    # later consumer swap (select.py, config_flow.py) is a mechanical
+    # rename of the call site, not a behaviour change.
+
+    def rename_room(self, room_id: str, name: str) -> bool:
+        """Rename a room and mark it confirmed. Returns True if found."""
+        room = self.rooms.get(room_id)
+        if room is None:
+            return False
+        room.name = name.strip()
+        room.confirmed = True
+        self.revision += 1
+        return True
+
+    def hide_room(self, room_id: str) -> bool:
+        """Set room.hidden = True. Removes from selectors and repair issues."""
+        room = self.rooms.get(room_id)
+        if room is None:
+            return False
+        room.hidden = True
+        self.revision += 1
+        return True
+
+    def unhide_room(self, room_id: str) -> bool:
+        """Set room.hidden = False, restoring it to selectors."""
+        room = self.rooms.get(room_id)
+        if room is None:
+            return False
+        room.hidden = False
+        self.revision += 1
+        return True
+
+    def confirm_room(self, room_id: str) -> bool:
+        """Mark a room confirmed without renaming it."""
+        room = self.rooms.get(room_id)
+        if room is None:
+            return False
+        room.confirmed = True
+        return True
+
+    # ── Diagnostics ──────────────────────────────────────────────────────────
+
+    @property
+    def unconfirmed_rooms(self) -> list[SegRoom]:
+        """Rooms detected but not yet named by the user.
+
+        Hidden rooms are excluded — no repair issue fires for hidden rooms.
+        Mirrors ZoneStore.unconfirmed_zones exactly.
+        """
+        return [r for r in self.rooms.values() if not r.confirmed and not r.hidden]
+
+    @property
+    def has_unconfirmed_rooms(self) -> bool:
+        return bool(self.unconfirmed_rooms)
+
+    def diagnostic_info(
+        self, grid_cell_count: int | None = None
+    ) -> dict[str, Any]:
+        return {
+            "room_count": len(self.rooms),
+            "door_count": len(self.doors),
+            "driven_door_count": len(self.driven_doors),
+            "path_evidence": self.path_evidence,
+            "last_cell_count": self.last_cell_count,
+            "rooms": [
+                {
+                    "id": r.id, "name": r.name, "confirmed": r.confirmed,
+                    "hidden": r.hidden, "confidence": round(r.confidence, 2),
+                    "cell_count": len(r.cells), "area_m2": round(r.area_m2, 1),
+                    "bbox_mm": [round(v) for v in r.bbox],
+                }
+                for r in self.rooms.values()
+            ],
+            "doors": [
+                {
+                    "id": d.id, "room_a": d.room_a, "room_b": d.room_b,
+                    "saddle_mm": round(d.saddle_mm, 0),
+                    "opening_mm": round(d.opening_mm, 0),
+                    "constriction": round(d.constriction, 2),
+                    "cx": round(d.cx), "cy": round(d.cy),
+                    "observation_count": len(d.observations),
+                    "driven_by_missions": len(d.driven_by),
+                }
+                for d in self.doors
+            ],
+        }
+
+    # ── Persistence ──────────────────────────────────────────────────────────
+
+    async def async_load(self, hass: HomeAssistant, entry_id: str) -> None:
+        store: Store[dict[str, Any]] = Store(hass, _HA_STORE_VERSION, f"{STORAGE_KEY_PREFIX}_{entry_id}")
+        data: dict[str, Any] | None = await store.async_load()
+        if not data:
+            _LOGGER.debug("RoomSegStore: no persisted data for %s", entry_id)
+            return
+        if data.get("version", 0) != PAYLOAD_VERSION:
+            _LOGGER.warning(
+                "RoomSegStore: incompatible storage version %s for %s, starting clean",
+                data.get("version"), entry_id,
+            )
+            return
+        try:
+            self.rooms = {
+                d["id"]: SegRoom.from_dict(d) for d in data.get("rooms", [])
+            }
+            self.doors = [SegDoor.from_dict(d) for d in data.get("doors", [])]
+            self.last_cell_count = int(data.get("last_cell_count", 0))
+            self._next_room_n = int(data.get("next_room_n", 1))
+            self._next_door_n = int(data.get("next_door_n", 1))
+            self.migrated_from_zonestore = bool(data.get("migrated_from_zonestore", False))
+            self.path_evidence = bool(data.get("path_evidence", False))
+            # v3.2.1 BOUNDARY-HISTORY — additive field, same no-version-
+            # bump precedent as GridStore's FURNITURE/DUAL-GRID fields: a
+            # payload saved before this existed simply has no key, which
+            # is indistinguishable from a fresh cold start for this
+            # tracker specifically.
+            raw_history = data.get("boundary_history") or []
+            self._boundary_history = deque(
+                (
+                    [[str(a), str(b)] for a, b in entry]
+                    for entry in raw_history
+                    if isinstance(entry, list)
+                ),
+                maxlen=MAX_BOUNDARY_HISTORY,
+            )
+            _LOGGER.debug(
+                "RoomSegStore: loaded %d rooms, %d doors for %s",
+                len(self.rooms), len(self.doors), entry_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("RoomSegStore: failed to load data for %s: %s", entry_id, exc)
+            self._reset()
+
+    def _boundary_stability(self, room_a: str, room_b: str) -> float:
+        """v3.2.1 — fraction of the boundary-history window in which
+        (room_a, room_b) appeared as an adjacent (door-connected) pair.
+        1.0 if history is empty (nothing to contradict stability yet).
+        Not yet consumed anywhere — scaffolding, see MAX_BOUNDARY_HISTORY.
+        """
+        if not self._boundary_history:
+            return 1.0
+        key = list(_unordered_key(room_a, room_b))
+        hits = sum(1 for entry in self._boundary_history if key in entry)
+        return hits / len(self._boundary_history)
+
+    async def async_save(self, hass: HomeAssistant, entry_id: str) -> None:
+        store: Store[dict[str, Any]] = Store(hass, _HA_STORE_VERSION, f"{STORAGE_KEY_PREFIX}_{entry_id}")
+        await store.async_save({
+            "version": PAYLOAD_VERSION,
+            "rooms": [r.to_dict() for r in self.rooms.values()],
+            "doors": [d.to_dict() for d in self.doors],
+            "last_cell_count": self.last_cell_count,
+            "next_room_n": self._next_room_n,
+            "next_door_n": self._next_door_n,
+            "migrated_from_zonestore": self.migrated_from_zonestore,
+            "path_evidence": self.path_evidence,
+            "boundary_history": list(self._boundary_history),
+        })
+        _LOGGER.debug(
+            "RoomSegStore: saved %d rooms, %d doors for %s",
+            len(self.rooms), len(self.doors), entry_id,
+        )
+
+
+_NEIGHBOURS_8 = (
+    (-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1),
+)
+
+
+def _divide_by_seeds(
+    cells: set[tuple[int, int]], seeds: list[set[tuple[int, int]]]
+) -> list[set[tuple[int, int]]]:
+    """Divide `cells` among the seeds: each cell to the seed it is fewest
+    steps from inside `cells`. A cell no seed reaches goes to the
+    largest part, so nothing is lost."""
+    owner: dict[tuple[int, int], int] = {}
+    queue: deque[tuple[int, int]] = deque()
+    for i, seed in enumerate(seeds):
+        for c in seed:
+            if c in cells and c not in owner:
+                owner[c] = i
+                queue.append(c)
+    while queue:
+        c = queue.popleft()
+        for dx, dy in _NEIGHBOURS_8:
+            n = (c[0] + dx, c[1] + dy)
+            if n in cells and n not in owner:
+                owner[n] = owner[c]
+                queue.append(n)
+    parts: list[set[tuple[int, int]]] = [set() for _ in seeds]
+    for c, i in owner.items():
+        parts[i].add(c)
+    rest = cells - owner.keys()
+    if rest:
+        max(parts, key=len).update(rest)
+    return [p for p in parts if p]
+
+
+def _depth_from_boundaries(
+    room_of: dict[tuple[int, int], str],
+) -> dict[tuple[int, int], int]:
+    """Steps from each cell to the nearest cell of another area."""
+    depth: dict[tuple[int, int], int] = {}
+    queue: deque[tuple[int, int]] = deque()
+    for c, rid in room_of.items():
+        for dx, dy in _NEIGHBOURS_8:
+            other = room_of.get((c[0] + dx, c[1] + dy))
+            if other is not None and other != rid:
+                depth[c] = 0
+                queue.append(c)
+                break
+    while queue:
+        c = queue.popleft()
+        for dx, dy in _NEIGHBOURS_8:
+            n = (c[0] + dx, c[1] + dy)
+            if n not in depth and room_of.get(n) == room_of[c]:
+                depth[n] = depth[c] + 1
+                queue.append(n)
+    return depth
+
+
+def _passages(
+    runs: list[list[tuple[float, float]]],
+    room_of: dict[tuple[int, int], str],
+    depth: dict[tuple[int, int], int],
+) -> list[tuple[tuple[str, str], tuple[int, int], list[float]]]:
+    """Where a path went from deep in one area to deep in another.
+
+    Each crossing as (area pair, the cell where the path entered the
+    area it went on to, [x, y, dx, dy] of the step that entered it). An
+    area with no boundary to another has no depth entry and counts as
+    deep throughout.
+    """
+    out: list[tuple[tuple[str, str], tuple[int, int], list[float]]] = []
+    for run in runs:
+        room: str | None = None
+        entered: tuple[tuple[int, int], str, list[float]] | None = None
+        # The way it went, over the last few points: a single step of a
+        # few centimetres says little about the direction.
+        recent: deque[tuple[float, float]] = deque(maxlen=DIRECTION_POINTS)
+        for x, y in run:
+            recent.append((x, y))
+            step = [x, y, x - recent[0][0], y - recent[0][1]]
+            c = (int(math.floor(x / CELL_MM)), int(math.floor(y / CELL_MM)))
+            rid = room_of.get(c)
+            if rid is None:
+                continue
+            if room is not None and rid != room and (
+                entered is None or entered[1] != rid
+            ):
+                entered = (c, rid, step)
+            if depth.get(c, PASSAGE_DEPTH_CELLS) >= PASSAGE_DEPTH_CELLS:
+                if (
+                    room is not None
+                    and rid != room
+                    and entered is not None
+                    and entered[1] == rid
+                ):
+                    out.append((_unordered_key(room, rid), entered[0], entered[2]))
+                room = rid
+                entered = None
+    return out
+

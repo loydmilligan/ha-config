@@ -1,0 +1,3641 @@
+"""Room-targeted cleaning, for both robot generations.
+
+WHY A FACADE RATHER THAN A BRANCH IN services.py.
+
+Four services clean named rooms: clean_room, clean_overdue_rooms,
+auto_clean_dirty_rooms and smart_start. All four ask the same two
+questions -- "what rooms exist and what are they called" and "clean
+these rooms" -- and both generations can answer both.
+
+They just answer differently. Classic reads regions off its cloud
+coordinator and sends pmap_id/region ids; Prime reads rooms_metadata
+off a map and sends p2map_id/region_id plus an initiator. Branching on
+that inside each service would put the same two-way decision in four
+places, which this project has already paid for once: vacuum.py carried
+four identical copies of one transport branch, and a fix that belonged
+in one of them went into the wrong one.
+
+So the services ask a backend, and the backend knows which generation
+it is. Adding a third generation later touches this file and nothing
+else.
+
+A SECOND THING THIS SETTLES. Room cleaning used to be gated on
+`map_capability == SMART`, which is a Classic concept -- it describes
+whether a Classic robot has persistent pmaps. Prime robots leave it at
+NONE (has_smart_map() looks for a "pmaps" key; Prime reports "p2maps"),
+so every Prime robot was refused room cleaning even after the transport
+was confirmed working on real hardware.
+
+Rather than redefining that flag -- it is read in 32 places across seven
+modules, many of them Classic cloud paths that do not exist for Prime --
+the question becomes "is there a backend for this robot". Absence of a
+backend is the honest answer to "can this robot clean a named room",
+and it needs no flag to be interpreted correctly at 32 call sites.
+"""
+
+from __future__ import annotations
+
+import contextlib
+
+
+import logging
+from abc import ABC, abstractmethod
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any, NamedTuple
+
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+
+from .command_record import record_command
+from .const import (
+    CONF_SMART_ZONE_ALIASES,
+    CONF_SMART_ZONE_HIDDEN,
+    CONF_SMART_ZONE_LABELS,
+    room_slug,
+    CONF_FLOOR,
+    CONF_SMART_ZONE_DATA,
+    DOMAIN,
+    MAP_UPDATING_NOT_READY,
+    cleaning_mode_select_unique_id,
+    cleaning_modes_for,
+    extract_region_id,
+    get_localized_error_entry,
+    prime_start_refusal,
+)
+from .structural_failures import record_failure, record_success
+from .zone_naming import map_room_label
+from .models import ConnectionType, MapCapability
+from .cloud_coordinator import committed_pmapv_id
+
+if TYPE_CHECKING:
+    from .cloud_coordinator import IrobotCloudCoordinator
+    from .models import RoombaConfigEntry, RoombaData
+
+_LOGGER = logging.getLogger(__name__)
+
+#: Marks a ZONE inside a region-id list. Rooms carry a bare id.
+#: Both backends read this: Classic since v2.7.0, Prime since the
+#: clean_zone service exposed zones to callers.
+ZID_PREFIX = "zid_"
+
+
+def match_room_names(
+    available: dict[str, str], requested: list[str]
+) -> tuple[list[str], list[str]]:
+    """Matches user-typed room names against a robot's actual rooms.
+
+    Returns (matched ids, unmatched names), preserving request order --
+    clean_overdue_rooms and auto_clean_dirty_rooms sort their lists by
+    urgency, and reordering silently discards that work.
+
+    EXTRACTED FROM services.py::_resolve_rooms (this session), which
+    could not simply be reused: 51 of its 141 lines deal with pmap ids
+    and cross-map conflicts, and it returns (region_id, pmap_id) tuples
+    that mean nothing to a Prime robot.
+
+    What IS shared is the name matching itself, and specifically the
+    slug fallback. Users type "kuche" for "Küche" and "salle a manger"
+    for "Salle à manger" -- accents are awkward on phone keyboards and
+    absent from voice assistants entirely. Without this, a German or
+    French user's automation fails with "unknown room" for a room that
+    plainly exists, which is a miserable thing to debug.
+
+    Case-insensitive first, slug second. Both are exact matches within
+    their own space -- deliberately no fuzzy scoring, because cleaning
+    the wrong room is worse than reporting an honest miss.
+    """
+    by_name = {name.casefold(): rid for name, rid in available.items()}
+    by_slug = {room_slug(name): rid for name, rid in available.items()}
+
+    # BARE REGION IDS, because that is what the map card sends.
+    #
+    # @jouwdan (#88): the Rooms Map publishes each room's own id in its
+    # `rooms` attribute, and xiaomi-vacuum-map-card sends that id back
+    # when somebody taps a room. Matching only on name and slug meant a
+    # card selection resolved to nothing -- so the card he made work in
+    # an earlier PR could draw rooms and not clean them.
+    #
+    # AMBIGUOUS IDS ARE REFUSED RATHER THAN GUESSED. A household with
+    # several maps can hold the same bare id under two different
+    # qualified ids; picking one would clean a room on the wrong floor.
+    # An honest miss is better, which is the same rule the name matching
+    # above already follows.
+    by_id: dict[str, str] = {}
+    ambiguous_ids: set[str] = set()
+    for qualified in available.values():
+        bare_id = qualified.rsplit("/", 1)[-1]
+        if bare_id in by_id and by_id[bare_id] != qualified:
+            ambiguous_ids.add(bare_id)
+        else:
+            by_id[bare_id] = qualified
+
+    matched: list[str] = []
+    unmatched: list[str] = []
+    for raw in requested:
+        wanted = raw.strip()
+        rid: str | None = (
+            by_name.get(wanted.casefold())
+            or by_slug.get(room_slug(wanted))
+            or (by_id.get(wanted) if wanted not in ambiguous_ids else None)
+        )
+        if rid is None:
+            unmatched.append(raw)
+        elif rid not in matched:
+            matched.append(rid)
+    return matched, unmatched
+
+
+
+
+def _per_room(values: list[Any] | None, index: int) -> Any:
+    """One per-room setting, or None when the caller said nothing.
+
+    Positional and possibly short: callers pass what the user supplied,
+    which may cover fewer rooms than were requested. Missing entries
+    mean "leave the robot's own setting alone" -- not False, which would
+    actively switch two-pass off for someone who had turned it on.
+    """
+    if not values or index >= len(values):
+        return None
+    return values[index]
+
+
+def _region_params(
+    params_cls: type,
+    two_pass: list[bool | None] | None,
+    suction_level: list[int | None] | None,
+    index: int,
+    operating_mode: list[int | None] | None = None,
+    smart_scrub: list[bool | None] | None = None,
+) -> Any:
+    """Per-region params, or None when the caller expressed no opinion.
+
+    None rather than an empty params object: the confirmed field payload
+    only ever carried params the app itself had set, and sending an
+    empty one is a difference from observed behaviour with no benefit.
+    """
+    tp = _per_room(two_pass, index)
+    sl = _per_room(suction_level, index)
+    # PER ROOM LIKE THE OTHER TWO. A caller that wants one room mopped
+    # and the rest vacuumed can say so; one that wants the same
+    # everywhere passes it once PER ROOM. A one-element list reaches the
+    # first room only (@tar-gezed: "vacuum and mop" mopped one room).
+    om = _per_room(operating_mode, index)
+    # SMARTSCRUB PER REGION (4.5.0b5, @gunzxz, Plus 405 Combo). The wire
+    # key is `swScrub` in the region's params, read from real Prime
+    # mission history (roombapy-prime CommandParams.scrub); 1 on, 0 off,
+    # as the Classic payload sends it and the robot's own per-room
+    # defaults store it.
+    sc = _per_room(smart_scrub, index)
+    if tp is None and sl is None and om is None and sc is None:
+        return None
+    fields = {}
+    if om is not None:
+        fields["operating_mode"] = om
+    if sc is not None:
+        fields["scrub"] = 1 if sc else 0
+    if tp is not None:
+        fields["two_pass"] = tp
+    if sl is not None:
+        fields["suction_level"] = sl
+    return params_cls(**fields)
+
+
+def classic_room_segments(
+    cloud: Any, maps: list[str], floor_label: str | None, segment: Any
+) -> list[Any]:
+    """The rooms of `maps` as Clean Area segments, `{pmap_id}_{region_id}`.
+
+    ROOMS ONLY (4.5.4, @adamvig). This read `regions_by_pmap`, which
+    folds a map's rooms and zones into one dict by id. A zone whose
+    number no room has -- his "Front Door" (0) and "Back Door" (1) --
+    came through as a ROOM segment, beside its own zone segment; mapped
+    to an area, it would have been sent as room 0. `region_names_by_type`
+    keeps the two apart.
+
+    A name is offered once, the first map listed winning: the caller
+    puts the map most likely right first.
+    """
+    by_type = getattr(cloud, "region_names_by_type", None)
+    by_type = by_type if isinstance(by_type, dict) else {}
+    seen_names: set[str] = set()
+    out: list[Any] = []
+    for pmap_id in maps:
+        rooms = (by_type.get(pmap_id) or {}).get("rid") or {}
+        for region_id, region_name in rooms.items():
+            if not region_id or region_name in seen_names:
+                continue
+            seen_names.add(region_name)
+            out.append(segment(
+                id=f"{pmap_id}_{region_id}",
+                name=region_name or region_id,
+                group=floor_label,
+            ))
+    return out
+
+
+def classic_zone_segments(cloud: Any, active_pmap_id: str, segment: Any) -> list[Any]:
+    """The active map's zones as Clean Area segments, `{pmap_id}_zid_{id}`
+    (IA74-ZONE full, v2.7.0); the zone type is the group in HA's dialog."""
+    zones = getattr(cloud, "zones", None)
+    out: list[Any] = []
+    for zone in zones if isinstance(zones, list) else []:
+        zid = zone.get("id")
+        if not zid:
+            continue
+        zone_type = zone.get("zone_type", "zone")
+        out.append(segment(
+            id=f"{active_pmap_id}_zid_{zid}",
+            name=zone.get("name") or f"Zone {zid}",
+            group=zone_type.replace("_", " ").capitalize() if zone_type else "Zone",
+        ))
+    return out
+
+
+class _SegmentId(NamedTuple):
+    id: str
+    name: str
+    group: str | None
+
+
+def classic_segment_ids(cloud: Any, saved_ids: Iterable[str]) -> set[str] | None:
+    """The segment ids a Classic robot offers now for the maps of
+    `saved_ids` -- what the change check compares the saved mapping with.
+
+    THE SAME LIST HOME ASSISTANT SHOWS (4.5.4, @adamvig). The check built
+    its ids from `regions` alone -- the active map's rooms -- while the
+    list it is compared with also has the zones (since v2.7.0) and rooms
+    of other maps (since 4.1). On any robot with zones the two never
+    matched, and "Vacuum segments have changed" came back every few days
+    with nothing to remap.
+
+    For the maps the saved mapping names, not for where the robot is
+    now: which map's rooms are offered follows the robot, and a mapping
+    made on one floor is not "changed" because the robot went to the
+    other. None while the account's maps are not read.
+    """
+    active = getattr(cloud, "active_pmap_id", None)
+    if not active:
+        return None
+    by_type = getattr(cloud, "region_names_by_type", None)
+    by_type = by_type if isinstance(by_type, dict) else {}
+    known = [active, *(m for m in by_type if m != active)]
+    room_maps: set[str] = set()
+    for saved in saved_ids:
+        if "_zid_" in saved:
+            continue
+        # The longest map id first: map ids may contain "_".
+        for pmap_id in sorted(known, key=len, reverse=True):
+            if saved.startswith(f"{pmap_id}_"):
+                room_maps.add(pmap_id)
+                break
+    maps = [m for m in known if m in room_maps] or [active]
+    ids = {s.id for s in classic_room_segments(cloud, maps, None, _SegmentId)}
+    if not ids:
+        # As get_segments(): without per-map names, the active map's list.
+        regions = getattr(cloud, "regions", None)
+        ids = {
+            f"{active}_{r['id']}"
+            for r in (regions if isinstance(regions, list) else [])
+            if r.get("id")
+        }
+    ids |= {s.id for s in classic_zone_segments(cloud, active, _SegmentId)}
+    return ids
+
+
+async def _maps_to_offer(backend: Any, all_map_ids: list[str]) -> list[str]:
+    """The maps whose rooms may be offered, most specific first.
+
+    A ROBOT CAN ONLY CLEAN THE MAP IT IS STANDING ON. Offering rooms
+    from the others offers commands that cannot succeed: the robot
+    accepts the start, fails to localise, and sits on the dock with
+    error 224. @Thonno hit that three times running, each time with the
+    robot on its own dock having moved nowhere -- his second map is his
+    father's house, where the robot used to live.
+
+    WHY NOT `active_pmap_id`: it means "most recently updated", not
+    "where the robot is". @ScenicSystemsLLC checked it directly on a
+    two-map Braava -- two missions run against the Second Floor map,
+    fresh reads after each, and the active map stayed "master bathroom"
+    throughout. Running a mission does not bump that timestamp, so
+    choosing by it is choosing by something unrelated.
+
+    The order:
+
+      1. an explicit choice, where the robot has a map selector
+      2. what the robot says it is on right now
+      3. the last thing it said, when it is currently silent
+      4. every map, when it has never said anything -- the pre-existing
+         behaviour, kept so a robot that never reports a location is no
+         worse off than before
+
+    One map makes all of this moot, which is most robots.
+    """
+    if len(all_map_ids) <= 1:
+        return all_map_ids
+
+    chosen = getattr(
+        getattr(backend, "_config_entry", None), "runtime_data", None
+    )
+    chosen_id = getattr(chosen, "prime_selected_map_id", None)
+    if chosen_id and chosen_id in all_map_ids:
+        return [chosen_id]
+
+    with contextlib.suppress(Exception):
+        on_map, _is_live = await backend.where_the_robot_is()
+        if on_map and on_map in all_map_ids:
+            return [on_map]
+
+    return all_map_ids
+
+
+class RoomCleaningBackend(ABC):
+    """What a service needs in order to clean named rooms."""
+
+    @abstractmethod
+    async def available_rooms(self) -> dict[str, str]:
+        """Room display name -> the id this backend cleans it by.
+
+        Names as the user set them in the iRobot app, because that is
+        what they will type into a service call or automation.
+        """
+
+    async def map_names(self) -> dict[str, str]:
+        """{p2map_id: display name}. Empty unless the backend has maps.
+
+        Declared here so callers need not know which generation they
+        hold. Classic robots have one map and no name for it, so an
+        empty mapping is the honest answer there rather than an error.
+
+        NOT `active_pmap_id`. That is the order of the cloud's map
+        list, not a location -- the distinction that made
+        @ScenicSystemsLLC's cross-map favourite work and
+        @chairstacker's cross-map room fail. Anything asking WHERE
+        the robot is must read `cleanMissionStatus.p2mapId`.
+        """
+        return {}
+
+    async def _all_map_ids(self) -> list[str]:
+        """Every map this robot holds, or empty when it has only one.
+
+        NOT ABSTRACT, and a default rather than a raise: three callers
+        (the rooms image, the calendar, the dirt manager) ask the
+        backend for map ids through this base type. `PrimeRoomCleaning`
+        answers properly; a Classic robot has a single implicit map and
+        nothing to enumerate.
+
+        Those callers used `backend._all_map_ids()  # noqa: SLF001` on a
+        method only the Prime subclass defined -- an AttributeError on
+        every Classic entry, two of them inside a bare except that
+        swallowed it.
+        """
+        return []
+
+    async def _current_map_id(self) -> str | None:
+        """The map the robot is on, or None when it does not track one.
+
+        Same story as `_all_map_ids` above.
+        """
+        return None
+
+    async def where_the_robot_is(self) -> tuple[str | None, bool]:
+        """(map id, whether the robot is saying so right now).
+
+        Base default: NOTHING, and not live.
+
+        This used to return `_current_map_id()` marked as a live
+        reading, on the stated assumption that "only the Prime backend
+        has more than one map to tell apart". That assumption is
+        false -- @Thonno runs a two-map Classic i7+, @ScenicSystemsLLC
+        two-map Classic robots -- and the value was wrong twice over.
+
+        On Classic `_current_map_id()` is the CLOUD's active map, which
+        is the most recently updated one. @ScenicSystemsLLC checked
+        directly: running a mission does not change it. So it is not a
+        location at all, not even a stale one, and returning it as a
+        live reading told consumers the robot was on a floor nobody had
+        established.
+
+        A Classic robot does not report where it is. Saying so is the
+        honest answer; a confident wrong floor is worse than none --
+        @Thonno's i7+ failed to start with "Smart Map localization
+        failed" precisely because the robot and the target map were on
+        different floors, and nothing could have warned him.
+        """
+        return None, False
+
+    @abstractmethod
+    async def get_segments(self) -> list[Any]:
+        """Rooms as Home Assistant Clean Area segments.
+
+        The id format is each backend's own business and is agreed with
+        its clean_segments() alone. Classic prefixes with the pmap id so
+        segments from another map can be recognised; Prime does not,
+        because it resolves the map at send time.
+
+        Both halves of that agreement live in the same class on purpose:
+        nothing outside these two methods would notice them drifting
+        apart, and for a while they lived in different files.
+        """
+
+    @abstractmethod
+    async def clean_segments(self, segment_ids: list[str]) -> None:
+        """Clean the given Home Assistant segments."""
+
+    @abstractmethod
+    async def clean_rooms(
+        self,
+        room_ids: list[str],
+        *,
+        ordered: bool = True,
+        two_pass: list[bool | None] | None = None,
+        suction_level: list[int | None] | None = None,
+        operating_mode: list[int | None] | None = None,
+        #: Per-run mop settings. Classic sends both inside the region's
+        #: own params (the Classic app capture); the Prime backend accepts and
+        #: ignores them, so a caller need not know which generation it
+        #: is talking to -- the same contract the other per-room
+        #: parameters here already follow.
+        smart_scrub: list[bool | None] | None = None,
+        pad_wetness: list[int | None] | None = None,
+    ) -> None:
+        """Sends the robot to clean these rooms, in the order given.
+
+        Order is preserved deliberately: clean_overdue_rooms and
+        auto_clean_dirty_rooms sort their lists by urgency, and a
+        backend that reorders them silently discards that work.
+
+        `ordered` asks the robot to visit them in that sequence rather
+        than picking its own route.
+
+        `two_pass` is per room and positional, aligned with room_ids;
+        None means "whatever the robot is already set to". A first draft
+        of this interface took only room_ids, which would have thrown
+        away a capability the Classic path has always had -- and which
+        Prime turns out to support identically (the confirmed field
+        payload carries twoPass per region).
+
+        `suction_level` is per room as well, and PRIME ONLY -- the
+        Classic room payload has no equivalent. A backend that cannot
+        honour it ignores it rather than failing, so a caller need not
+        know which generation it is talking to.
+
+        DELIBERATELY NOT OFFERED: operatingMode, which the confirmed
+        Prime payload also carries. It selects the JOB -- vacuum, mop,
+        or a combination; see the decoded bitmask in `const.py` -- and
+        which values a given robot accepts depends on its hardware and
+        on the pad fitted at the time. That rule lives robot-side where
+        this code cannot check it -- our own diagnostic script says as much when
+        it reports the value. Exposing a setting whose valid range we
+        cannot determine invites a service call that is silently
+        rejected, or worse, accepted and wrong. It stays out until
+        somebody establishes what the values mean.
+
+        UPDATE (30 July 2026): the values are now known, from a
+        chairstacker map-edit response that returned the full
+        p2map_metadata. Each room carries operating_mode_defaults keyed
+        by mode, plus a last_operating_mode:
+
+            2   -> profile "normal"
+            4   -> profile "normal" (seen only with carpetBoost + swScrub)
+            32  -> profile "light"
+            512 -> profile "deep"  (suctionLevel 4, twoPass, swScrub 1)
+
+        Still not offered, and the reason has changed. It is no longer
+        "we do not know the range" but "the robot already stores a
+        per-room default for each mode, including which one was used
+        last". Overriding that from a service call would discard a
+        preference the user set in the iRobot app, per room, and there is
+        no way to put it back.
+
+        The useful feature here is not an operating_mode parameter -- it
+        is READING these defaults, so a service call can honour what the
+        user configured rather than replace it. Not built yet, and
+        deliberately noted rather than guessed at.
+        """
+
+
+def raise_if_prime_start_blocked(
+    data: Any, modes: list[int | None], *, robot_name: str | None = None
+) -> None:
+    """Refuse a Prime mission start the robot's own fault rules out (4.4.2).
+
+    const.prime_start_refusal() decides; this reads the robot's current
+    state from the entry's runtime data and says why, in the vendor's
+    words for the fault. Nothing known about the state means nothing
+    refused.
+    """
+    from roombapy_prime.models import CurrentStateShadow  # noqa: PLC0415
+
+    coordinator = getattr(data, "prime_status_coordinator", None)
+    shadows = getattr(coordinator, "data", None)
+    raw = shadows.get("ro-currentstate") if isinstance(shadows, dict) else None
+    if not isinstance(raw, dict):
+        return
+    try:
+        status = CurrentStateShadow.from_json(raw).clean_mission_status
+    except Exception:  # noqa: BLE001
+        return
+    codes = prime_start_refusal(status, modes)
+    if not codes:
+        return
+    hass = getattr(data, "hass_ref", None)
+    language = getattr(getattr(hass, "config", None), "language", None) or "en"
+    reason = " · ".join(
+        f"{get_localized_error_entry(code, language, prime=True, robot_name=robot_name).get('label') or 'Error'} ({code})"
+        for code in codes
+    )
+    raise ServiceValidationError(
+        f"Not started: {reason}",
+        translation_domain=DOMAIN,
+        translation_key="prime_start_blocked",
+        translation_placeholders={"reason": reason},
+    )
+
+
+def _selected_cleaning_mode(config_entry: Any) -> int | None:
+    """The mode the cleaning-mode select is showing, if there is one.
+
+    Read through the entity rather than from a stored preference,
+    because the select reflects the robot's own last start when it has
+    one -- so a user who chose in the iRobot app gets what the machine
+    actually did rather than a stale pick of ours.
+    """
+    from homeassistant.helpers import entity_registry as er  # noqa: PLC0415
+
+    # FROM RUNTIME DATA. `config_entry.hass` does not exist, so this
+    # returned None on every call and the selector's mode was never
+    # applied to a room clean that named none.
+    data = getattr(config_entry, "runtime_data", None)
+    hass = getattr(data, "hass_ref", None)
+    if hass is None or data is None:
+        return None
+    try:
+        registry = er.async_get(hass)
+        unique = cleaning_mode_select_unique_id(data.blid)
+        entity_id = registry.async_get_entity_id("select", DOMAIN, unique)
+        if entity_id is None:
+            return None
+        state = hass.states.get(entity_id)
+        if state is None:
+            return None
+        # THIS ROBOT'S TABLE, NOT THE PRIME ONE (4.4.2). The lookup went
+        # through the select's class-level table, which is Prime's, so
+        # "vacuum and mop" picked on a Classic robot sent Prime's 32
+        # instead of the 6 Classic takes. The select itself already
+        # held the right table per instance; only this reader did not.
+        return cleaning_modes_for(
+            getattr(data, "connection_type", None) is ConnectionType.CLOUD_ONLY
+        ).get(state.state)
+    except Exception:  # noqa: BLE001
+        _LOGGER.debug("roomba_plus: could not read the cleaning mode", exc_info=True)
+        return None
+
+
+class PrimeRoomCleaning(RoomCleaningBackend):
+    """V4/Prime rooms, over the cloud command topic.
+
+    Confirmed on real hardware (DaRealGuGu): the robot travelled to the
+    named room and cleaned it, both from a saved favorite and from a
+    command built from scratch.
+
+    Two requirements, neither obvious, and both cost field sessions to
+    establish:
+
+      - `initiator` is MANDATORY. A stored favorite does not carry one;
+        the app adds it when sending. Without it the command is
+        delivered, acknowledged with a PUBACK, and silently ignored.
+      - The wire keys are `start` and `region_id`, not `clean` and `id`.
+
+    A map version is NOT required, which is worth knowing because it
+    looks like it should be. The robot re-versions its map every few
+    seconds while cleaning -- five values inside 37 seconds in one real
+    capture -- so any stored version is stale within a minute, and
+    confirmed-working commands carried versions hours out of date or
+    none at all.
+    """
+
+    def __init__(
+        self,
+        data: RoombaData,
+        config_entry: RoombaConfigEntry | None = None,
+        hass: HomeAssistant | None = None,
+    ) -> None:
+        self._data = data
+
+        # NARROWED HERE, where it is true. A CLOUD_ONLY entry always has
+        # a prime robot -- `ClassicRoomCleaning` is what a local entry
+        # gets -- and mypy cannot see that across the factory. Stating
+        # it once beats four checks for a condition that cannot occur.
+        if data.prime_robot is None:  # pragma: no cover - Classic gets the other backend
+            raise RuntimeError(
+                "PrimeRoomCleaning built for an entry with no Prime robot"
+            )
+        self._robot = data.prime_robot
+        # Optional, and only needed to record the mission plan. Kept
+        # optional rather than required because several call sites build
+        # this backend for read-only use -- listing rooms needs neither.
+        self._config_entry = config_entry
+        self._hass = hass
+
+    async def _all_map_ids(self) -> list[str]:
+        """Every visible map on this robot, in whatever order the server
+        returned them.
+
+        Order is NOT meaningful. The endpoint documents no sort, and
+        picking the first entry would be a coin flip -- one real account
+        (arielgr) has two maps, "1st floor" and "2nd floor".
+        """
+        try:
+            versions = await self._robot.get_active_map_versions()
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning(
+                "roomba_plus: could not read map versions for %s",
+                self._data.blid, exc_info=True,
+            )
+            return []
+
+        # Wire data arrives as plain dicts, not typed models -- getattr()
+        # would silently return None on every field. That exact mistake
+        # has been made three times across these two codebases.
+        return [
+            entry["p2map_id"]
+            for entry in versions or []
+            if isinstance(entry, dict) and entry.get("p2map_id")
+        ]
+
+    async def _current_map_id(self) -> str | None:
+        """The map the robot is actually standing on, if it says.
+
+        MULTI-FLOOR IS REAL, not hypothetical: one tester's account
+        holds a map per floor. Room ids only mean anything within their
+        own map, so choosing the wrong one cleans the wrong floor --
+        the kind of failure that is obvious to the user and baffling
+        from the logs.
+
+        The robot reports its map in cleanMissionStatus while it knows
+        where it is (its own reloc events carry p2mapId). When it does
+        not -- parked, freshly booted, not yet relocalised -- there is
+        no honest single answer, and this returns None rather than
+        guessing.
+        """
+        coordinator = getattr(self._data, "prime_status_coordinator", None)
+        if coordinator is None or not coordinator.data:
+            return None
+        current = coordinator.data.get("ro-currentstate") or {}
+        mission = current.get("cleanMissionStatus") or {}
+        _live = mission.get("p2mapId") or mission.get("p2map_id")
+        if _live:
+            return str(_live)
+
+        # PARKED IS NOT THE SAME AS UNKNOWN.
+        #
+        # A Prime robot reports its map while it is relocalised. Docked
+        # between missions it reports nothing -- which is exactly when a
+        # user is standing in the UI choosing a room, so "follow the
+        # robot" offered every map and narrowed nothing
+        # (@chairstacker).
+        #
+        # Where it last WORKED is where it is standing, unless somebody
+        # carried it. That is a weaker claim than a live reading and a
+        # much better one than nothing, and the caller already marks
+        # this branch as not-live.
+        #
+        # NOT IF THAT COMMAND FAILED. @Thonno's Classic robot stored our
+        # own rejected commands and handed them back as its location,
+        # which is how a wrong map survived three releases. The same
+        # guard 4.2.2 put on the map VERSION applies here to the map:
+        # a command that ended in a localisation error is evidence of
+        # where the robot is not.
+        if int(mission.get("error") or 0) in (224, 225):
+            return None
+
+        software = coordinator.data.get("rw-software") or {}
+        last = software.get("lastCommand") or {}
+        if isinstance(last, dict):
+            parked = last.get("pmap_id") or last.get("p2map_id")
+            if parked:
+                return str(parked)
+        return None
+
+    async def where_the_robot_is(self) -> tuple[str | None, bool]:
+        """(map id, whether the robot is saying so right now).
+
+        `_current_map_id()` is the truth and is often silent: the
+        robot reports its map while it knows where it is, and a
+        parked one reports nothing. That silence lands exactly when
+        somebody opens a dashboard and presses a button.
+
+        So a live reading is remembered, and returned again later
+        with `False` to say it is a memory rather than a statement.
+        A dock does not move: the floor the robot last cleaned is
+        where it still is, unless a person carried it -- and that
+        person knows they did.
+
+        THE FLAG IS THE POINT. A caller that shows the user which
+        floor a room is on can say "currently" or "last seen";
+        without it, a remembered value looks like a measurement.
+        """
+        live = await self._current_map_id()
+        if live:
+            self._data.last_known_map_id = live
+            return live, True
+        return getattr(self._data, "last_known_map_id", None), False
+
+    def _raise_if_map_updating(self) -> None:
+        """Refuses while the robot is rebuilding its map.
+
+        notReady equal to 67 (MAP_UPDATING_NOT_READY), the same value
+        and meaning Classic uses -- confirmed present in Prime's own
+        cleanMissionStatus. A value, not a bit: see const.py.
+        """
+        from homeassistant.exceptions import ServiceValidationError  # noqa: PLC0415
+
+
+        coordinator = getattr(self._data, "prime_status_coordinator", None)
+        if coordinator is None or not coordinator.data:
+            return
+        current = coordinator.data.get("ro-currentstate") or {}
+        not_ready = (current.get("cleanMissionStatus") or {}).get("notReady", 0)
+        # EQUALITY, not a bit test. notReady is a scalar index, and `&`
+        # fired for eight unrelated states -- see const.py.
+        if not_ready == MAP_UPDATING_NOT_READY:
+            raise ServiceValidationError(
+                "The robot is currently updating its map. Wait for the update to "
+                "complete, then try again.",
+                translation_domain="roomba_plus",
+                translation_key="map_updating",
+            )
+
+    async def _region_to_map(self) -> dict[str, str]:
+        """{region_id: p2map_id} across every map, names or not.
+
+        available_rooms() skips regions with no name (it builds a
+        name->id picker), but @chairstacker's zones read `name=None`
+        and still need cleaning by id. This walks the same maps and
+        records every region's map, named or not, so an unqualified
+        zone id can be resolved to its floor.
+
+        A region id appearing on two maps is dropped rather than
+        guessed: with no map reported and the id ambiguous, refusing
+        downstream is the honest answer.
+        """
+        seen: dict[str, str] = {}
+        ambiguous: set[str] = set()
+        for p2map_id in await self._all_map_ids():
+            try:
+                map_data = await self._map_metadata(p2map_id)
+            except Exception:  # noqa: BLE001
+                _LOGGER.warning(
+                    "roomba_plus: could not read rooms from map %s for %s",
+                    p2map_id, self._data.blid, exc_info=True,
+                )
+                continue
+            for room in map_data.rooms_metadata or []:
+                if not room.room_id:
+                    continue
+                rid = str(room.room_id)
+                if rid in seen and seen[rid] != p2map_id:
+                    ambiguous.add(rid)
+                else:
+                    seen[rid] = p2map_id
+        for rid in ambiguous:
+            del seen[rid]
+        return seen
+
+    async def whole_home_room_ids(self) -> list[str]:
+        """Every room of the map the robot is on, map-qualified, zones
+        left out (4.4.2). Empty where that map is not known.
+
+        HOW THE PRIME APP CLEANS THE WHOLE HOME IN A CHOSEN MODE (3.2.0,
+        claude/APK_MODUS_RECHERCHE.md F1): not a bare `start`, but a
+        room command listing every room of the map, each carrying the
+        mode. Unnamed rooms included -- the app lists room ids, not
+        names -- which `available_rooms()`, keyed by name, cannot give.
+        """
+        # A DOCKED PRIME ROBOT NAMES NO MAP (4.4.3): its status carries
+        # one only while it is localised, and its last command none. So
+        # the map it last named, else the account's only map. Two maps
+        # and no memory is no answer: the bare start goes out instead.
+        current, _live = await self.where_the_robot_is()
+        if not current:
+            maps = await self._all_map_ids()
+            current = maps[0] if len(maps) == 1 else None
+        if not current:
+            return []
+        try:
+            map_data = await self._map_metadata(current)
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning(
+                "roomba_plus: could not read the rooms of map %s for %s",
+                current, self._data.blid, exc_info=True,
+            )
+            return []
+        ids: list[str] = []
+        for room in getattr(map_data, "rooms_metadata", None) or []:
+            region_type = getattr(room, "region_type", None)
+            region_type = getattr(region_type, "value", region_type)
+            if not room.room_id or (region_type and str(region_type).lower() == "zid"):
+                continue
+            rid = f"{current}/{room.room_id}"
+            if rid not in ids:
+                ids.append(rid)
+        return ids
+
+    async def available_rooms(self) -> dict[str, str]:
+        """Rooms across ALL maps, not just the current one.
+
+        A user asking to clean "Bedroom" should get a match whether or
+        not the robot happens to be parked on that floor right now.
+        Restricting this to the current map would make the same
+        automation work in the evening and fail in the morning.
+
+        IDS ARE QUALIFIED BY THEIR MAP -- "<p2map_id>/<room_id>".
+        
+        Room ids are assigned per map and start low, so two floors
+        almost certainly both have a room "1". Returning bare ids meant
+        "Kitchen" downstairs and "Bedroom" upstairs could both resolve
+        to "1", and cleaning then targeted whichever map the robot
+        happened to be on. Choosing "Kitchen" while the robot was
+        upstairs cleaned the bedroom -- silently, since the id was
+        valid on that map too.
+
+        Found by feeding two maps with colliding ids, not by reading
+        the code: both halves are individually correct.
+
+        DUPLICATE NAMES: the room from the map the robot is currently
+        on wins. Borrowed from services.py::_resolve_rooms, which has
+        handled this for Classic robots for a long time -- a first draft
+        here used "whichever came back first", i.e. server order, which
+        decides by coin flip what Classic decides by relevance.
+
+        "Hallway" upstairs and downstairs is an ordinary thing to have,
+        and the name alone cannot say which was meant. Preferring the
+        floor the robot is standing on is the only reading that is right
+        more often than not, and the warning tells the user how to make
+        it unambiguous.
+        """
+        current_map = await self._current_map_id()
+        rooms: dict[str, str] = {}
+        from_current: set[str] = set()
+
+        # Region ids the robot itself marks as zones. Recorded rather
+        # than dropped: `get_segments()` offers them under the zone
+        # prefix, so they stay usable -- they just stop being rooms.
+        zone_ids: set[str] = set()
+
+        seen_map_ids: list[str] = []
+        # ONLY THE MAP THE ROBOT CAN ACTUALLY CLEAN.
+        #
+        # `_region_to_map()` and `_named_regions_across_maps()` above
+        # still walk every map -- they RESOLVE ids that already exist.
+        # This method OFFERS names, and offering one from a map the
+        # robot is not on offers a command that cannot succeed.
+        for p2map_id in await _maps_to_offer(
+            self, await self._all_map_ids()
+        ):
+            seen_map_ids.append(p2map_id)
+            try:
+                map_data = await self._map_metadata(p2map_id)
+            except Exception:  # noqa: BLE001
+                _LOGGER.warning(
+                    "roomba_plus: could not read rooms from map %s for %s",
+                    p2map_id, self._data.blid, exc_info=True,
+                )
+                continue
+
+            is_current = bool(current_map) and p2map_id == current_map
+            # BOTH SOURCES, like get_segments() twenty lines down.
+            #
+            # `rooms_metadata` carries a name only for some rooms.
+            # @utkjmitch's Y351020 has five named rooms that live in the
+            # version endpoint's `geojson_details.regions` and nowhere
+            # in metadata -- so this produced {} and the service told
+            # him to "finish a mapping run and name the rooms", which he
+            # had done.
+            #
+            # Metadata names win where present: they are the per-map,
+            # user-set ones. `prime_room_names` is the fallback, and it
+            # is what get_segments() has been layering on all along --
+            # the same source this loop was never revisited to use.
+            _fallback = getattr(
+                getattr(self._config_entry, "runtime_data", None),
+                "prime_room_names", None,
+            ) or {}
+
+            for room in map_data.rooms_metadata or []:
+                _name = room.name or _fallback.get(str(room.room_id))
+                if not (_name and room.room_id):
+                    continue
+
+                # ZONES ARE NOT ROOMS, and the robot says which is which.
+                #
+                # `rooms_metadata` lists every region on the map, zones
+                # included, and each entry carries `region_type` -- the
+                # library reads it from a confirmed live response and
+                # maps it to `rid` or `zid`. This loop ignored it, so a
+                # user-drawn zone was offered as a room and the button
+                # sent its id as a ROOM id.
+                #
+                # @theChef163's zone "Litter" is region 100 on a robot
+                # whose rooms are 10-19. Sent as `rid` 100 the robot
+                # accepts the command, finds no such room, and reports
+                # `completed` after 71 seconds with zero area cleaned --
+                # which looks exactly like "starts and immediately
+                # returns to the dock".
+                #
+                # Absence still means room: not every capture carries
+                # the field, and rooms outnumber zones by far.
+                # A ZONE IS A PLACE WITH A NAME, AND IT IS CLEANABLE.
+                #
+                # This used to `continue` here, so a zone name resolved
+                # to nothing and `clean_room` called it unknown.
+                # @mrsnyds has nine named regions and eight the service
+                # would accept.
+                #
+                # THE EXCLUSION WAS A SYMPTOM FIX. @theChef163's zone
+                # went out as a ROOM id -- untyped -- and the robot
+                # found no such room, reported success after 71 seconds
+                # and cleaned nothing. The fault was the missing type,
+                # not the zone being offered. Classic solves it that
+                # way already: it keeps zones in the list and records
+                # the type in `_type_by_region`.
+                #
+                # THE PREFIX IS WHAT TYPES IT. `_send_region_command()`
+                # sets `RegionType.ZID` for any id starting with
+                # `zid_`, and `clean_rooms()` splits a qualified id at
+                # the first `/` and passes the rest through -- so
+                # `MAP/zid_100` arrives as `zid_100` and is typed
+                # correctly. That is the same shape `clean_segments()`
+                # already builds, so both routes now agree.
+                _rt = getattr(room, "region_type", None)
+                _rt = getattr(_rt, "value", _rt)
+                _is_zone = bool(_rt) and str(_rt).lower() == "zid"
+                if _is_zone:
+                    zone_ids.add(str(room.room_id))
+                # LOCAL NAME, not a rewritten object. `replace()` needs
+                # a dataclass and this loop also sees plain namespaces
+                # from tests and from other readers.
+                room_name = str(_name)
+
+                if room_name in rooms:
+                    if is_current and room_name not in from_current:
+                        _LOGGER.warning(
+                            "roomba_plus: room name %r exists on more than one map "
+                            "for %s -- using the one on the map the robot is "
+                            "currently on. Rename one of them in the iRobot app to "
+                            "target them separately.",
+                            room_name, self._data.blid,
+                        )
+                        rooms[room_name] = f"{p2map_id}/{ZID_PREFIX if _is_zone else ''}{room.room_id}"
+                        from_current.add(room_name)
+                    else:
+                        _LOGGER.warning(
+                            "roomba_plus: room name %r exists on more than one map "
+                            "for %s -- keeping the first match. Rename one of them "
+                            "in the iRobot app to target them separately.",
+                            room_name, self._data.blid,
+                        )
+                    continue
+
+                rooms[room_name] = f"{p2map_id}/{ZID_PREFIX if _is_zone else ''}{room.room_id}"
+                if is_current:
+                    from_current.add(room_name)
+
+        # Handed to `get_segments()` so the zones it skipped here can be
+        # offered under the `zid_` prefix instead of vanishing.
+        self._zone_region_ids = zone_ids
+
+        # THE LAST LIST THAT WORKED, kept for when a lookup yields
+        # nothing.
+        #
+        # WHY THE BUTTON WORKED AND THE SERVICE DID NOT. The selector
+        # already does this: it calls `get_segments()`, and on failure
+        # returns early, leaving its previous `{name: id}` map in place.
+        # Pressing the button then cleans the room the user picked, from
+        # the last list that resolved.
+        #
+        # `clean_room` had no such memory. It asked live, got nothing,
+        # and told the user his rooms were unknown -- while the same
+        # rooms sat in the dropdown beside it and the button cleaned
+        # them (@mrsnyds, whose button has worked since 4.1.3 and whose
+        # service call never has).
+        #
+        # A slightly stale room list is better than "your rooms do not
+        # exist". That is the selector's judgement already; this only
+        # makes the service share it.
+        if rooms:
+            self._last_known_rooms = dict(rooms)
+        elif getattr(self, "_last_known_rooms", None):
+            _LOGGER.debug(
+                "roomba_plus: no rooms resolved for %s; using the %d from "
+                "the last successful lookup",
+                self._data.blid, len(self._last_known_rooms),
+            )
+            return dict(self._last_known_rooms)
+
+        # NOTHING FROM THE MAPS? FALL BACK TO THE NAMES WE ALREADY HAVE.
+        #
+        # This whole method reads `rooms_metadata`. When that is empty --
+        # a map not fetched yet, or a fetch that failed -- it returns
+        # nothing, and `clean_room` then reports every room the user
+        # named as unknown.
+        #
+        # Meanwhile `prime_room_names` holds those very names: it is what
+        # the room display and the selector show, so a user sees the
+        # rooms listed and is told they do not exist. @mrsnyds hit
+        # exactly that, passing "Guest Bath" and "Dining Room" -- both
+        # real rooms on his robot -- and getting "Unknown room(s)".
+        #
+        # ONLY WITH A SINGLE MAP. `prime_room_names` is merged across
+        # maps and carries no map of its own, so on a multi-map robot
+        # there is no honest way to qualify an id. Refusing there is
+        # correct; silently guessing a floor is not.
+        if not rooms:
+            # A read-only backend carries no config entry; callers that
+            # only wanted the map list pass none. Neither is an error.
+            _names = getattr(
+                getattr(self._config_entry, "runtime_data", None),
+                "prime_room_names",
+                None,
+            )
+            # HOW MANY MAPS THE ROBOT HAS, not how many we chose to
+            # offer from.
+            #
+            # `prime_room_names` is merged across every map and carries
+            # no map of its own, so on a two-map robot a cached name
+            # cannot be attributed to a floor -- refusing is the honest
+            # answer, and a test pins it.
+            #
+            # Narrowing the OFFER to the robot's current map made this
+            # read as a one-map robot and hand back all nine merged
+            # names under that map's id. Two different questions that
+            # happened to share a variable.
+            _map_count = len(await self._all_map_ids())
+            if _map_count == 1 and isinstance(_names, dict):
+                only_map = seen_map_ids[0]
+                # ZONES STAY OUT, EVEN HERE.
+                #
+                # `prime_room_names` is a flat id-to-name map with no
+                # region types in it, so this fallback cannot tell a
+                # zone from a room by itself -- and offering a zone as a
+                # room is the bug fixed one release earlier: the command
+                # goes out with a room id that does not exist, the robot
+                # finds nothing and reports success.
+                #
+                # `discovered_zone_ids` is what the config entry has
+                # recorded as zones. It is the only zone knowledge
+                # available when map metadata is not.
+                _known_zones = {
+                    str(z)
+                    for z in (
+                        getattr(self._config_entry, "options", None) or {}
+                    ).get("discovered_zone_ids", ())
+                } | {str(z) for z in zone_ids}
+
+                # SAME RULE AS ABOVE: a zone is offered, and carries
+                # the prefix that types it. The cache has no region
+                # types in it, so `discovered_zone_ids` is the only
+                # thing that can tell them apart here.
+                rooms = {
+                    str(name): (
+                        f"{only_map}/{ZID_PREFIX}{region_id}"
+                        if str(region_id) in _known_zones
+                        else f"{only_map}/{region_id}"
+                    )
+                    for region_id, name in _names.items()
+                    if region_id and name
+                }
+                if rooms:
+                    _LOGGER.debug(
+                        "roomba_plus: map metadata gave no rooms for %s; "
+                        "using the %d cached room names instead",
+                        self._data.blid, len(rooms),
+                    )
+
+        return rooms
+
+    _SEGMENT_PREFIX = "rid_"
+
+    #: Map documents fetched during one `get_segments()` listing.
+    #: Declared here so both readers share one type; `get_segments()`
+    #: clears it, and `_map_metadata()` fills it lazily.
+    _map_meta_cache: dict[str, Any]
+
+    #: {region_id: p2map_id}, filled while reading region names.
+    #: A class-level default because tests build this backend past
+    #: __init__, and `get_segments()` reads it before anything has
+    #: filled it.
+    _region_map_ids: dict[str, str] = {}
+
+    async def _named_regions_across_maps(self) -> dict[str, str]:
+        """{region_id: name} for every named room AND zone, on every map.
+
+        THE SOURCE THAT WAS FOUND AND NEVER CONNECTED. Region names live
+        in the map VERSION document, `GET /v1/p2maps/{id}/versions/{vid}`
+        -- roombapy-prime's own docstring records that it took four
+        rounds with @chairstacker to establish that, after
+        `rooms_metadata` (rooms only, zones always None) and the
+        bundle's `cleanZones` layer (empty on his robot) both came up
+        short.
+
+        The integration never called it. Zone names came from two
+        narrower places instead: the bundle of the map being DRAWN, and
+        `lastCommand.regions[].region_name` -- whichever regions the
+        last command happened to label. So a zone on another map was
+        missing from the area-mapping dialog entirely, and a room could
+        appear in the rooms half of that dialog and not the zones half.
+        That is what @chairstacker reported the day 4.1.0 shipped.
+
+        ADDITIVE AND FAILING SAFE. Everything is merged rather than
+        replaced, and the library returns {} instead of raising when the
+        key is absent -- it has not seen this response on a robot
+        either. If the endpoint gives nothing back, the list is what it
+        was before.
+        """
+        # NO ROBOT, NO CALL. Tests build this backend past __init__ and
+        # never set `_robot`; so does any caller that only wants the
+        # stored zone data. An AttributeError here would turn a missing
+        # optional source into a failed segment listing.
+        robot = getattr(self, "_robot", None)
+        if robot is None:
+            return {}
+
+        names: dict[str, str] = {}
+        # WHICH MAP EACH REGION CAME FROM, recorded alongside the name.
+        #
+        # A zone segment id has to carry its map exactly as a room's
+        # does. Without it, `clean_rooms()` cannot tell which map a
+        # zone belongs to, and on a robot with two maps it refuses the
+        # command rather than guess -- @chairstacker got "this robot has
+        # 2 maps and is not currently reporting which one it is on"
+        # every time he cleaned a zone, while rooms worked.
+        # A FRESH DICT PER CALL, never the class-level default.
+        #
+        # `getattr(self, "_region_map_ids", {})` would return the CLASS
+        # attribute here and then bind it to the instance -- so two
+        # robots in one Home Assistant would share one mapping and
+        # overwrite each other's zone-to-map assignments. The class
+        # attribute exists only so a backend built past __init__ can
+        # read it; it must never be written to.
+        self._region_map_ids = {}
+        for p2map_id in await self._all_map_ids():
+            try:
+                map_data = await self._map_metadata(p2map_id)
+            except Exception:  # noqa: BLE001
+                continue
+            if map_data is None:
+                continue
+            version = (
+                getattr(map_data, "active_p2mapv_id", None)
+                or getattr(map_data, "user_p2mapv_id", None)
+                or getattr(map_data, "p2mapv_id", None)
+            )
+            if not version:
+                # SILENT UNTIL NOW, and that was the problem.
+                #
+                # No version means no region names, which means the
+                # zones on this map get no map assignment, which means
+                # their segment ids stay bare -- and a bare zone id on a
+                # multi-map robot is refused by `clean_rooms()` with
+                # "not currently reporting which one it is on".
+                #
+                # @chairstacker sees exactly that error on 4.1.6 while
+                # his room list is correct. Nothing in the log said why,
+                # because this path took the `continue` without a word.
+                _LOGGER.warning(
+                    "roomba_plus: map %s for %s carries no version id, so its "
+                    "region names cannot be read -- any ZONES on that map will "
+                    "have no map assignment and cannot be cleaned by name",
+                    p2map_id, self._data.blid,
+                )
+                continue
+            try:
+                found = await robot.get_map_region_names(p2map_id, version)
+            except Exception:  # noqa: BLE001
+                # WARNING, NOT DEBUG. Skipping a map here produces a
+                # SHORTER list that looks exactly like a complete one --
+                # the zones of that map simply are not there, and
+                # nothing says so.
+                #
+                # @chairstacker saw 18 entries in the selector and 17 in
+                # the area-mapping dialog. The selector loads once at
+                # startup; the dialog reads live. One of the two calls
+                # had a map fail, and at debug level there was nothing
+                # in his log to tell the two apart.
+                _LOGGER.warning(
+                    "roomba_plus: could not read region names from map %s "
+                    "(version %s) for %s -- any zones on that map are "
+                    "missing from the room/zone list until this succeeds",
+                    p2map_id, version, self._data.blid, exc_info=True,
+                )
+                continue
+            for region_id, region_name in (found or {}).items():
+                if region_id and region_name:
+                    names.setdefault(str(region_id), str(region_name))
+                    self._region_map_ids.setdefault(str(region_id), p2map_id)
+        return names
+
+    async def _map_metadata(self, p2map_id: str) -> Any:
+        """`get_map_metadata`, fetched at most once per segment listing.
+
+        `available_rooms()` and `_named_regions_across_maps()` both walk
+        every map, and without this each would fetch the same document.
+        `get_segments()` clears the cache before it starts, so it lives
+        for one listing and cannot go stale between them -- a map
+        retrained in the app is picked up the next time the dialog opens.
+        """
+        cache: dict[str, Any] | None = getattr(self, "_map_meta_cache", None)
+        if cache is None:
+            cache = {}
+            self._map_meta_cache = cache
+        if p2map_id not in cache:
+            cache[p2map_id] = await self._robot.get_map_metadata(p2map_id)
+        return cache[p2map_id]
+
+    async def map_names(self) -> dict[str, str]:
+        """{p2map_id: display name} for every map on the account.
+
+        Read from `get_active_map_versions()`, which carries the name
+        beside the id -- the same call `_all_map_ids()` already makes.
+
+        Exists so the room/zone selector can say WHICH floor a room is
+        on before someone presses the button. A raw p2map id means
+        nothing to a person; "Upstairs" does.
+        """
+        robot = getattr(self, "_robot", None)
+        if robot is None:
+            return {}
+        try:
+            versions = await robot.get_active_map_versions()
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug(
+                "roomba_plus: could not read map names for %s",
+                self._data.blid, exc_info=True,
+            )
+            return {}
+        names: dict[str, str] = {}
+        for entry in versions or []:
+            if not isinstance(entry, dict):
+                continue
+            map_id = entry.get("p2map_id")
+            if map_id:
+                names[str(map_id)] = str(entry.get("name") or map_id)
+        return names
+
+    async def get_segments(self) -> list[Any]:
+        """Prime rooms as HA Clean Area segments.
+
+        The id format is agreed with clean_segments() below and nowhere
+        else, which is why both live here rather than one of them in
+        vacuum.py. Classic makes the same agreement about its own
+        pmap-prefixed format, in the same file, for the same reason.
+
+        Prime needs no pmap prefix: unlike Classic it resolves the map
+        at send time, from the one the robot reports being on.
+        """
+        try:
+            from homeassistant.components.vacuum import Segment  # noqa: PLC0415
+        except ImportError:
+            return []
+
+        # ONE CALL. A test caught a second await here -- it hits the
+        # cloud, and asking twice for a list that has not changed is a
+        # request nobody asked for.
+        #
+        # `_map_metadata()` now backs both this and the zone lookup
+        # below, so the two walks over the maps share one fetch each
+        # rather than doubling them. Cleared here: the cache is meant to
+        # last for one listing, so that a map retrained in the app shows
+        # up the next time this dialog opens.
+        self._map_meta_cache = {}
+        rooms = await self.available_rooms()
+        segments = [
+            Segment(id=f"{self._SEGMENT_PREFIX}{room_id}", name=name, group="Room")
+            for name, room_id in sorted(rooms.items())
+        ]
+
+        # ZONES TOO, WHICH THIS NEVER OFFERED.
+        #
+        # `available_rooms()` reads `rooms_metadata`, and that carries
+        # rooms and not zones -- so a zone could not be mapped to a Home
+        # Assistant area, because it was never in the list the mapping
+        # dialog shows. Classic has offered its zones all along, with a
+        # `zid_` id, in this same file.
+        #
+        # The omission was not a decision: when this was written
+        # `available_rooms()` was the only name source Prime had.
+        # `prime_room_names` came later, for the map, and the places
+        # already reading the older source were never revisited -- the
+        # same root as four other bugs this week.
+        #
+        # `zid_`, not `rid_`: `area_resolver` distinguishes them, and a
+        # zone mapped under a room's prefix would collide with a room of
+        # the same id.
+        known = {seg.id for seg in segments}
+        entry = getattr(self, "_config_entry", None)
+
+        # THREE LAYERS, WIDEST LAST-RESORT FIRST.
+        #
+        # `prime_room_names` holds what the drawn map's bundle and the
+        # last command named -- narrow, but user-set and current. The
+        # version document covers every map, which is the half that was
+        # missing, so it fills gaps rather than overriding: a name
+        # someone typed for the map in front of them wins over one read
+        # from another map's document.
+        names = dict(await self._named_regions_across_maps())
+        names.update(
+            getattr(
+                getattr(entry, "runtime_data", None), "prime_room_names", None
+            )
+            or {}
+        )
+
+        # THE MAPS FOR THE CACHED NAMES, from the same place they come
+        # from.
+        #
+        # `_named_regions_across_maps()` above records a map for every
+        # name it finds. The cache did not, so a name that came only
+        # from there had no floor -- and a zone with no floor cannot be
+        # narrowed to the selected map, nor sent to the robot, which
+        # refuses it as "not currently reporting which map it is on".
+        #
+        # `setdefault`: the per-map lookup is the stronger evidence and
+        # keeps precedence.
+        for _rid, _mid in (
+            getattr(
+                getattr(entry, "runtime_data", None),
+                "prime_room_map_ids",
+                None,
+            )
+            or {}
+        ).items():
+            self._region_map_ids.setdefault(str(_rid), str(_mid))
+        # THE BARE REGION ID, because that is what `names` is keyed by.
+        #
+        # `available_rooms()` returns `{p2map_id}/{room_id}`, so a
+        # straight inversion gives keys like "MAP-A/11" -- and the check
+        # below compares them against "11". It never matched, so EVERY
+        # room was also emitted as a zone: 21 segments where 11 were
+        # meant, each room duplicated under a `zid_` id.
+        #
+        # Invisible in the selector, which keys by NAME and silently
+        # collapsed each pair back to one. Visible in the area-mapping
+        # dialog, which keys by id and showed both -- @chairstacker's
+        # "they both still have rooms and zones in them", which I had
+        # read as a description of the grouping rather than a bug.
+        rooms_by_id = {
+            str(room_id).rsplit("/", 1)[-1]: name
+            for name, room_id in rooms.items()
+        }
+        # SORTED BY NAME, as the rooms above are. This sorted by region
+        # id, so the zone half of the area-mapping dialog came out in an
+        # order that looks random next to an alphabetical room list
+        # (@chairstacker).
+        # NOT NARROWABLE IS NOT THE SAME AS EMPTY. A backend that
+        # cannot answer which maps exist must keep offering what it
+        # always offered, rather than silently offering nothing.
+        _offerable_maps: list[str] | None = None
+        with contextlib.suppress(Exception):
+            _offerable_maps = await _maps_to_offer(
+                self, await self._all_map_ids()
+            )
+        for region_id, region_name in sorted(
+            names.items(), key=lambda item: str(item[1]).casefold()
+        ):
+            if str(region_id) in rooms_by_id or not region_name:
+                continue
+            # ZONES FOLLOW THE SAME RULE AS ROOMS.
+            #
+            # `available_rooms()` narrows to the map the robot can
+            # reach and this list inherits that for ROOMS -- but zones
+            # are added here from their own source and were not
+            # narrowed. So a two-map robot still saw zones from the
+            # other map in the dropdown, which is the list
+            # @chairstacker picked "Foyer Zone" from before being
+            # refused.
+            _zone_map_check = getattr(self, "_region_map_ids", {}).get(
+                str(region_id)
+            )
+            if (
+                _offerable_maps is not None
+                and _zone_map_check
+                and _zone_map_check not in _offerable_maps
+            ):
+                continue
+            # MAP-QUALIFIED, like the room ids above. `available_rooms()`
+            # returns `{p2map_id}/{room_id}` and clean_rooms() splits on
+            # the slash to learn the map; a bare zone id gave it nothing
+            # to split, so a two-map robot refused every zone clean.
+            _zone_map = getattr(self, "_region_map_ids", {}).get(str(region_id))
+            seg_id = (
+                f"{ZID_PREFIX}{_zone_map}/{region_id}"
+                if _zone_map
+                else f"{ZID_PREFIX}{region_id}"
+            )
+            if seg_id in known:
+                continue
+            segments.append(
+                Segment(id=seg_id, name=str(region_name), group="Zone")
+            )
+        return segments
+
+    async def clean_segments(self, segment_ids: list[str]) -> None:
+        """Decode HA segment ids back to room ids and clean them."""
+        # THE `zid_` PREFIX SURVIVES; only `rid_` is stripped.
+        #
+        # `_send_region_command()` decides between RegionType.ZID and
+        # RegionType.RID by looking for exactly that prefix. Removing it
+        # here left the zone indistinguishable from a room, so it went
+        # out as RID with an id no room has -- @chairstacker's robot
+        # left the dock, localised, found nothing to clean and declared
+        # the mission complete.
+        #
+        # The comment that stood here worried about the opposite: that
+        # keeping the prefix would clean "whatever room happened to
+        # share the remainder". That is the danger for `rid_`, whose
+        # remainder IS a room id. For `zid_` the remainder is a zone id,
+        # and stripping it is what makes the two collide.
+        # THE MAP GOES FIRST, THE TYPE PREFIX SECOND.
+        #
+        # `clean_rooms()` splits on the first slash to learn which map
+        # the command is for, and `_send_region_command()` then looks
+        # for `zid_` on what is left. A zone id arrives here as
+        # `zid_<map>/<region>`, so the two have to swap: `<map>/zid_
+        # <region>`. Get it wrong in either direction and one of the two
+        # readers sees nothing it recognises.
+        room_ids: list[str] = []
+        for seg_id in segment_ids:
+            if seg_id.startswith(self._SEGMENT_PREFIX):
+                room_ids.append(seg_id[len(self._SEGMENT_PREFIX):])
+            elif seg_id.startswith(ZID_PREFIX):
+                rest = seg_id[len(ZID_PREFIX):]
+                if "/" in rest:
+                    p2map, region = rest.split("/", 1)
+                    room_ids.append(f"{p2map}/{ZID_PREFIX}{region}")
+                else:
+                    room_ids.append(seg_id)
+        if not room_ids:
+            # A stale area mapping, or segments belonging to another
+            # vacuum. Cleaning nothing quietly would look like success.
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="no_valid_segments",
+            )
+        await self.clean_rooms(room_ids)
+
+    async def clean_rooms(
+        self,
+        room_ids: list[str],
+        *,
+        ordered: bool = True,
+        two_pass: list[bool | None] | None = None,
+        suction_level: list[int | None] | None = None,
+        operating_mode: list[int | None] | None = None,
+        # SENT PER REGION (4.5.0b5). This said "no confirmed per-region
+        # scrub field" and dropped it, while roombapy-prime had read
+        # `cmd.regions[].params.swScrub` from a real Prime mission
+        # history; @gunzxz's Plus 405 Combo (cap.scrub 3, per room)
+        # asked for it.
+        smart_scrub: list[bool | None] | None = None,
+        # ACCEPTED AND IGNORED, on purpose: a Classic-shaped mop setting
+        # (the Classic app capture puts it in the region's own params).
+        # Prime carries pad wetness as `{"padPlate": N}`, so the honest
+        # behaviour is to take the argument and do nothing rather than
+        # invent a Prime shape from a Classic payload.
+        pad_wetness: list[int | None] | None = None,
+    ) -> None:
+
+        # SAME READINESS CHECK CLASSIC HAS. A robot rebuilding its map
+        # has region ids in flux, so a command sent now can target a
+        # room that no longer exists by the time it arrives -- it either
+        # fails or cleans somewhere else.
+        #
+        # Added after comparing the two generations feature by feature:
+        # Prime reports the same notReady bit and simply was not being
+        # asked. Everything else had an equivalent; this was the one
+        # thing Classic did that Prime did not.
+        self._raise_if_map_updating()
+
+        # Ids arrive qualified as "<p2map_id>/<room_id>" (see
+        # available_rooms), which removes the guesswork entirely: the
+        # map is not inferred from where the robot happens to be, it
+        # comes with the room the caller asked for.
+        qualified = [r for r in room_ids if "/" in r]
+        if qualified:
+            maps = {r.split("/", 1)[0] for r in qualified}
+            if len(maps) > 1:
+                raise HomeAssistantError(
+                    "Those rooms are on different maps. A single cleaning command "
+                    "can only target one map, so please clean them separately.", translation_domain=DOMAIN, translation_key="rooms_on_different_maps"
+                )
+            # Optional across both branches: the block further down
+            # clears it when the robot names a map that is not in its
+            # own list, and the fallback keys on `not p2map_id`.
+            p2map_id: str | None = maps.pop()
+
+            # SAY SO WHEN THE ROBOT IS SOMEWHERE ELSE.
+            #
+            # The command still goes out: the "active map" this
+            # integration knows is what the robot last reported, and it
+            # is routinely stale. @ScenicSystemsLLC ran a favourite for
+            # a map we did not consider active and the robot went
+            # straight there -- because it was physically standing on
+            # that floor, whatever our flag said. Refusing on the flag
+            # would have blocked a mission that worked.
+            #
+            # But the reverse costs the user a real three minutes.
+            # @chairstacker targeted a room on his secondary map with
+            # the robot downstairs; it accepted, wandered, and gave up
+            # with "Roomba is a little lost" and error 69. Nothing in
+            # his log connected the two.
+            #
+            # A robot can only ever be on one floor. Cleaning another
+            # map's room means someone carried it there -- so this is a
+            # warning, not a refusal, and it names both maps.
+            try:
+                _on_map, _is_live = await self.where_the_robot_is()
+            except Exception:  # noqa: BLE001
+                _on_map, _is_live = None, False
+            if _on_map and p2map_id and _on_map != p2map_id:
+                _LOGGER.warning(
+                    "roomba_plus: cleaning a room on map %s while %s %s map "
+                    "%s. Sending anyway -- if somebody carried the robot to "
+                    "that floor this is exactly right -- but if not, it will "
+                    "search, fail to place itself and stop with a navigation "
+                    "error a few minutes from now",
+                    p2map_id,
+                    self._data.blid,
+                    "reports being on" if _is_live else "was last seen on",
+                    _on_map,
+                )
+            room_ids = [r.split("/", 1)[1] for r in qualified]
+            self._raise_if_map_updating()
+            # `maps.pop()` yields a str; the annotation is Optional
+            # because a later branch clears it, and mypy keeps the
+            # widened type across the whole function.
+            assert p2map_id is not None  # noqa: S101
+            await self._send_region_command(
+                p2map_id, room_ids, ordered=ordered,
+                two_pass=two_pass, suction_level=suction_level,
+                operating_mode=operating_mode, smart_scrub=smart_scrub,
+            )
+            return
+
+        p2map_id = await self._current_map_id()
+
+        # BEFORE FALLING BACK TO THE ROBOT'S REPORT, ASK THE ROOMS.
+        #
+        # @chairstacker's clean_zone on a two-map robot failed with "not
+        # currently reporting which map" even mid-mission: _current_map_id
+        # reads `cleanMissionStatus.p2mapId`, which his robot did not
+        # populate. But a room/zone id belongs to exactly one map, and
+        # available_rooms() already knows which map each id is on -- so
+        # the map the caller means is derivable from the ids they gave,
+        # with no need for the robot to volunteer it.
+        #
+        # This is the unqualified-id counterpart of the "<map>/<room>"
+        # path above: the qualified form carries the map explicitly, and
+        # here we recover it from the map metadata. Only used when every
+        # requested id resolves to one map; a mix is left to the checks
+        # below, which refuse honestly.
+        if not p2map_id:
+            region_to_map = await self._region_to_map()
+
+            # ZONE IDS CARRY A PREFIX; THE INDEX DOES NOT.
+            #
+            # `_region_to_map()` is keyed by bare region id, because it
+            # reads `rooms_metadata` -- which lists every region on the
+            # map, zones included. A zone arrives here as `zid_100`, so
+            # the lookup missed every time and the map stayed unknown.
+            #
+            # On a one-map robot that is invisible: the fallback below
+            # picks the only map. On a robot with two, it raises "not
+            # currently reporting which one it is on" -- which is what
+            # @chairstacker sees on 4.1.6 with a correct room list.
+            def _bare(rid: str) -> str:
+                return rid[len(ZID_PREFIX):] if rid.startswith(ZID_PREFIX) else rid
+
+            wanted = {
+                region_to_map[_bare(r)]
+                for r in room_ids
+                if region_to_map.get(_bare(r))
+            }
+            if len(wanted) == 1:
+                p2map_id = wanted.pop()
+
+        # THE ROBOT'S MAP MUST BE ONE WE LISTED ROOMS FROM.
+        #
+        # Room ids come from get_map_metadata() per map; the map to
+        # clean against comes from the robot's own report. Two sources,
+        # and nothing checked them against each other -- so a robot
+        # reporting a map that is not in its own list (carried to
+        # another floor, a map deleted in the app while HA was running,
+        # a freshly created one) would have had ids from map A sent
+        # against map B. The robot then cleans the wrong room or
+        # nothing, with no error anywhere.
+        #
+        # Falling back to the single-map path is right here: if there is
+        # exactly one map, its ids are the only ids there are. With
+        # several, refusing is the only honest answer.
+        if p2map_id and p2map_id not in await self._all_map_ids():
+            _LOGGER.warning(
+                "roomba_plus: robot %s reports being on map %s, which is not in its "
+                "own map list -- ignoring it and falling back",
+                self._data.blid, p2map_id,
+            )
+            p2map_id = None
+
+        if not p2map_id:
+            # Falling back to a single map is safe; guessing between
+            # several is not. On one map there is nothing to get wrong.
+            map_ids = await self._all_map_ids()
+            if len(map_ids) == 1:
+                p2map_id = map_ids[0]
+            elif len(map_ids) > 1:
+                raise HomeAssistantError(
+                    f"This robot has {len(map_ids)} maps and is not currently "
+                    "reporting which one it is on, so there is no way to tell which "
+                    "floor's rooms you mean. Start the robot from the iRobot app "
+                    "first, or wait until it has relocalised.", translation_domain=DOMAIN, translation_key="current_map_unknown", translation_placeholders={"count": str(len(map_ids))}
+                )
+            else:
+                raise HomeAssistantError(
+                    "This robot has no saved maps yet, so it cannot clean a named "
+                    "room. Let it finish a full mapping run first.", translation_domain=DOMAIN, translation_key="no_saved_maps"
+                )
+
+        await self._send_region_command(
+            p2map_id, room_ids, ordered=ordered,
+            two_pass=two_pass, suction_level=suction_level,
+            operating_mode=operating_mode, smart_scrub=smart_scrub,
+        )
+
+    async def _send_region_command(
+        self,
+        p2map_id: str,
+        room_ids: list[str],
+        *,
+        ordered: bool,
+        two_pass: list[bool | None] | None,
+        suction_level: list[int | None] | None,
+        operating_mode: list[int | None] | None = None,
+        smart_scrub: list[bool | None] | None = None,
+    ) -> None:
+        """Builds and sends the region command for one map.
+
+        Extracted so the qualified-id path and the fallback path cannot
+        drift apart -- two copies of a payload this specific is exactly
+        how a wire key ends up correct in one place and wrong in the
+        other.
+        """
+
+        # THE CLEANING MODE SELECT, WHICH PRIME WAS IGNORING.
+        #
+        # `_selected_cleaning_mode()` reads the dropdown, and it had one
+        # reader: Classic's `clean_rooms()`. So a Prime robot showed the
+        # control, accepted a change, and cleaned in whatever mode it
+        # was already in (@chairstacker, whose robot mops).
+        #
+        # Caller first, select second, robot's own setting last -- the
+        # same precedence Classic uses, written here rather than shared
+        # because the two build their payloads differently.
+        #
+        # HERE RATHER THAN IN `clean_rooms()`: this is the single place
+        # every Prime region command passes through, both callers
+        # included, so a path added later inherits it.
+        #
+        # EVERY ROOM, NOT THE FIRST (#254, @AR2000AR). `_region_params()`
+        # reads the list per room and does not spread a short one, so a
+        # one-element list from the select mopped the first room and left
+        # the rest in the robot's own mode.
+        if not operating_mode:
+            _selected = _selected_cleaning_mode(self._config_entry)
+            if _selected is not None:
+                operating_mode = [_selected] * len(room_ids)
+        # NOT INTO A FAULT THAT RULES THE MODE OUT (4.4.2): mopping with
+        # the pad plate missing, vacuuming with it fitted, anything with
+        # the robot off the floor. Here, so every region start has it.
+        raise_if_prime_start_blocked(
+            self._data, list(operating_mode or []),
+            robot_name=getattr(self._config_entry, "title", None),
+        )
+        from roombapy_prime.models.mission_control import (  # noqa: PLC0415
+            CommandParams,
+            MissionCommandType,
+            Region,
+            RegionType,
+            RoutineCommand,
+        )
+
+        command = RoutineCommand(
+            command_type=MissionCommandType.START,
+            asset_id=self._data.blid,
+            # The field two field sessions were spent establishing.
+            initiator="rmtApp",
+            # The dataclass field is map_id; it serialises to the wire
+            # key p2map_id. Assuming the two matched would have failed
+            # on the first real call.
+            map_id=p2map_id,
+            ordered=1 if ordered else 0,
+            regions=[
+                Region(
+                    region_id=(
+                        rid[len(ZID_PREFIX):] if rid.startswith(ZID_PREFIX) else rid
+                    ),
+                    # ZONES ARE MARKED BY PREFIX, NOT BY A SEPARATE
+                    # ARGUMENT.
+                    #
+                    # The Classic backend has split rooms from zones on
+                    # a `zid_` prefix in this same list since v2.7.0.
+                    # Prime hardcoded RID, so a zone id arriving here
+                    # was sent as a room -- which the robot answers by
+                    # cleaning nothing, or the wrong region if a room
+                    # happens to carry that number.
+                    #
+                    # Found when wiring the clean_zone service for
+                    # @chairstacker, whose robot is Prime: the service
+                    # would have looked correct and done nothing.
+                    region_type=(
+                        RegionType.ZID
+                        if rid.startswith(ZID_PREFIX)
+                        else RegionType.RID
+                    ),
+                    # Omitted entirely when the caller has no opinion,
+                    # rather than sent as False. The confirmed field
+                    # payload only ever carried params the app itself
+                    # set, and inventing a value here would override
+                    # whatever the user configured on the robot.
+                    params=_region_params(
+                        CommandParams, two_pass, suction_level, i,
+                        operating_mode=operating_mode, smart_scrub=smart_scrub,
+                    ),
+                )
+                for i, rid in enumerate(room_ids)
+            ],
+        )
+        # OUR SIDE OF THE WIRE, recorded. The robot's `lastCommand`
+        # only shows what it RECEIVED, which is the thing in doubt when
+        # a command produces nothing.
+        _ok = await self._robot.send_routine_command_via_cmd_topic(command)
+        record_command(
+            self._config_entry, "start (regions)",
+            {"map_id": p2map_id, "region_ids": room_ids}, ok=bool(_ok),
+        )
+        if _ok is False:
+            _LOGGER.warning(
+                "Roomba+: region command publication was not confirmed; "
+                "delivery to the robot is unknown",
+            )
+            # Match simple commands: an unconfirmed publish must fail
+            # the action before a mission plan is recorded.
+            raise HomeAssistantError(
+                "Publication of the region command was not confirmed. "
+                "Delivery is unknown; check the robot's state before retrying.",
+                translation_domain=DOMAIN,
+                translation_key="command_not_delivered",
+                translation_placeholders={"command": "start (regions)"},
+            )
+
+        # THE PLAN GETS THE IDS THE ROBOT WILL REPORT.
+        #
+        # `room_ids` still carries our `zid_` markers here. The mission
+        # timer matches planned regions against what the robot reports
+        # as it cleans, and the robot reports a bare `100` -- so a
+        # prefixed plan would never match, and a zone mission would show
+        # every region as unvisited for its whole run.
+        self._note_mission_plan(
+            p2map_id,
+            [
+                rid[len(ZID_PREFIX):] if rid.startswith(ZID_PREFIX) else rid
+                for rid in room_ids
+            ],
+        )
+
+    def _note_mission_plan(self, p2map_id: str, room_ids: list[str]) -> None:
+        """Tells MissionTimerStore which rooms this mission will visit.
+
+        THE LINK THAT WAS MISSING. The store was created for Prime and
+        fed phase transitions, but nothing ever called set_mission_plan()
+        -- only the Classic MQTT callback path does. Four things depend
+        on it:
+
+          - the advance_room service, whose planned_rooms was always
+            empty, so it silently did nothing
+          - current_room and next_room, both blank
+          - the mission progress sensor, which showed elapsed time and no
+            remaining estimate -- half working, and looking whole
+
+        ESTIMATES COME FROM MEASURED HISTORY, not from the cloud.
+        get_time_estimates() would supply predictions, and an APK pass
+        established that its request body is assembled in native code --
+        the key names are not determinable, and guessing them is what
+        cost three testers weeks on virtual walls.
+
+        So the estimate is the median of how long this robot has actually
+        taken in that room, from past missions. Better than a model
+        value, and None for a room never cleaned -- which
+        set_mission_plan already accepts per room, because Classic has
+        the same gap for a newly named room.
+
+        ONLY COVERS MISSIONS HOME ASSISTANT STARTED. A robot cleaning on
+        its own schedule still has no plan here -- the timeline reports
+        rooms as it enters them, but not the list up front. That is a
+        real limitation and not one this can fix.
+        """
+        try:
+            store = getattr(self._data, "mission_timer_store", None)
+            hass = getattr(self._data, "hass_ref", None) or self._hass
+            entry_id = getattr(self._config_entry, "entry_id", None)
+            if store is None or hass is None or not entry_id:
+                return
+            from .prime_mission_sync import estimate_room_seconds  # noqa: PLC0415
+
+            per_room = estimate_room_seconds(
+                getattr(self._data, "mission_store", None), list(room_ids)
+            )
+            known = [s for s in per_room if s is not None]
+            store.set_mission_plan(
+                f"{p2map_id}:{'+'.join(room_ids)}",
+                list(room_ids),
+                # Total only when EVERY room has a measurement. A partial
+                # sum would read as the whole mission and be short by
+                # however many rooms are missing -- worse than showing
+                # nothing, because nothing is visibly nothing.
+                sum(known) if len(known) == len(room_ids) else None,
+                hass,
+                entry_id,
+                room_estimates_sec=per_room,
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug(
+                # NOT INSTRUMENTED: the plan is a convenience record for
+                # room progress, and a robot cleaning everywhere has no
+                # plan to write -- absence here is a normal state.
+                "roomba_plus: could not record the mission plan", exc_info=True
+            )
+
+
+class ClassicRoomCleaning(RoomCleaningBackend):
+    """Classic rooms, via the Classic cloud coordinator.
+
+    Wraps what services.py already did, unchanged in behaviour. It is
+    here so the services stop having to know which generation they are
+    talking to -- not because the Classic path needed fixing.
+    """
+
+    def __init__(
+        self, data: RoombaData, config_entry: RoombaConfigEntry, hass: Any = None
+    ) -> None:
+        self._data = data
+        self._config_entry = config_entry
+        self._hass = hass
+        self._pmap_by_region: dict[str, str] = {}
+        #: region id -> wire region type ("rid" or "zid").
+        #:
+        #: A ZONE IS NOT A ROOM ON THE WIRE, and this sent every region
+        #: as "rid". The robot's own command schema enumerates
+        #: `["rid", "zid", "wid", "tag"]` (ruby firmware), so a zone sent
+        #: as a room is wrong against the vendor contract -- and room and
+        #: zone ids are numbered per map, so the id very likely names a
+        #: real but different region.
+        #:
+        #: The Prime backend already picks the type from an id prefix;
+        #: Classic ids arrive bare, so the source has to be remembered
+        #: while the list is built. Fourth repair in this project to have
+        #: reached one of two sibling classes and not the other.
+        self._type_by_region: dict[str, str] = {}
+
+        #: The local robot, narrowed once for this whole class.
+        #:
+        #: A CLOUD_ONLY entry gets `PrimeRoomCleaning`, never this one,
+        #: so `data.roomba` is always set here. mypy cannot see that
+        #: across the factory, and reported it at each send site --
+        #: which invites an `if roomba is None` at every one of them,
+        #: turning a class-wide invariant into scattered runtime checks
+        #: for a condition that cannot occur.
+        #:
+        #: Stated once, where it is true.
+        if data.roomba is None:  # pragma: no cover - Prime gets the other backend
+            raise RuntimeError(
+                "ClassicRoomCleaning built for an entry with no local "
+                "robot -- a CLOUD_ONLY entry should have PrimeRoomCleaning"
+            )
+        self._roomba = data.roomba
+
+    @property
+    def _cloud(self) -> IrobotCloudCoordinator:
+        """The cloud coordinator, for the room-targeting paths.
+
+        Region ids come from the cloud pmap, so `clean_rooms` and
+        `clean_segments` cannot work without one. Listing rooms and
+        reading names can, and those run on entries with no cloud at
+        all -- which is why this raises where it is read rather than
+        refusing in the constructor.
+
+        Five reads share it. Checking at each would be five runtime
+        tests for one invariant, and mypy cannot follow `has_cloud`
+        because a property narrows nothing.
+        """
+        cloud = self._data.cloud_coordinator
+        if cloud is None:
+            raise ServiceValidationError(
+                "room targeting needs cloud credentials on this robot",
+                translation_domain=DOMAIN,
+                translation_key="cloud_required",
+            )
+        return cloud
+
+    def _raise_if_map_updating(self) -> None:
+        """Refuses while the robot is rebuilding its map.
+
+        Was inline in services.py; moved with everything else. A robot
+        rebuilding its map has region ids in flux, so a command sent now
+        can target a room that no longer exists on arrival.
+        """
+        state = self._data.roomba_reported_state()
+        not_ready = (state.get("cleanMissionStatus") or {}).get("notReady", 0)
+        # Coerced: a robot that reports notReady as a string, or a test
+        # fixture handing back a mock, must not make this raise -- a
+        # false "map is updating" refusal blocks a legitimate request
+        # for a reason the user cannot act on.
+        if not isinstance(not_ready, int):
+            return
+        if not_ready == MAP_UPDATING_NOT_READY:
+            raise ServiceValidationError(
+                "The robot is currently updating its Smart Map. Wait for the update "
+                "to complete (readiness sensor shows 'Ready'), then try again.",
+                translation_domain=DOMAIN,
+                translation_key="map_updating",
+            )
+
+    async def where_the_robot_is(self) -> tuple[str | None, bool]:
+        """The floor the robot was last sent to, never a live reading.
+
+        A CLASSIC ROBOT DOES NOT SAY WHERE IT IS. There is no
+        `p2mapId` in its `cleanMissionStatus` -- that is Prime's.
+
+        But it does not need to. `lastCommand.pmap_id` is the map the
+        last command targeted, and a robot that finished a mission on
+        one floor is standing on that floor: it drove back to the dock
+        there. Carried robots exist; missions that end somewhere else
+        do not.
+
+        WHY NOT `active_pmap_id`: it is the CLOUD's notion, the most
+        recently updated map. @ScenicSystemsLLC checked it directly on a
+        two-map Classic robot -- two missions run against one map,
+        forced fresh reads after each, and the active map never moved
+        off the other one. It is not a location.
+
+        The two disagree in the field, and `lastCommand` is the one that
+        tracks reality: on his Braava the last command named the map she
+        actually cleaned while the active map named a different one. On
+        @Thonno's two-map i7+ the same split appears, and his start
+        failed with "Smart Map localization failed" -- the robot was on
+        the floor `lastCommand` names, not the one the cloud calls
+        active.
+
+        Marked NOT live, always. This is a memory, and a memory is right
+        until somebody carries the robot upstairs.
+        """
+        with contextlib.suppress(Exception):
+            state = self._data.roomba_reported_state() or {}
+            pmap_id = (state.get("lastCommand") or {}).get("pmap_id")
+            if pmap_id:
+                return str(pmap_id), False
+        return None, False
+
+    async def map_names(self) -> dict[str, str]:
+        """{pmap_id: display name}, from the cloud map list.
+
+        Parity with Prime: the room/zone selector labels each room
+        with its floor, and a raw pmap id means nothing to a person.
+
+        The name lives in `active_pmapv_details.map_header.name` --
+        not at the top of the pmap entry, where there is no name at
+        all. Falls back to the id so a map with no name still gets a
+        label rather than an empty one.
+        """
+        # `self._cloud` RAISES when there is no cloud -- it is the
+        # accessor room targeting goes through, and refusing there is
+        # right. Labelling a list is not room targeting: no names is a
+        # fine answer, a failed segment listing is not.
+        try:
+            cloud = self._cloud
+        except Exception:  # noqa: BLE001
+            return {}
+        if cloud is None or not getattr(cloud, "data", None):
+            return {}
+        names: dict[str, str] = {}
+        for pmap in cloud.data.get("pmaps", []) or []:
+            if not isinstance(pmap, dict):
+                continue
+            details = pmap.get("active_pmapv_details") or {}
+            header = details.get("map_header") or {}
+            pmap_id = (details.get("active_pmapv") or {}).get("pmap_id")
+            if pmap_id:
+                names[str(pmap_id)] = str(header.get("name") or pmap_id)
+        return names
+
+    async def available_rooms(self) -> dict[str, str]:
+        # NO EARLY RETURN ON A MISSING COORDINATOR.
+        #
+        # Stored zone data lives in the config entry options and needs
+        # no cloud at all -- the comment below says as much, and says a
+        # first version of this "lost every user-named room on installs
+        # without cloud credentials". Six tests caught that.
+        #
+        # It came back here as a guard clause: without a coordinator
+        # this returned {} BEFORE reading the stored zones. Same fault,
+        # four lines higher, and this time nothing caught it because the
+        # tests build a coordinator.
+        #
+        # @Young9898 reported that local-only installs have no way to
+        # get region ids and proposed probing for them by launching real
+        # missions. The ids were already available; we discarded them.
+        coordinator = self._data.cloud_coordinator
+        # BOTH SOURCES, in the original's order: stored zone data
+        # first, cloud regions and zones layered on top.
+        #
+        # A first version of this read only the cloud coordinator and
+        # lost every user-named room on installs without cloud
+        # credentials. Six existing tests caught it -- which is the
+        # reason this was moved rather than rewritten.
+        #
+        # Also records region_id -> pmap_id as a side effect, and that
+        # is what makes clean_rooms() work on ids alone: the only thing
+        # Classic needs beyond a region id is its map, and it already
+        # sits right here.
+        self._pmap_by_region = {}
+        self._type_by_region = {}
+        rooms: dict[str, str] = {}
+
+        zone_data: dict[str, Any] = self._config_entry.options.get(CONF_SMART_ZONE_DATA, {})
+        entries: list[tuple[str, str, str]] = [
+            (str(rid), meta["name"], str(meta.get("pmap_id") or ""))
+            for rid, meta in zone_data.items()
+            if meta.get("name")
+        ]
+
+        coordinator = self._data.cloud_coordinator
+        if coordinator is not None and coordinator.data is not None:
+            for source, region_type in (
+                (coordinator.regions or [], "rid"),
+                (coordinator.zones or [], "zid"),
+            ):
+                for item in source:
+                    if not (item.get("id") and item.get("name")):
+                        continue
+                    # A ZONE CARRIES ITS TYPE IN ITS ID, as on Prime.
+                    #
+                    # Rooms and zones are numbered separately, so room
+                    # `0` and zone `0` can sit on the same map. The type
+                    # was kept in `_type_by_region`, keyed by the bare
+                    # id and filled rooms first, zones second -- so the
+                    # zone overwrote the room, and `clean_room: Hallway`
+                    # went out as `{"region_id": "0", "type": "zid"}`
+                    # and cleaned a 9 sq ft toilet zone instead of a
+                    # 305 sq ft hallway, twice (@FJSoninC, j7+).
+                    #
+                    # The name is what the user picked, so the name has
+                    # to carry the type: `zid_0`, which `clean_rooms()`
+                    # already strips and types for `clean_zone`.
+                    rid = str(item["id"])
+                    entries.append(
+                        (
+                            f"{ZID_PREFIX}{rid}" if region_type == "zid" else rid,
+                            item["name"],
+                            str(item.get("pmap_id") or ""),
+                        )
+                    )
+                    # The bare-id lookup stays for callers that pass a
+                    # bare id, and a room keeps its id: rooms are read
+                    # first, and a zone no longer overwrites one.
+                    self._type_by_region.setdefault(rid, region_type)
+
+            # ROOMS ON THE OTHER MAPS TOO, added last on purpose.
+            #
+            # `coordinator.regions` returns the ACTIVE map only, and
+            # deliberately: two maps sharing a room name would otherwise
+            # produce a silent clean on the wrong floor. That protection
+            # is right and stays -- but it also meant a room existing
+            # only on another map could not be named at all, and
+            # `clean_room` answered "unknown room" for a room the robot
+            # knows perfectly well.
+            #
+            # @ScenicSystemsLLC hit it with a bathroom-only map trained
+            # for spot cleaning: after using it, every room on his real
+            # Second Floor map became unreachable by name.
+            #
+            # LAST, so the collision rule is unchanged. The loop below
+            # keeps the FIRST entry for a name, and the active map's
+            # rooms are already in `entries` by now -- so a duplicate
+            # name still resolves to the active map, exactly as before.
+            # What changes is only the case that used to have no answer.
+            # ONLY MAPS THE ROBOT COULD ACTUALLY BE ON.
+            #
+            # These are the NON-active maps, added so a stored area
+            # mapping keeps working when the cloud's idea of "active"
+            # moves. That fixed a real silent failure -- and it also
+            # started offering rooms from maps the robot cannot reach.
+            #
+            # @Thonno's second map is his father's house, where the
+            # robot used to live. Selecting a room from it produced
+            # error 224 three releases running, with the robot on its
+            # own dock having moved nowhere.
+            _offerable = await _maps_to_offer(
+                self, list((coordinator.regions_by_pmap or {}))
+            )
+            for pmap_id, names in (coordinator.regions_by_pmap or {}).items():
+                if pmap_id == coordinator.active_pmap_id:
+                    continue
+                if pmap_id not in _offerable:
+                    continue
+                # CARRYING THEIR MAP IN THE ID (4.3.3). Region ids are
+                # numbered per map, and everything keyed by the bare id
+                # below -- the map, the type -- was filled from the
+                # active map first. @catongates' upstairs Bathroom went
+                # out on the DOWNSTAIRS map as ZONE 5, "In front of the
+                # Oven": the zone had claimed the bare id first. A
+                # qualified id takes both from itself (`clean_rooms()`).
+                entries += [
+                    (f"{pmap_id}/{rid}", name, str(pmap_id))
+                    for rid, name in names.items()
+                    if rid and name
+                ]
+
+        #: bare id -> the id the list hands out for it, first one wins
+        #: like everything else here; an alias stored against a bare id
+        #: takes it, so it reaches the same map the room's own name does.
+        handed_out: dict[str, str] = {}
+        for rid, name, pmap_id in entries:
+            qualified = "/" in rid
+            unqualified = rid.split("/", 1)[1] if qualified else rid
+            bare = (
+                unqualified[len(ZID_PREFIX):]
+                if unqualified.startswith(ZID_PREFIX) else unqualified
+            )
+            handed_out.setdefault(bare, rid)
+            if name in rooms:
+                # THE SAME REGION, NOW WITH ITS TYPE. Stored zone data
+                # comes first and carries no type; the cloud's entry
+                # for the same name and id says it is a zone. Keeping
+                # the bare id would send it as whatever the bare-id
+                # lookup says, which is a room when the ids collide.
+                #
+                # NOT A ROOM FROM ANOTHER MAP. `<map>/<id>` differs from
+                # its bare id too, so a second map with the same room
+                # name and the same number replaced the active map's
+                # room, and the command went out on the other map.
+                if rid != bare and not qualified and rooms[name] == bare:
+                    rooms[name] = rid
+                continue
+            # FIRST ONE WINS. `rooms[name] = rid` overwrote, so the last
+            # entry decided -- which put the non-active maps in charge
+            # the moment they were added above. Order carries the
+            # priority here, and it has to be read that way.
+            rooms[name] = rid
+            # THE SAME RULE, AND IT WAS NOT.
+            #
+            # `rooms` is keyed by NAME and the first entry wins, which
+            # the comment above establishes. This line is keyed by
+            # REGION ID and plainly assigned, so the LAST entry won --
+            # two opposite precedence rules, one line apart, on the same
+            # loop.
+            #
+            # A region id existing on both maps therefore took its name
+            # from the active map and its map from the other one. The
+            # command then went out with a correct region id, the wrong
+            # map, and that map's version alongside it -- a closed,
+            # consistent, wrong answer, which is why it looked
+            # intermittent: whether it bit depended on which rooms were
+            # picked.
+            #
+            # @Thonno reproduced it deliberately and downloaded the
+            # diagnostics on the spot: the same room worked on
+            # `tM_GAK...` and failed on `oGwE...` with error 224, after
+            # four theories of mine had each been ruled out by one of
+            # his messages.
+            #
+            # Keyed by the BARE id: `clean_rooms()` strips the zone
+            # prefix before it looks the map up.
+            self._pmap_by_region.setdefault(bare, pmap_id)
+
+        # THE NAME THE USER SEES, TOO.
+        #
+        # A room renamed under Configure → Zone management carries an
+        # alias, and every display shows it: the room select, the rooms
+        # map, the card. This list did not, so `clean_room` answered
+        # "Unknown room(s)" for the very name the card had just offered
+        # (found in the card's 2.5.0 review, I8). The original name keeps
+        # working -- automations written before the rename must not
+        # break.
+        #
+        # ONLY FOR A REGION THIS LIST ALREADY HOLDS: the alias names a
+        # room, it does not make one reachable. And a name another room
+        # already has stays with that room, like every other collision
+        # here; the alias then resolves nothing, and the log says so.
+        aliases = self._config_entry.options.get(CONF_SMART_ZONE_ALIASES) or {}
+        if isinstance(aliases, dict):
+            for alias_rid, alias in aliases.items():
+                rid = str(alias_rid)
+                name = str(alias or "").strip()
+                if not name or rid not in self._pmap_by_region:
+                    continue
+                # The alias is stored against the BARE id, so it stays
+                # bare: the type lookup in `clean_rooms()` still types a
+                # zone that has no room twin. Where a room and a zone
+                # share the id, the alias names the room -- the stored
+                # alias cannot say which it meant.
+                owner = rooms.get(name)
+                if owner is None:
+                    rooms[name] = handed_out.get(rid, rid)
+                elif owner not in (rid, handed_out.get(rid, rid)):
+                    _LOGGER.warning(
+                        "clean_room: the name '%s' given to region %s under "
+                        "Zone management already belongs to region %s; "
+                        "it keeps resolving to region %s",
+                        name, rid, owner, owner,
+                    )
+        return rooms
+
+    async def clean_rooms(
+        self,
+        room_ids: list[str],
+        *,
+        ordered: bool = True,
+        two_pass: list[bool | None] | None = None,
+        suction_level: list[int | None] | None = None,
+        operating_mode: list[int | None] | None = None,
+        smart_scrub: list[bool | None] | None = None,
+        pad_wetness: list[int | None] | None = None,
+    ) -> None:
+        """The Classic path, moved here verbatim from services.py.
+
+        MOVED, NOT REWRITTEN. An earlier draft copied it and lost four
+        things in the process -- the cross-map conflict rules, the
+        map-updating readiness check, cloud enrichment of stored zone
+        data, and the distinct "no rooms configured" error. Everything
+        below is the original code with names adjusted for its new home.
+
+        `suction_level` is accepted and ignored: the Classic room
+        payload has no field for it. Ignoring beats raising, so callers
+        need not know which generation they are talking to.
+
+        WHAT USED TO BE HERE INSTEAD:
+
+        Classic room cleaning stays in services.py. A version of it did
+        live here briefly and was removed, because comparing the two
+        line by line showed the copy had quietly lost four things the
+        original does:
+
+          - the 141-line resolution step, including cross-map conflict
+            rules for duplicate room names
+          - the "map is currently updating" readiness check
+          - enriching stored zone data with the cloud coordinator's
+            regions and zones
+          - the distinct "no rooms configured yet" error, which tells a
+            user what to do rather than just failing
+
+        A copy that looks finished and is not is worse than no copy:
+        whoever finds it later may switch the service over to it and
+        lose all four without noticing.
+
+        Moving it properly is worthwhile and is its own task. It touches
+        a path real users depend on daily, and it should not ride along
+        with adding a new generation -- one working generation at a time
+        is easier to verify than two changing at once.
+        """
+        # ZONES ARRIVE MARKED. `clean_zone` sends `zid_<id>`, the marker
+        # every other path in this file uses; the robot wants the bare id
+        # and `"type": "zid"`. Before 4.2.19 the marked id went out as a
+        # room id and the map lookup below never found it, so
+        # `clean_zone` could not work on a Classic robot at all
+        # (@Hardy-196, i7+).
+        #
+        # AND A ROOM FROM ANOTHER MAP ARRIVES AS `<map>/<id>` (4.3.3,
+        # `available_rooms()`): its map and its type are its own, never
+        # the bare-id lookups, which the active map's rooms and zones
+        # filled first. Per position, not per id: room 5 and zone 5 in
+        # one request are two regions.
+        bare_ids: list[str] = []
+        types: list[str | None] = []
+        maps: list[str | None] = []
+        for rid in room_ids:
+            on_map: str | None = None
+            if "/" in rid:
+                on_map, rid = rid.split("/", 1)
+            if rid.startswith(ZID_PREFIX):
+                rid = rid[len(ZID_PREFIX):]
+                types.append("zid")
+            else:
+                types.append("rid" if on_map else None)
+            maps.append(on_map or None)
+            bare_ids.append(rid)
+        room_ids = bare_ids
+
+        if not self._pmap_by_region:
+            # READ IT NOW rather than refuse. `clean_room` reaches this
+            # through available_rooms(), which fills the index;
+            # `clean_zone` does not, and has no other reason to.
+            await self.available_rooms()
+        if not self._pmap_by_region:
+            # Refusing beats sending a command with an empty pmap_id,
+            # which the robot accepts and ignores.
+            raise HomeAssistantError(
+                "Room list has not been read yet, so the map each room belongs to "
+                "is unknown.", translation_domain=DOMAIN, translation_key="room_list_not_read"
+            )
+
+        self._raise_if_map_updating()
+
+        state = self._data.roomba_reported_state()
+        # Every requested region carries its own map; they must all come
+        # from the same one, since the payload has a single pmap_id.
+        wanted = [
+            on_map or self._pmap_by_region.get(rid) or ""
+            for rid, on_map in zip(room_ids, maps, strict=True)
+        ]
+        # ONE COMMAND, ONE MAP. The payload has a single `pmap_id`; with
+        # regions from two maps it took the first and sent the rest to a
+        # map they are not on, where their ids name other regions.
+        if len({m for m in wanted if m}) > 1:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="rooms_different_floors",
+                translation_placeholders={
+                    "pmap_ids": ", ".join(sorted({m for m in wanted if m}))
+                },
+            )
+        pmap_id = next((m for m in wanted if m), "")
+        # AN EMPTY MAP ID IS NOT A NEUTRAL VALUE.
+        #
+        # @Echovictor37 sent a region command with `map_id=None` on a
+        # Combo 105: the broker returned a PUBACK **and the robot cleaned
+        # the whole house.** Not the requested room, and not nothing --
+        # accepted, effective, and not what was asked.
+        #
+        # This fell through to `""` and sent it. A user asking for the
+        # kitchen would get every room, with a success in the log.
+        # Refusing is the only honest answer: we cannot address a room
+        # without knowing its map.
+        if not pmap_id:
+            raise ServiceValidationError(
+                "The map these rooms belong to is not known yet, so a "
+                "room-targeted clean cannot be sent. Sending it anyway would "
+                "start a whole-house clean instead. Wait for the map to load, "
+                "or start the robot without naming rooms.", translation_domain=DOMAIN, translation_key="room_map_unknown"
+            )
+        # WRONG FLOOR? SAY SO, BUT SEND IT.
+        #
+        # The Prime path has warned about this for a while. Classic
+        # could not, because nothing here knew where the robot was --
+        # and Classic is where it matters most: @Thonno's two-map i7+
+        # and @ScenicSystemsLLC's household are both Classic.
+        #
+        # `where_the_robot_is()` reads `lastCommand.pmap_id` -- the
+        # floor the robot was last sent to, which is where it drove back
+        # to its dock. Never live, always a memory.
+        #
+        # NOT BLOCKED. Somebody may have carried the robot upstairs, and
+        # then this command is exactly right. But when @Thonno's start
+        # failed with "Smart Map localization failed", nothing in the
+        # log connected that to the floor -- and this is the line that
+        # would have.
+        with contextlib.suppress(Exception):
+            _on_map, _is_live = await self.where_the_robot_is()
+            if _on_map and pmap_id and _on_map != pmap_id:
+                _LOGGER.warning(
+                    "roomba_plus: cleaning map %s, but %s was last sent to "
+                    "map %s and should be standing there. Sending anyway -- "
+                    "if the robot was carried to the other floor this is "
+                    "right, otherwise expect it to refuse with a "
+                    "localisation error and stay on the dock.",
+                    pmap_id, self._data.blid, _on_map,
+                )
+
+        # THE VERSION OF THE MAP BEING CLEANED. This took the ACTIVE
+        # map's version whatever map the rooms were on, so cleaning a
+        # second floor sent that floor's id with the ground floor's
+        # version. The robot cannot localise against that pairing and
+        # returns error 224 (@Thonno, two-map i7+, robot never moved).
+        #
+        # Invisible on a one-map robot, where active and requested are
+        # always the same map.
+        #
+        # 4.2.13: the version of THIS map from the cloud, whichever map
+        # it is, and the active version rather than the last one the
+        # user made (#183) -- resolve_user_pmapv_id().
+        user_pmapv_id: str = (
+            resolve_user_pmapv_id(
+                state,
+                self._data.cloud_coordinator.data
+                if self._data.has_cloud and self._data.cloud_coordinator is not None
+                else None,
+                pmap_id,
+            )
+            or ""
+        )
+        # WHAT THE USER CHOSE, from the cleaning-mode select. None when
+        # they never picked one, and then nothing is sent.
+        #
+        # This was deliberately left out until "somebody establishes what
+        # the values mean" -- see the note on the room payload above.
+        # They are established now: 2 vacuum, 4 mop, 32 both at once,
+        # 512 vacuum then mop, confirmed from schedules on two accounts
+        # and from the app's own operating_mode_defaults.
+        # THE CALLER'S CHOICE OUTRANKS THE SELECT.
+        #
+        # `clean_room` has a `cleaning_mode` field for a run that should
+        # differ from the everyday default -- it was described in
+        # services.yaml and never read, so the service accepted it and
+        # threw it away. The select's value is the fallback, which is
+        # what "leave empty to use the selector" in that description
+        # promises.
+        selected = _selected_cleaning_mode(self._config_entry)
+        def _mode_for(index: int) -> int | None:
+            """This room's mode: caller first, then the select.
+
+            A ONE-ELEMENT LIST APPLIES TO EVERY ROOM. The service passes
+            `[mode]` for a single choice, and reading it positionally
+            would give room one the caller's mode and every other room
+            the select's -- a schedule that mops the kitchen and vacuums
+            the hall, from one field nobody meant that way.
+            """
+            if operating_mode:
+                per_room = (
+                    operating_mode[index] if index < len(operating_mode)
+                    else operating_mode[0] if len(operating_mode) == 1
+                    else None
+                )
+                if per_room is not None:
+                    return per_room
+            return selected
+
+        robot_two_pass = bool(state.get("twoPass", False))
+        no_auto = bool(state.get("noAutoPasses", False))
+
+        def _region_type(index: int, rid: str) -> str:
+            """The id's own type where it carries one, else the lookup."""
+            return types[index] or getattr(self, "_type_by_region", {}).get(rid, "rid")
+
+        params = {
+            "ordered": 1 if ordered else 0,
+            "pmap_id": pmap_id,
+            "user_pmapv_id": user_pmapv_id,
+            "regions": [
+                {
+                    "region_id": rid,
+                    # ZONES GO OUT AS "zid". Everything used to go out
+                    # as "rid" -- see `_type_by_region` for why that is
+                    # wrong against the robot's own schema rather than
+                    # merely inconsistent with the Prime path.
+                    #
+                    # Defaults to "rid" for an id whose source is not
+                    # known: that is the previous behaviour, and it is
+                    # the right fallback because rooms are the common
+                    # case and an id reaching here without having gone
+                    # through the room list is most likely one a caller
+                    # supplied directly.
+                    # `getattr` because tests -- and any caller that
+                    # builds this backend without __init__ -- reach
+                    # `clean_rooms` without the mapping existing. An
+                    # AttributeError here would turn a missing lookup
+                    # into a failed clean.
+                    "type": _region_type(i, rid),
+                    "params": {
+                        "noAutoPasses": no_auto,
+                        # THE CLEANING MODE, when the user has expressed
+                        # one. Omitted entirely otherwise, so a robot
+                        # keeps whatever it would have done -- sending a
+                        # default here would decide for people who never
+                        # touched the control.
+                        # Per room, because the signature carries a list:
+                        # a caller that names one mode gets it everywhere,
+                        # and one that names none falls back to the select.
+                        **(
+                            {"operatingMode": _mode_for(i)}
+                            if _mode_for(i) is not None else {}
+                        ),
+                        # SMART SCRUB, when the caller asks for it.
+                        #
+                        # Shape from a real capture (a user's, posted on
+                        # roomba_rest980's issue tracker): the iRobot
+                        # app sends `swScrub: 1` for "strength 3 with
+                        # smart scrub" and `0` otherwise. The value was
+                        # not inferred from the field name -- the app's
+                        # own control was labelled next to it.
+                        #
+                        # Omitted when unset, like the mode above: this
+                        # integration does not have a device-level scrub
+                        # setting to fall back on, so sending a default
+                        # would be deciding for people who never asked.
+                        **(
+                            {"swScrub": 1 if _per_room(smart_scrub, i) else 0}
+                            if _per_room(smart_scrub, i) is not None else {}
+                        ),
+                        # PAD WETNESS, and the shape differs by tier.
+                        #
+                        # Classic sends `{"disposable": N, "reusable":
+                        # N}` (that capture, 1=light 2=standard
+                        # 3=hard); Prime sends `{"padPlate": N}`. Same
+                        # field name, different structure -- the same
+                        # trap as 32-vs-6 for the combined mode, and it
+                        # would have been built wrong without a real
+                        # Classic payload to read.
+                        #
+                        # ONLY WHEN NAMED. Both pad-wetness selects
+                        # already exist as device settings, and a
+                        # per-region value would silently override what
+                        # somebody set there. An omitted key leaves the
+                        # robot's own setting alone.
+                        **(
+                            {"padWetness": {
+                                "disposable": _per_room(pad_wetness, i),
+                                "reusable": _per_room(pad_wetness, i),
+                            }}
+                            if _per_room(pad_wetness, i) is not None else {}
+                        ),
+                        "twoPass": (
+                            value if (value := _per_room(two_pass, i)) is not None
+                            else robot_two_pass
+                        ),
+                    },
+                }
+                for i, rid in enumerate(room_ids)
+            ],
+        }
+        # A PURE ZONE COMMAND CARRIES NO MAP VERSION. Field logs: with
+        # `user_pmapv_id` the robot answers a zone-only command with
+        # error 224; `async_clean_segments` has omitted it since 2.7.0.
+        # Mixed room and zone commands keep it.
+        if room_ids and all(
+            _region_type(i, rid) == "zid" for i, rid in enumerate(room_ids)
+        ):
+            params.pop("user_pmapv_id", None)
+            user_pmapv_id = ""
+        _LOGGER.info(
+            "clean_room: %s → regions=%s pmap=%s pmapv=%s",
+            self._data.blid, room_ids, pmap_id[:12],
+            user_pmapv_id[:12] if user_pmapv_id else "none",
+        )
+        # OUR SIDE OF THE WIRE, on Classic too.
+        #
+        # The Prime region command records what it sent; these two
+        # did not, so a Classic robot that did nothing left no
+        # record of whether a command went out or with what. That
+        # is the first question every silent-failure report asks.
+        #
+        # `send_command` returns nothing to check, so `ok` stays
+        # None: sent, result unknown -- which is honest rather than
+        # a claim either way.
+        await self._roomba.send_command("start", params)
+        record_command(
+            self._config_entry, "start (regions)",
+            params,
+        )
+
+
+
+    def _segments_from_saved_zone_data(self) -> list[Any]:
+        """Segments built from the config entry's stored zone data.
+
+        Only entries that carry BOTH a name and a `pmap_id` are used:
+        an id with no map cannot be sent, and offering one would put the
+        user back in front of the refusal this fallback exists to avoid.
+        """
+        # Same late import and same failure mode as the main path: on a
+        # Home Assistant without Segment there are no segments to offer,
+        # whatever the source.
+        try:
+            from homeassistant.components.vacuum import Segment  # noqa: PLC0415
+        except ImportError:
+            return []
+
+        saved: dict[str, Any] = self._config_entry.options.get(
+            CONF_SMART_ZONE_DATA, {}
+        ) or {}
+        out: list[Any] = []
+        for rid, meta in saved.items():
+            if not isinstance(meta, dict):
+                continue
+            name = meta.get("name")
+            pmap_id = meta.get("pmap_id")
+            if not name or not pmap_id:
+                continue
+            out.append(Segment(id=f"{pmap_id}/{rid}", name=str(name)))
+        if out:
+            _LOGGER.debug(
+                "async_get_segments: cloud unavailable -- offering %d "
+                "room(s) from saved zone data instead of nothing",
+                len(out),
+            )
+        return out
+
+    async def get_segments(self) -> list[Any]:
+        """The Classic side of HA's Clean Area segment list.
+
+        MOVED (this session), completing what clean_segments started.
+        Leaving the producer in vacuum.py while the consumer lived here
+        split one contract across two files: the pmap-prefixed id format
+        is agreed between exactly these two methods, and nothing else
+        would have flagged them drifting apart.
+
+        Checked before moving rather than after: no entity-only
+        attribute is reached in here, unlike clean_segments, which
+        silently used self.vacuum and self.vacuum_state and needed three
+        rounds of test failures to surface them.
+        """
+        # Segment lands in HA 2026.3. Returning [] on older versions
+        # matches supported_features, which gates CLEAN_AREA on the same
+        # hasattr -- so capability and data agree about whether this HA
+        # can do segments at all.
+        try:
+            from homeassistant.components.vacuum import Segment  # noqa: PLC0415
+        except ImportError:
+            return []
+
+
+        if not self._data.has_cloud or self._data.cloud_coordinator is None:
+            # WHAT WE STORED, when the cloud has nothing.
+            #
+            # `available_rooms()` on this same class starts from the
+            # saved zone data and works through a cloud outage. This
+            # method returned nothing, so the same rooms were reachable
+            # by name through the service and absent from the dropdown
+            # at the same moment -- an inconsistency no user could
+            # explain.
+            #
+            # The guard itself is right: a segment id without a map
+            # prefix is the thing that produces "this robot has N maps
+            # and is not reporting which one" when it is sent. But the
+            # saved data carries `pmap_id` per region, so the prefix is
+            # known without the cloud rather than guessed.
+            #
+            # PRECAUTION, NOT A FIX: no reporter has hit this. It is
+            # here because the two methods disagreed, not because
+            # somebody lost a dropdown.
+            return self._segments_from_saved_zone_data()
+        active_pmap_id = self._cloud.active_pmap_id
+        if not active_pmap_id:
+            # Coordinator has not yet fetched pmap data — returning segments with a
+            # None prefix would create IDs that never match in async_clean_segments.
+            _LOGGER.debug(
+                "async_get_segments: active_pmap_id not yet available — returning empty"
+            )
+            return []
+        floor_label = (
+            self._config_entry.options.get(CONF_FLOOR) or None
+            if self._config_entry else None
+        )
+        # ROOM SEGMENTS FROM EVERY MAP, each id carrying its own.
+        #
+        # This offered the cloud-active map alone, and prefixed every id
+        # with it. Two problems followed from that one choice: rooms on
+        # a second floor could not be mapped to a Home Assistant area at
+        # all, and a stored mapping stopped working whenever the cloud's
+        # notion of "active" moved -- silently, because `clean_segments`
+        # then dropped the foreign prefix without a word.
+        #
+        # `clean_rooms()` has resolved the map per region since 4.1.0
+        # ("every requested region carries its own map"); only this path
+        # was left behind. `regions_by_pmap` gives every map's regions,
+        # and since today its zones too.
+        #
+        # THE ACTIVE MAP GOES FIRST so its names win a duplicate --
+        # "Hallway" upstairs and downstairs is ordinary, and the floor
+        # the robot is on is the reading that is right more often.
+        _by_type = getattr(self._cloud, "region_names_by_type", None)
+        by_map: dict[str, Any] = dict(_by_type) if isinstance(_by_type, dict) else {}
+        # SAME RULE AS THE ROOM LIST. This offers rooms and zones from
+        # every map the cloud knows; a robot can only clean the one it
+        # is standing on, and the rest produce error 224.
+        #
+        # Fails open: a backend that cannot say which maps exist keeps
+        # offering what it always offered.
+        _offerable_maps: list[str] | None = None
+        with contextlib.suppress(Exception):
+            _offerable_maps = await _maps_to_offer(self, list(by_map))
+
+        maps = [
+            pmap_id
+            for pmap_id in [active_pmap_id, *(m for m in by_map if m != active_pmap_id)]
+            if _offerable_maps is None or pmap_id in _offerable_maps
+        ]
+        segments = classic_room_segments(self._cloud, maps, floor_label, Segment)
+        if not segments:
+            # No per-map data yet: fall back to the active map's own
+            # list, which is what this did before and is still right
+            # when the coordinator has only that.
+            segments = [
+                Segment(
+                    id=f"{active_pmap_id}_{region['id']}",
+                    name=region.get("name", region["id"]),
+                    group=floor_label,
+                )
+                for region in self._cloud.regions
+                if region.get("id")
+            ]
+        # Zone segment ids carry "_zid_" so clean_segments can tell them
+        # from rooms (classic_zone_segments).
+        segments.extend(classic_zone_segments(self._cloud, active_pmap_id, Segment))
+        return segments
+
+    async def clean_segments(self, segment_ids: list[str]) -> None:
+        """HA Clean Area segments, which are NOT the same as room ids.
+
+        MOVED VERBATIM from vacuum.py (this session), with two entity
+        attributes rebound: `self.vacuum` and `self.vacuum_state` are
+        conveniences IRobotEntity provides, and they resolve here to
+        `self._data.roomba` and `roomba_reported_state()` -- the same
+        objects by a different route.
+
+        Both were missed by the mechanical rewrite that moved this and
+        were caught by existing tests. Worth naming: a move that renames
+        `data.` to `self._data.` looks complete and silently leaves
+        anything that was reached another way. Kept as its own
+        method rather than folded into clean_rooms(), because Classic
+        segments carry three things room ids do not:
+
+          - a pmap_id prefix, so segments from another map can be
+            recognised and skipped rather than sent to the wrong map
+          - a "zid_" marker separating user-drawn ZONES from named
+            rooms; both clean, through different payload fields
+          - self-healing: a room id that no longer exists on the current
+            map is looked up again by its stored name, because a retrain
+            renumbers rooms and would otherwise break every saved area
+            mapping silently
+
+        None of that has a Prime equivalent, which is why PrimeRoom-
+        Cleaning implements this as a thin decode of its own prefix.
+
+        An earlier plan was to drop this into clean_rooms() and lose the
+        distinction. That would have quietly removed zone cleaning and
+        the self-healing from every Classic user -- the same shape of
+        mistake as an earlier draft here that dropped four capabilities
+        while "moving" code that it was actually rewriting.
+        """
+        active_pmap_id = self._cloud.active_pmap_id
+        if not active_pmap_id:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="no_valid_segments",
+            )
+        region_ids: list[str] = []
+        # ANY MAP, NOT JUST THE ACTIVE ONE.
+        #
+        # The prefix is the map the segment belongs to, and
+        # `clean_rooms()` resolves the map per region anyway. Matching
+        # only the active prefix meant a stored area mapping stopped
+        # working the moment the cloud's list order moved -- and stopped
+        # in silence, which is the failure this project has spent a week
+        # removing.
+        #
+        # ONE MAP PER COMMAND, because the payload carries a single
+        # pmap_id. Rooms from two floors in one call is refused with the
+        # same message Prime gives, rather than half of them being
+        # dropped.
+        by_map: dict[str, list[str]] = {}
+        for seg_id in segment_ids:
+            # A plain split on "_" is wrong: map ids contain them, and
+            # "2Bly_kGURy6OcUVTX7FN3w_19" would lose most of its map.
+            # The region part is always what follows the LAST underscore
+            # of the map id, so match against known maps instead.
+            for candidate in (
+                active_pmap_id,
+                *(m for m in (getattr(self._cloud, "regions_by_pmap", None) or {})),
+            ):
+                marker = f"{candidate}_"
+                if seg_id.startswith(marker):
+                    by_map.setdefault(candidate, []).append(seg_id[len(marker):])
+                    break
+            else:
+                _LOGGER.warning(
+                    "roomba_plus: segment %s does not name a map this robot "
+                    "has, and was not cleaned. Re-map that area in Home "
+                    "Assistant -- a map retrain renumbers everything",
+                    seg_id,
+                )
+
+        if len(by_map) > 1:
+            # The message this project already has for the same
+            # situation on the room-name path -- one wording for one
+            # problem, rather than a second key saying the same thing.
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="rooms_different_floors",
+                translation_placeholders={"pmap_ids": ", ".join(sorted(by_map))},
+            )
+        region_ids = next(iter(by_map.values()), [])
+
+        if not region_ids:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="no_valid_segments",
+            )
+
+        # THE BUTTON PATH NEEDS THE SAME WARNING AS THE SERVICE.
+        #
+        # Prime's `clean_segments()` hands off to its `clean_rooms()`
+        # and inherits the check there. This one does not -- it is a
+        # separate method on purpose -- so the warning had to be
+        # repeated rather than inherited, and was not.
+        #
+        # Which means pressing "Clean selected room" on a two-map
+        # Classic robot, the most ordinary way to reach this code, was
+        # the one route with nothing to say about floors.
+        _target_map = next(iter(by_map), "")
+        with contextlib.suppress(Exception):
+            _on_map, _is_live = await self.where_the_robot_is()
+            if _on_map and _target_map and _on_map != _target_map:
+                _LOGGER.warning(
+                    "roomba_plus: cleaning map %s, but %s was last sent to "
+                    "map %s and should be standing there. Sending anyway -- "
+                    "if the robot was carried to the other floor this is "
+                    "right, otherwise expect it to refuse with a "
+                    "localisation error and stay on the dock.",
+                    _target_map, self._data.blid, _on_map,
+                )
+
+        # IA74-ZONE full (v2.7.0): split room IDs from zone IDs.
+        # Zone segment IDs were encoded as "zid_{zone_id}" after prefix-stripping
+        # in async_get_segments().  Rooms are plain integers (e.g. "19").
+        # Was a local literal; now the module constant, so Classic and
+        # Prime cannot drift apart on what marks a zone.
+        _ZONE_PREFIX = ZID_PREFIX
+        raw_zone_ids = [r for r in region_ids if r.startswith(_ZONE_PREFIX)]
+        raw_room_ids = [r for r in region_ids if not r.startswith(_ZONE_PREFIX)]
+        # Extract the bare zone_id (strip "zid_" prefix)
+        bare_zone_ids = [z[len(_ZONE_PREFIX):] for z in raw_zone_ids]
+
+        # Validate + auto-heal room IDs against the current cloud map (zone IDs
+        # are stable across map retrains — no validation needed for them).
+        # THE SEGMENT'S OWN MAP, not just the active one.
+        #
+        # `self._cloud.regions` is the active map alone, so a region on
+        # any other map failed this check and was discarded as "stale" --
+        # which turned the newly-allowed foreign-map segment straight
+        # back into a silent no-op, one step further down.
+        #
+        # The healing itself still needs the active map's names: a
+        # retrain renumbers rooms THERE, which is what it exists to
+        # repair. Widening only the validity test keeps that intact.
+        current_regions = self._cloud.regions
+        _segment_map = next(iter(by_map), active_pmap_id)
+        _regions_on_that_map = (
+            getattr(self._cloud, "regions_by_pmap", None) or {}
+        ).get(_segment_map) or {}
+        current_region_ids: set[str] = {
+            str(r["id"]) for r in current_regions if r.get("id")
+        } | {str(rid) for rid in _regions_on_that_map}
+        validated_room_ids = list(raw_room_ids)
+        if current_region_ids and raw_room_ids:
+            stale = [rid for rid in raw_room_ids if rid not in current_region_ids]
+            if stale:
+                # Build name → current_id lookup from live cloud data
+                name_to_current: dict[str, str] = {
+                    r["name"].casefold(): str(r["id"])
+                    for r in current_regions
+                    if r.get("name") and r.get("id")
+                }
+                zone_labels: dict[str, str] = (
+                    self._config_entry.options.get("smart_zone_labels", {})
+                    if self._config_entry else {}
+                )
+                healed: list[str] = []
+                for stale_rid in stale:
+                    label = zone_labels.get(stale_rid, "")
+                    current_id = name_to_current.get(label.casefold()) if label else None
+                    if current_id and current_id not in raw_room_ids:
+                        healed.append(current_id)
+                        _LOGGER.info(
+                            "async_clean_segments: auto-healed stale region %s → %s "
+                            "('%s') — map retrained but room name matched current map",
+                            stale_rid, current_id, label,
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "async_clean_segments: stale region %s could not be "
+                            "auto-healed (label=%r, not in current map) — skipping. "
+                            "Re-map vacuum segments to areas in HA to fix permanently.",
+                            stale_rid, label or "<unlabeled>",
+                        )
+                validated_room_ids = (
+                    [r for r in raw_room_ids if r in current_region_ids] + healed
+                )
+
+        if not validated_room_ids and not bare_zone_ids:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="no_valid_segments",
+            )
+
+        # THE CLEANING MODE SELECT, HERE TOO.
+        #
+        # `clean_rooms()` reads the dropdown; this method sends its
+        # own command and did not, so a zone cleaned in whatever mode
+        # the robot was already in while the control showed something
+        # else.
+        #
+        # Prime had the same gap on every path and it was closed at
+        # its single send point. Classic has no such point -- this
+        # method exists precisely because it does NOT fold into
+        # `clean_rooms()` -- so the fallback is repeated rather than
+        # shared, and a test holds the two together.
+        _mode = _selected_cleaning_mode(self._config_entry)
+        _params: dict[str, Any] = {"noAutoPasses": False, "twoPass": False}
+        if _mode is not None:
+            _params["operatingMode"] = _mode
+
+        regions = [
+            {
+                "region_id": rid,
+                "type": "rid",
+                "params": dict(_params),
+            }
+            for rid in validated_room_ids
+        ] + [
+            # IA74-ZONE full (v2.7.0): zones use type "zid" with bare zone_id
+            {
+                "region_id": zid,
+                "type": "zid",
+                "params": dict(_params),
+            }
+            for zid in bare_zone_ids
+        ]
+
+        # THE VERSION OF THE MAP BEING CLEANED, not of the active one.
+        #
+        # Pairing the active map's version with another map's id gives
+        # the robot a map and a version that do not belong together --
+        # error 224. Since 4.2.13 the cloud is asked for the segment's
+        # own map, and for its active version (#183):
+        # resolve_user_pmapv_id().
+        user_pmapv_id: str | None = resolve_user_pmapv_id(
+            self._data.roomba_reported_state(),
+            self._cloud.data,
+            _segment_map,
+        )
+        if user_pmapv_id is None:
+            _LOGGER.warning(
+                "async_clean_segments: user_pmapv_id not found in cloud or "
+                "state.pmaps for pmap %s — sending command without version ID",
+                active_pmap_id,
+            )
+
+        # Bug 5 fix (v2.7.0): per field logs, including user_pmapv_id in pure
+        # zone (zid) commands causes error 224. Omit it when no room regions
+        # are present. Mixed room+zone commands retain it for room-ID validation.
+        include_pmapv = bool(validated_room_ids)
+
+        # THE SEGMENT'S OWN MAP, in the payload as well.
+        #
+        # Allowing foreign-map segments through the filter above without
+        # changing this sent map A's id with map B's region ids. The
+        # robot is asked to find regions that do not exist on the map it
+        # was given, and answers with error 224, "Smart Map localization
+        # failed" -- @Thonno, on a two-map i7+ standing on its dock.
+        #
+        # `_segment_map` was already computed above for the validity
+        # check and simply was not used here.
+        params: dict[str, Any] = {
+            "ordered": 1,
+            "pmap_id": _segment_map,
+            "regions": regions,
+        }
+        if include_pmapv and user_pmapv_id is not None:
+            params["user_pmapv_id"] = user_pmapv_id
+        # OUR SIDE OF THE WIRE, on Classic too.
+        #
+        # The Prime region command records what it sent; these two
+        # did not, so a Classic robot that did nothing left no
+        # record of whether a command went out or with what. That
+        # is the first question every silent-failure report asks.
+        #
+        # `send_command` returns nothing to check, so `ok` stays
+        # None: sent, result unknown -- which is honest rather than
+        # a claim either way.
+        await self._roomba.send_command("start", params)
+        record_command(
+            self._config_entry, "start (regions)",
+            params,
+        )
+        # F-RB-1: best-effort state update after segment clean command.
+        # Cloud may not yet have the new state; failure is non-fatal.
+        try:
+            await self._cloud.async_refresh()
+            record_success("post-command cloud refresh")
+        except Exception:  # noqa: BLE001
+            record_failure("post-command cloud refresh")
+            _LOGGER.debug("async_clean_segments: post-command cloud refresh failed (non-fatal)")
+
+def _classic_has_room_data(data: RoombaData, config_entry: RoombaConfigEntry) -> bool:
+    """Whether a Classic robot has any room names to work with.
+
+    NOT the same as has_cloud, which a first draft used and which is too
+    strict: room names live in config_entry.options (smart_zone_data),
+    and the cloud coordinator only ENRICHES that list. Requiring cloud
+    would lock out every Classic user running without credentials -- a
+    real configuration, and one the gate this replaced allowed.
+
+    Also not "always true for SMART", which a second draft used and
+    which is too loose: a robot with a smart map but no named rooms
+    anywhere has nothing to target, and offering room cleaning would
+    produce a service call that can only fail. An existing test caught
+    that one.
+    """
+    # TWO KEYS FOR THE SAME THING, and the check read the wrong one.
+    #
+    # The naming flow writes `smart_zone_labels`. `smart_zone_data` is
+    # written by exactly one path: the rest980 migration, for people
+    # arriving from another integration. So a user who named their rooms
+    # through our own flow still failed this check, and the docstring
+    # above -- "requiring cloud is too strict, room names live in
+    # options" -- described a route that did not exist for them.
+    #
+    # Either key answers the question the check is actually asking: does
+    # this robot have room names to work with.
+    if config_entry.options.get(CONF_SMART_ZONE_DATA):
+        return True
+    if config_entry.options.get(CONF_SMART_ZONE_LABELS):
+        return True
+    coordinator = data.cloud_coordinator
+    return coordinator is not None and coordinator.data is not None
+
+
+def keeps_no_persistent_map(state: dict[str, Any]) -> bool:
+    """True for a robot that cannot keep a map between missions (a 900- or
+    600-series): it cannot be sent to a single room, whatever room list
+    exists.
+
+    DECIDED BY WHAT THE ROBOT SAYS IT CAN DO, not by `map_capability`.
+    That one is also NONE when the map option is off and EPHEMERAL on an
+    i-series whose maps have not arrived yet -- robots that could clean
+    rooms. The test is the one the connect wait uses: a robot with
+    `cap.pmaps`, or more than one `cap.maps`, keeps maps. Without a
+    capability block nothing is concluded.
+    """
+    cap = state.get("cap") if isinstance(state, dict) else None
+    if not isinstance(cap, dict) or not cap:
+        return False
+    pmaps = cap.get("pmaps", 0)
+    maps = cap.get("maps", 0)
+    return not (
+        (isinstance(pmaps, int) and pmaps > 0) or (isinstance(maps, int) and maps > 1)
+    )
+
+
+def async_get_room_cleaning_backend(
+    config_entry: RoombaConfigEntry, hass: Any = None
+) -> RoomCleaningBackend | None:
+    """The backend for this robot, or None when it cannot clean rooms.
+
+    None IS the answer to "does this robot support room cleaning". It
+    replaces the old `map_capability == SMART` check, which was a
+    Classic-shaped question that no Prime robot could ever pass.
+    """
+    if config_entry is None:
+        # Entities can briefly exist without one -- and the code this
+        # replaced checked for it. A move that drops a guard the
+        # original had is the quiet kind of regression, caught here by
+        # an existing test rather than by the move itself.
+        return None
+
+    data: RoombaData = config_entry.runtime_data
+
+    if data.connection_type == ConnectionType.CLOUD_ONLY:
+        return (
+            PrimeRoomCleaning(data, config_entry, hass)
+            if data.prime_robot is not None
+            else None
+        )
+
+    if data.map_capability == MapCapability.SMART and _classic_has_room_data(
+        data, config_entry
+    ):
+        # hass COMES FROM THE CALLER OR IS NONE. It must never be read off
+        # the config entry: ConfigEntry has no `hass` attribute, so
+        # `config_entry.hass` raises AttributeError.
+        #
+        # This factory is called from `supported_features`, a property
+        # Home Assistant evaluates while registering the entity. An
+        # exception there means the entity is never added -- which is how
+        # the vacuum entity, the single most important one in this
+        # integration, disappeared for a tester on v4.0.0a14.
+        #
+        # THE TEST SUITE COULD NOT SEE IT. Every test passes a MagicMock
+        # as the config entry, and a MagicMock answers any attribute
+        # access. All 4,577 tests stayed green against code that raises
+        # on the first real ConfigEntry it meets.
+        #
+        # hass is only needed to record the mission plan; a backend built
+        # without it still lists rooms and still cleans.
+        # is the same object in production but not in tests, whose
+        # fixtures prepare the one the service call carries -- and the
+        # send path runs through hass.async_add_executor_job.
+        return ClassicRoomCleaning(data, config_entry, hass)
+
+    return None
+
+
+# ── Classic room resolution ──────────────────────────────────────────
+#
+# MOVED WHOLESALE FROM services.py (this session), not rewritten. Every
+# line below is the original, because the point of the move is that
+# Classic behaviour does not change -- and a rewrite is exactly how four
+# capabilities went missing in an earlier draft that copied instead of
+# moved.
+#
+# 21 existing clean_room tests cover this and were the check that the
+# move preserved behaviour.
+
+#: `Smart Map localization failed`. The robot records the command and
+#: then refuses to act on it, so its version must not be reused.
+_ERROR_LOCALIZATION_FAILED: int = 224
+
+
+def resolve_user_pmapv_id(
+    state: dict[str, Any], cloud_data: Any, pmap_id: str | None
+) -> str | None:
+    """The map version a room command for `pmap_id` must carry.
+
+    ONE ANSWER FOR EVERY SENDER (4.2.13). Four places built a room
+    command and resolved this in three different orders: `clean_room` and
+    `clean_area` asked the cloud (for the active map only), `send_command`
+    and the repeat-last-mission button never asked it at all. On
+    @cburrell16's robot all four sent the same wrong version (#183).
+
+    1. The version the app stored for this map, in a favourite or a
+       schedule (4.2.14). The one source right in every report so far:
+       @cburrell16's favourites (#183), @FJSoninC's j7+ and
+       @ScenicSystemsLLC's two S9+ -- and the app keeps it current,
+       since its own favourites run on it.
+    2. The cloud's committed version of THIS map (committed_pmapv_id;
+       which field, and why never the robot's own: pmap_committed_version).
+    3. Without cloud data, what the robot and the app have used for this
+       map: see _resolve_pmapv_id.
+
+    NOT THE VERSION THAT JUST FAILED. A favourite or schedule can predate
+    a map edit, and step 1 would then win on every attempt. When the
+    robot's last command for this map ended in error 224, its version is
+    passed over for the next source that differs -- so one failed clean
+    is enough for the next one to try something else. Only when every
+    source gives the failed version is it sent again: nothing better is
+    known.
+    """
+    if not pmap_id:
+        return None
+    favorites = cloud_data.get("favorites") if isinstance(cloud_data, dict) else None
+    failed = _version_that_failed(state, pmap_id)
+    candidates = (
+        ("app favourite/schedule", _app_stored_pmapv_id(state, pmap_id, favorites)),
+        ("cloud map", committed_pmapv_id(cloud_data, pmap_id)),
+        ("robot state", _resolve_pmapv_id(state, pmap_id, favorites=favorites)),
+    )
+    found = [(source, value) for source, value in candidates if value]
+    if not found:
+        return None
+    source, value = next(
+        ((s, v) for s, v in found if v != failed), found[0]
+    )
+    _LOGGER.debug(
+        "Map %s: version %s from %s%s", pmap_id, value, source,
+        f" (passed over {failed}, which failed with error 224)"
+        if failed and failed != value else "",
+    )
+    return value
+
+
+def _version_that_failed(state: dict[str, Any], pmap_id: str) -> str | None:
+    """The version of `pmap_id` the robot's last command carried, if that
+    command ended in error 224; otherwise None."""
+    if (state.get("cleanMissionStatus") or {}).get("error") != _ERROR_LOCALIZATION_FAILED:
+        return None
+    last = state.get("lastCommand") or {}
+    if last.get("pmap_id") != pmap_id or not last.get("user_pmapv_id"):
+        return None
+    return str(last["user_pmapv_id"])
+
+
+def cloud_data_of(entry: Any) -> Any:
+    """The cloud coordinator's data for a config entry, or None.
+
+    Read defensively: entities and backends reach it through
+    `runtime_data`, which is absent on a CLOUD_ONLY path and a bare mock
+    in many tests, and only a dict is data.
+    """
+    runtime = getattr(entry, "runtime_data", None)
+    coordinator = getattr(runtime, "cloud_coordinator", None)
+    data = getattr(coordinator, "data", None)
+    return data if isinstance(data, dict) else None
+
+
+def _app_stored_pmapv_id(
+    state: dict[str, Any], pmap_id: str, favorites: Any = None
+) -> str | None:
+    """The newest version of `pmap_id` in a command the app stored.
+
+    Schedules (`cleanSchedule2`, in the robot's own state) and favorites
+    (cloud) carry the version the app wrote when it saved them, and the
+    robot runs them: @cburrell16's favorites worked on every run while
+    the version from the robot's `pmaps` failed on every run (#183).
+
+    The NEWEST of them, because an older entry may predate a map edit.
+    Versions are fixed-width YYMMDDTHHMMSS, so string order is time
+    order.
+    """
+    found: list[str] = []
+
+    def _take(cmd: Any) -> None:
+        if (
+            isinstance(cmd, dict)
+            and cmd.get("pmap_id") == pmap_id
+            and cmd.get("user_pmapv_id")
+        ):
+            found.append(str(cmd["user_pmapv_id"]))
+
+    for entry in state.get("cleanSchedule2") or []:
+        if isinstance(entry, dict):
+            _take(entry.get("cmd"))
+    for favorite in favorites or []:
+        if isinstance(favorite, dict):
+            for cmd in favorite.get("commanddefs") or []:
+                _take(cmd)
+    return max(found) if found else None
+
+
+def _resolve_pmapv_id(
+    state: dict[str, Any], pmap_id: str, favorites: Any = None
+) -> str | None:
+    """Return user_pmapv_id for pmap_id from local MQTT state.
+
+    NOT THE FIRST CHOICE. Senders call resolve_user_pmapv_id(), which
+    asks the cloud first; this is what remains without it.
+
+    v2.7.4 (PMAP-PMAPV): prefers lastCommand.user_pmapv_id over state.pmaps.
+
+    rest980 protocol: get user_pmapv_id from lastCommand (the stable committed
+    version the robot last accepted).  state.pmaps reflects the live value that
+    the robot writes to MQTT immediately after updating its map — this version
+    is not yet committed for command use and will cause error 224 if sent.
+
+    Fallback to state.pmaps when lastCommand has a different pmap_id (e.g. the
+    robot was last commanded on a different map) or when cloud data is absent.
+    """
+    last = state.get("lastCommand", {})
+
+    # A COMMAND THAT FAILED IS NOT A SOURCE OF TRUTH.
+    #
+    # "The version the robot last accepted" is the whole argument for
+    # preferring `lastCommand`. But the robot ACCEPTS a start it then
+    # refuses to act on: it records the command, sets `error: 224`
+    # ("Smart Map localization failed") and stays on the dock.
+    #
+    # So a wrong version, once sent, is written into `lastCommand` by
+    # the robot and read back here as authoritative on the next attempt.
+    # @Thonno's two-map i7+ was stuck in exactly that loop: 4.2.2 stopped
+    # PRODUCING the mismatched pairing, and the mismatched pairing was
+    # by then cached in his robot, so nothing changed for him.
+    #
+    # The error field says which case this is. A last command that ended
+    # in a localisation failure is skipped, and the per-map value below
+    # is used instead.
+    _last_error = (state.get("cleanMissionStatus") or {}).get("error")
+    _last_failed = _last_error == _ERROR_LOCALIZATION_FAILED
+
+    if (
+        last.get("pmap_id") == pmap_id
+        and last.get("user_pmapv_id")
+        and not _last_failed
+    ):
+        return str(last["user_pmapv_id"])
+    # WHAT THE APP STORED, BEFORE WHAT THE ROBOT REPORTS (4.2.13).
+    #
+    # `pmaps` below is the robot's live version, which this docstring
+    # already calls not yet committed and a cause of error 224. It was
+    # nevertheless the next step after `lastCommand` -- and `lastCommand`
+    # is replaced by every dock, stop or whole-house start, so the
+    # uncommitted value was what most room commands without cloud data
+    # ended up carrying (#183).
+    stored = _app_stored_pmapv_id(state, pmap_id, favorites)
+    if stored:
+        return stored
+    for pmap in state.get("pmaps", []):
+        if pmap_id in pmap:
+            return str(pmap[pmap_id])
+    return None
+
+
+
+def region_names_across_maps(
+    cloud_coordinator: Any, prefer_pmap_id: str | None = None
+) -> dict[str, str]:
+    """{region_id: name} from every map the account holds.
+
+    ONE PLACE, because there were four. `cloud_coordinator.regions`
+    returns the ACTIVE map's regions only -- deliberately, so that two
+    maps sharing a room name cannot collide. Four separate consumers
+    built the same `id_to_name` dict from it, and when 4.1.0 lifted the
+    restriction for `clean_room` the other three kept it.
+
+    @ScenicSystemsLLC found the first of them the evening 4.1.0 shipped:
+    a favourite cleaning a room on a non-active map worked, and
+    `current_room` displayed "Room ID 18" instead of "Hallway". Nobody
+    could have hit it earlier, because until that release a cross-map
+    mission could not be started at all.
+
+    ACTIVE MAP WINS a duplicate name, exactly as before: its entries go
+    in first and `setdefault` leaves them alone.
+    """
+    if cloud_coordinator is None:
+        return {}
+    # ROOMS AND ZONES, both halves of the active map first.
+    #
+    # A first version read `regions` only and a test caught it: the
+    # active map's ZONES would have vanished from every consumer at
+    # once. `regions` and `zones` are separate lists on the coordinator
+    # and always have been -- reading one of them is the mistake this
+    # helper exists to stop repeating.
+    names: dict[str, str] = {}
+
+    # THE MAP THE COMMAND ACTUALLY TARGETED WINS, when the caller knows
+    # which one that was.
+    #
+    # Region ids are unique per map, not across maps. @ScenicSystemsLLC
+    # ran a favourite against his "Second Floor" map while a one-room
+    # "master bathroom" map was active; both have a region "1". The
+    # active map won, and the display said "Primary Bathroom" for the
+    # whole 80-minute mission while the robot worked through five rooms
+    # upstairs.
+    #
+    # That is worse than the placeholder problem this helper was
+    # written for. "Room ID 18" is obviously broken; a real, wrong,
+    # confident room name is not.
+    #
+    # Optional and last-resort by design: every existing caller keeps
+    # the old behaviour, and one that knows the command's `pmap_id` --
+    # from `lastCommand` -- gets the right answer instead of the
+    # active map's.
+    if prefer_pmap_id:
+        _preferred = (
+            getattr(cloud_coordinator, "regions_by_pmap", None) or {}
+        ).get(prefer_pmap_id) or {}
+        for region_id, region_name in _preferred.items():
+            if region_id and region_name:
+                names[str(region_id)] = str(region_name)
+
+    for source in (cloud_coordinator.regions, cloud_coordinator.zones):
+        for r in source or []:
+            if r.get("id") and r.get("name"):
+                names.setdefault(str(r["id"]), str(r["name"]))
+    by_map = getattr(cloud_coordinator, "regions_by_pmap", None) or {}
+    for regions in by_map.values():
+        for region_id, region_name in regions.items():
+            if region_id and region_name:
+                names.setdefault(str(region_id), region_name)
+    return names
+
+class CommandRegionNames:
+    """Names for a command's regions, each found on the command's own map
+    and by its own type (4.5.0). Build once per command, then ask per
+    region with name() or for the whole list with names().
+
+    region_names_across_maps() answers "what is region 21 called?" and
+    cannot know that a command meant ZONE 21, or region 21 of the map it
+    named: one dict, the room before the zone, the active map before the
+    others. Mission names went wrong both ways -- a zone mission recorded
+    under the room with its number, and a mission on a second map named
+    from the first.
+
+    Order per region: the command's map, the active map, every other map
+    -- within each, the region's type (`rid` a room, `zid` a zone; a
+    region without a type is looked up as a room, then as a zone). Only
+    when no map has it, region_names_across_maps() as before, which also
+    keeps a coordinator without per-type names working.
+    """
+
+    def __init__(self, cloud_coordinator: Any, pmap_id: str | None = None) -> None:
+        self._cc = cloud_coordinator
+        self._pmap_id = pmap_id
+        typed = getattr(cloud_coordinator, "region_names_by_type", None)
+        self._typed: dict[str, dict[str, dict[str, str]]] = (
+            typed if isinstance(typed, dict) else {}
+        )
+        active = getattr(cloud_coordinator, "active_pmap_id", None)
+        order = [p for p in (pmap_id, active) if isinstance(p, str) and p in self._typed]
+        self._order = order + [p for p in self._typed if p not in order]
+        self._fallback: dict[str, str] | None = None
+
+    def name(self, region: Any) -> str | None:
+        """The name of one region of the command, or None."""
+        if self._cc is None:
+            return None
+        region_id = extract_region_id(region)
+        if not region_id:
+            return None
+        kind = region.get("type") if isinstance(region, dict) else None
+        kinds = (kind,) if kind in ("rid", "zid") else ("rid", "zid")
+        for pmap in self._order:
+            for k in kinds:
+                found = (self._typed[pmap].get(k) or {}).get(region_id)
+                if found:
+                    return found
+        if self._fallback is None:
+            self._fallback = region_names_across_maps(self._cc, self._pmap_id)
+        return self._fallback.get(region_id) or None
+
+    def names(self, regions: list[Any]) -> list[str]:
+        """The names of the regions that resolve, in command order."""
+        return [n for n in (self.name(r) for r in regions) if n]
+
+
+def region_names_for_command(
+    cloud_coordinator: Any, regions: list[Any], pmap_id: str | None = None
+) -> list[str]:
+    """CommandRegionNames(...).names(regions) -- see there (4.5.0)."""
+    return CommandRegionNames(cloud_coordinator, pmap_id).names(regions)
+
+
+def smart_rooms_to_name(runtime_data: Any, options: Any) -> list[str]:
+    """Rooms on the robot's map that have no name anywhere (4.2.19).
+
+    THE ONLY ROOMS WORTH ASKING ABOUT. A name can come from the user's
+    alias, the iRobot account, or the naming form; a room with any of
+    them needs nothing. And only a room ON THE MAP can be asked about:
+    the naming form shows that map, and a number the map does not draw
+    is one the user cannot place.
+
+    That leaves out every region id that is only known from an old
+    schedule or an earlier clean. A tester's i7 was asked to name twelve
+    of them, all with names in his account or on no map at all. Those
+    cannot be cleaned on the current map either, so nothing is lost by
+    not asking.
+
+    Hidden rooms are left out, as everywhere else.
+    """
+    aligner = getattr(runtime_data, "umf_aligner", None)
+    polygons = getattr(aligner, "room_polygons_umf", None)
+    if not isinstance(polygons, dict) or not polygons:
+        return []
+    account = region_names_across_maps(
+        getattr(runtime_data, "cloud_coordinator", None)
+    )
+    try:
+        on_map = aligner.rid_to_name()  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001 -- a broken aligner names nothing
+        on_map = {}
+    hidden = {str(h) for h in (options.get(CONF_SMART_ZONE_HIDDEN) or [])}
+    unnamed: list[str] = []
+    for rid in polygons:
+        rid = str(rid)
+        if rid in hidden:
+            continue
+        cloud = account.get(rid) or on_map.get(rid)
+        # rid_to_name() falls back to the id itself for a region without
+        # a name; that is no name.
+        if not cloud or cloud == rid:
+            cloud = None
+        if map_room_label(rid, cloud, options) == rid:
+            unnamed.append(rid)
+    return sorted(unnamed, key=lambda x: x.zfill(4))
+
+
+def _resolve_rooms(
+    zone_data: dict[str, dict[str, Any]],
+    room_names: list[str],
+    state: dict[str, Any],
+    cloud_pmap_id: str | None = None,
+) -> list[tuple[str, str]]:
+    """Resolve room names to (region_id, pmap_id) tuples.
+
+    Args:
+        zone_data:      smart_zone_data from config_entry.options —
+                        {region_id: {"name": str, "pmap_id": str}}
+        room_names:     user-supplied room names from the service call.
+        state:          live robot state — used to resolve pmap_id when the stored
+                        value is empty (MQTT fallback).
+        cloud_pmap_id:  authoritative pmap_id from the cloud coordinator.
+                        When present this is preferred over the MQTT cascade.
+
+    Returns:
+        Ordered list of (region_id, pmap_id) matching each room name.
+
+    Raises:
+        ServiceValidationError: unknown name, unresolvable pmap_id, or
+            rooms spanning more than one pmap_id.
+    """
+    index: dict[str, tuple[str, str]] = {}
+    for rid, meta in zone_data.items():
+        if not meta.get("name"):
+            continue
+        key = meta["name"].casefold()
+        pmap_id = meta.get("pmap_id", "")
+        if key in index:
+            existing_rid, existing_pmap = index[key]
+            if cloud_pmap_id and pmap_id == cloud_pmap_id:
+                _LOGGER.warning(
+                    "clean_room: duplicate room name '%s' across maps "
+                    "(region %s from map %.8s overwrites region %s from map %.8s). "
+                    "Delete the old Smart Map in the iRobot app to prevent this.",
+                    meta["name"], rid, pmap_id, existing_rid, existing_pmap,
+                )
+                index[key] = (rid, pmap_id)
+            else:
+                _LOGGER.warning(
+                    "clean_room: duplicate room name '%s' — keeping region %s "
+                    "(region %s ignored, not from active map %.8s). "
+                    "Delete the old Smart Map in the iRobot app.",
+                    meta["name"], existing_rid, rid,
+                    cloud_pmap_id[:8] if cloud_pmap_id else "unknown",
+                )
+        else:
+            index[key] = (rid, pmap_id)
+
+    resolved: list[tuple[str, str]] = []
+    unknown: list[str] = []
+
+    # v2.7.3 (ROOM-SLUG): XVMC sends room_id (ASCII slug) as [[selection]].
+    # Build a secondary slug index so "kuche" resolves to "Küche".
+
+    # Uses the shared room_slug from const.py. A THIRD copy of this rule
+    # lived here as a nested function, invisible to a module-level scan --
+    # and it used a different unicode test (`category(c) != "Mn"` rather
+    # than `combining(c)`), which agree for accents but not for every mark.
+
+    slug_index: dict[str, tuple[str, str]] = {
+        room_slug(meta["name"]): val
+        for val in [index[k] for k in index]
+        for meta in zone_data.values()
+        if meta.get("name") and index.get(meta["name"].casefold()) == val
+    }
+    # Simpler rebuild: slug → (rid, pmap_id) from the name index
+    slug_index = {
+        room_slug(display_name): match_val
+        for display_name, match_val in (
+            (meta["name"], index.get(meta["name"].casefold()))
+            for meta in zone_data.values()
+            if meta.get("name") and index.get(meta["name"].casefold())
+        )
+        if match_val is not None
+    }
+
+    for name in room_names:
+        match = index.get(name.casefold()) or slug_index.get(room_slug(name))
+        if match is None:
+            unknown.append(name)
+        else:
+            resolved.append(match)
+
+    if unknown:
+        raise ServiceValidationError(
+            f"Unknown room(s): {', '.join(unknown)}. "
+            f"Known rooms: {', '.join(meta['name'] for meta in zone_data.values() if meta.get('name'))}",
+            translation_domain=DOMAIN,
+            translation_key="rooms_not_found",
+            translation_placeholders={"names": ", ".join(unknown)},
+        )
+
+    # Resolve empty pmap_ids — priority:
+    #   0. cloud_pmap_id  — authoritative, immune to stale MQTT
+    #   1. lastCommand.pmap_id
+    #   2. cleanSchedule2[].cmd.pmap_id
+    #   3. pmaps[0] key   — last resort
+    last = state.get("lastCommand", {})
+    pmaps: list[dict[str, Any]] = state.get("pmaps", [])
+    fallback_pmap_id: str = (
+        cloud_pmap_id
+        or last.get("pmap_id")
+        or next(
+            (
+                cmd.get("cmd", {}).get("pmap_id")
+                for cmd in state.get("cleanSchedule2", [])
+                if cmd.get("cmd", {}).get("pmap_id")
+            ),
+            None,
+        )
+        or (next(iter(pmaps[0]), None) if pmaps else None)
+        or ""
+    )
+    resolved = [
+        (rid, pmap_id if pmap_id else fallback_pmap_id)
+        for rid, pmap_id in resolved
+    ]
+
+    pmap_ids = {pmap_id for _, pmap_id in resolved}
+    if "" in pmap_ids:
+        raise ServiceValidationError(
+            "Could not resolve map ID (pmap_id) for one or more rooms. "
+            "Ensure the robot has reported its map state via MQTT.",
+            translation_domain=DOMAIN,
+            translation_key="pmap_not_resolved",
+        )
+    if len(pmap_ids) > 1:
+        raise ServiceValidationError(
+            "All rooms must be on the same floor (same pmap). "
+            f"Got rooms from maps: {', '.join(pmap_ids)}",
+            translation_domain=DOMAIN,
+            translation_key="rooms_different_floors",
+            translation_placeholders={"pmap_ids": ", ".join(pmap_ids)},
+        )
+
+    return resolved

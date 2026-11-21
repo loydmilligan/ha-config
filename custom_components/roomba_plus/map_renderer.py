@@ -1,0 +1,2073 @@
+"""Map renderer for Roomba+ — converts pose data to a PNG camera image.
+
+Works for all map-capable robots (900, i, s, j, m series) because they all
+report position in the same format:
+  pose.point.x / pose.point.y  in mm, origin = dock (0, 0)
+  pose.theta                   in degrees, counter-clockwise positive
+
+Pillow is a Home Assistant Core dependency (Pillow==12.1.1 in requirements.txt)
+so no manifest.json entry is needed.
+
+Rendering pipeline (5 layers, bottom to top):
+  1. Background — plain floor colour
+  2. Cleaned area — circle per pose point (radius = half cleaning width)
+  3. Path overlay — polyline connecting pose points
+  4. Markers — stuck positions (triangle), dock (square)
+  5. Robot icon — filled circle with direction arrow
+
+Coordinate system:
+  Roomba mm → pixel:  px = cx + x_mm / scale
+                       py = cy - y_mm / scale   (image Y grows downward)
+  Dock is always at image centre (cx, cy).
+
+Persistence:
+  dump_state() / restore_state() serialise the renderer's internal state
+  (pose points, stuck positions, last heading) to a plain dict so that
+  image.py can persist it across HA restarts via hass.storage.
+  The cached PNG is NOT persisted — it is re-rendered on first async_image()
+  call after restore, which is fast (<5 ms).
+"""
+from __future__ import annotations
+
+import io
+import logging
+import math
+import time as _time_mod
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from PIL import Image, ImageDraw, ImageFont
+
+from .room_layout import CELL_MM as LAYOUT_CELL_MM
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from .geometry_store import GeometryStore
+    from .room_layout import RoomLayout
+    from .room_seg_store import RoomSegStore
+
+_LOGGER = logging.getLogger(__name__)
+
+# ── MAP-FONT (v2.9.0) — embedded TTF instead of PIL's tiny bitmap default ────
+# DejaVu Sans, Bitstream Vera License (see fonts/LICENSE.txt) — freely
+# redistributable, no attribution requirement beyond keeping the license file.
+_FONT_PATH = Path(__file__).parent / "fonts" / "DejaVuSans.ttf"
+
+
+def map_mm_to_view(x_mm: float, y_mm: float) -> tuple[float, float]:
+    """A point of the maps' frame, as a picture draws it: x mirrored.
+
+    THE MAPS' FRAME IS A MIRROR IMAGE OF THE FLOOR. `raw_pose_mm_to_map`
+    swaps the firmware's axes, and a swap is a reflection, not a turn. In
+    the firmware's own frame the robot's heading and its direction of
+    travel agree; in the swapped one they agree only as 90 deg minus the
+    heading. Every picture drawn from it came out flipped left to right:
+    A tester's 980 against its floor plan, and a second 980 alike.
+
+    Mirrored HERE, where millimetres become a picture, and nowhere else.
+    Every store keeps the frame it was written in -- the coverage grid,
+    the areas, the doors, the trajectories, the tracker's `map_x_mm` --
+    so nothing stored moves and nothing needs migrating. A picture and
+    the `calibration_points` describing it go through the same
+    conversion, so an overlay still lands where it belongs.
+
+    The result is a quarter turn of the firmware's frame, (x, y) ->
+    (-y, x): the dock where it was, the floor the right way round.
+    """
+    return -x_mm, y_mm
+
+
+def raw_heading_to_view_deg(theta_deg: float) -> float:
+    """The firmware's heading, as a picture drawn through
+    `map_mm_to_view` shows it: a quarter turn, as the positions get."""
+    return theta_deg + 90.0
+
+
+#: The map turns the user may choose (4.3.2), in degrees clockwise.
+MAP_ROTATIONS: tuple[int, ...] = (0, 90, 180, 270)
+
+
+def quarter_turns(rotation_deg: Any) -> int:
+    """A rotation option as clockwise quarter turns, 0-3; anything that
+    is not one of MAP_ROTATIONS is no turn at all."""
+    try:
+        deg = int(rotation_deg)
+    except (TypeError, ValueError):
+        return 0
+    return MAP_ROTATIONS.index(deg) if deg in MAP_ROTATIONS else 0
+
+
+def turn_view(u: float, v: float, turns: int) -> tuple[float, float]:
+    """A point of a picture's frame (y up), turned clockwise by `turns`
+    quarter turns.
+
+    THE MAP HAS NO NORTH (4.3.2). Its "up" is wherever the robot faced
+    when it set off from the dock, so it depends on how the dock stands
+    in the room: the maintainer's own map came out a quarter turn off
+    the way he pictures the flat. Unlike the mirror this is no fault to
+    fix but a choice per robot, made in the options. Turned here, after
+    the mirror and nowhere else; every store keeps its frame.
+    """
+    k = turns % 4
+    if k == 1:
+        return v, -u
+    if k == 2:
+        return -u, -v
+    if k == 3:
+        return -v, u
+    return u, v
+
+
+def mm_to_view(
+    x_mm: float, y_mm: float, mirror_x: bool, turns: int
+) -> tuple[float, float]:
+    """A point of the maps' frame as a picture shows it: mirrored where
+    the frame is a mirror image (map_mm_to_view), then turned."""
+    if mirror_x:
+        x_mm, y_mm = map_mm_to_view(x_mm, y_mm)
+    return turn_view(x_mm, y_mm, turns)
+
+
+def view_to_mm(
+    u: float, v: float, mirror_x: bool, turns: int
+) -> tuple[float, float]:
+    """`mm_to_view` undone."""
+    x_mm, y_mm = turn_view(u, v, -turns)
+    if mirror_x:
+        x_mm, y_mm = map_mm_to_view(x_mm, y_mm)  # its own inverse
+    return x_mm, y_mm
+
+
+def _load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """Load the bundled DejaVu Sans font at the given pixel size.
+
+    Falls back to PIL's bitmap default if the font file is somehow missing
+    (e.g. a packaging error) so rendering never hard-crashes over a label font.
+    """
+    try:
+        return ImageFont.truetype(str(_FONT_PATH), size)
+    except OSError:
+        _LOGGER.warning(
+            "MAP-FONT: could not load bundled font at %s — falling back to "
+            "PIL default bitmap font", _FONT_PATH,
+        )
+        return ImageFont.load_default()
+
+
+# Pre-loaded at module import so each render call doesn't re-read the font
+# file from disk. 12px for compact labels (door/obstacle), 13px default.
+LABEL_FONT      = _load_font(13)
+LABEL_FONT_SMALL = _load_font(12)
+
+
+# ── Fonts for characters DejaVu Sans lacks (4.5.0) ───────────────────────────
+#
+# JAPANESE ROOM NAMES WERE BOXES (@kyoheimukaida, Combo j9+): DejaVu Sans
+# has no CJK glyphs, and a font that loads draws every missing character
+# as its empty box. Bundling a CJK font would add 5 to 20 MB to every
+# installation, so a label is drawn with the first font that has all its
+# characters: DejaVu Sans, then the fonts in `<config>/roomba_plus/fonts/`
+# -- outside the integration, so an update keeps them -- then fonts the
+# system has. A label no font covers is drawn with the one that covers
+# most, and the log says once what is missing and where a font goes.
+
+FONT_EXTENSIONS: tuple[str, ...] = (".ttf", ".otf", ".ttc")
+#: Where a system keeps fonts; Home Assistant OS has none with CJK.
+SYSTEM_FONT_DIRS: tuple[Path, ...] = (Path("/usr/share/fonts"), Path("/usr/local/share/fonts"))
+#: File names of system fonts worth trying, lower case.
+_SYSTEM_FONT_HINTS: tuple[str, ...] = (
+    "cjk", "notosansjp", "notosanssc", "notosanstc", "notosanskr",
+    "droidsansfallback", "wqy", "ipag", "ipaex", "takao", "nanum",
+)
+#: A code point no font maps: what a font draws for a missing character.
+_NOT_A_CHARACTER = "\U0010FFFD"
+_PROBE_SIZE = 16
+
+_fallback_fonts: list[Path] = []
+_fonts: dict[tuple[str, int], Any] = {}
+_probe_masks: dict[tuple[str, str], bytes] = {}
+_reported_missing: set[str] = set()
+
+
+def find_fallback_fonts(user_dir: Path | None) -> list[Path]:
+    """The fallback fonts: the user's, sorted by name, then the
+    system's CJK fonts. Reads the disk -- run it in the executor."""
+    found: list[Path] = []
+    if user_dir is not None and user_dir.is_dir():
+        found.extend(
+            p for p in sorted(user_dir.iterdir())
+            if p.is_file() and p.suffix.lower() in FONT_EXTENSIONS
+        )
+    system: list[Path] = []
+    for root in SYSTEM_FONT_DIRS:
+        if not root.is_dir():
+            continue
+        system.extend(
+            p for p in root.rglob("*")
+            if p.suffix.lower() in FONT_EXTENSIONS
+            and any(hint in p.name.lower().replace("-", "").replace("_", "") for hint in _SYSTEM_FONT_HINTS)
+        )
+    # Sans before serif, regular before bold or thin: a label should not
+    # turn black because the first font with the characters is a heavy cut.
+    return found + sorted(system, key=_system_font_rank)
+
+
+def _system_font_rank(path: Path) -> tuple[int, int, str]:
+    name = path.name.lower()
+    serif = 1 if "serif" in name or "mincho" in name or "myungjo" in name else 0
+    weight = 1 if any(w in name for w in ("black", "bold", "heavy", "light", "thin", "medium")) else 0
+    return serif, weight, name
+
+
+def set_fallback_fonts(paths: list[Path]) -> None:
+    """Use these fonts, in this order, for what DejaVu Sans lacks."""
+    _fallback_fonts[:] = paths
+    _fonts.clear()
+    _probe_masks.clear()
+
+
+def fallback_font_names() -> list[str]:
+    """The fallback fonts' file names, for diagnostics -- no paths."""
+    return [p.name for p in _fallback_fonts]
+
+
+def _font(path: Path, size: int) -> Any | None:
+    key = (str(path), size)
+    if key not in _fonts:
+        try:
+            _fonts[key] = ImageFont.truetype(str(path), size)
+        except OSError:
+            _LOGGER.warning("MAP-FONT: could not load %s", path.name)
+            _fonts[key] = None
+    return _fonts[key]
+
+
+def _probe(font: Any, path: Path, char: str) -> bytes:
+    key = (str(path), char)
+    if key not in _probe_masks:
+        image = Image.new("L", (_PROBE_SIZE * 3, _PROBE_SIZE * 3))
+        ImageDraw.Draw(image).text((_PROBE_SIZE, _PROBE_SIZE), char, font=font, fill=255)
+        _probe_masks[key] = image.tobytes()
+    return _probe_masks[key]
+
+
+def _missing(path: Path, text: str) -> set[str]:
+    """The characters of `text` the font at `path` draws as its box."""
+    font = _font(path, _PROBE_SIZE)
+    if font is None:
+        return {c for c in text if not c.isspace()}
+    box = _probe(font, path, _NOT_A_CHARACTER)
+    return {c for c in set(text) if not c.isspace() and _probe(font, path, c) == box}
+
+
+def label_font(text: str, base: Any) -> Any:
+    """The font to draw `text` with, at `base`'s size: `base` (DejaVu
+    Sans) where it has every character, else the first fallback font that
+    does, else the one that misses fewest."""
+    size = getattr(base, "size", None)
+    if not text or not isinstance(size, int) or text.isascii():
+        return base
+    lacking = _missing(_FONT_PATH, text)
+    if not lacking:
+        return base
+    best: tuple[int, Path] | None = None
+    for path in _fallback_fonts:
+        still = _missing(path, "".join(lacking))
+        if not still:
+            return _font(path, size) or base
+        if best is None or len(still) < best[0]:
+            best = (len(still), path)
+    unseen = lacking - _reported_missing
+    if unseen:
+        _reported_missing.update(unseen)
+        _LOGGER.warning(
+            "MAP-FONT: no font draws %s on the map. Put a font that has "
+            "them (for Japanese, Chinese or Korean e.g. Noto Sans CJK) into "
+            "the folder roomba_plus/fonts in your Home Assistant "
+            "configuration folder and restart Home Assistant",
+            "".join(sorted(unseen)),
+        )
+    if best is not None and best[0] < len(lacking):
+        return _font(best[1], size) or base
+    return base
+
+# ── Colours (RGBA) ────────────────────────────────────────────────────────────
+BG_COLOUR       = (255, 255, 255, 255)  # White background (floor)
+FLOOR_BORDER    = (220, 220, 220, 255)  # Light grey — subtle canvas border
+CLEANED_COLOUR  = (173, 216, 230, 255)  # Light blue — cleaned area
+#: THE CLEANED AREA SEEN THROUGH (4.4.1, @frnchfrgg): drawn on a layer of
+#: its own and laid over the floor plan at this opacity, so the rooms and
+#: their names show through. The colour is the one that comes out as
+#: CLEANED_COLOUR over white: (CLEANED - (1 - alpha) * 255) / alpha.
+CLEANED_ALPHA   = 0.5
+CLEANED_LAYER_COLOUR = (91, 177, 205, 255)
+PATH_COLOUR     = ( 30, 100, 200, 255)  # Deep blue — travel path
+DOCK_COLOUR     = ( 80, 180,  80, 255)  # Green — dock station marker
+ROBOT_COLOUR    = ( 30, 100, 200, 255)  # Blue — robot position
+ARROW_COLOUR    = (255, 255, 255, 255)  # White — direction arrow on robot
+STUCK_COLOUR    = (220,  60,  60, 255)  # Red — stuck event marker
+
+# ── Geometry layer colours (RGBA) ─────────────────────────────────────────────
+SUGGEST_OUTLINE  = (180, 180, 180, 180)  # Light grey — zone outline suggestion
+SUGGEST_LABEL    = (160, 160, 160, 220)  # Grey — zone name text
+DOOR_MARKER      = ( 24,  95, 165, 200)  # Blue — inferred door crossing marker
+WALL_FILL        = ( 74,  85, 104, 255)  # Dark grey — user wall
+WALL_CENTRE      = (255, 255, 255,  60)  # White tint — wall depth highlight
+DOOR_FILL        = ( 24,  95, 165, 200)  # Blue dashed — user door gap line
+DOOR_ARC_FILL    = ( 24,  95, 165,  35)  # Blue transparent — door swing arc
+DOOR_ARC_OUTLINE = ( 24,  95, 165, 120)  # Blue — door swing arc border
+OBSTACLE_FILL    = (186, 117,  23,  45)  # Amber — obstacle area fill
+FLOOR_PLAN_FILL  = (238, 241, 246, 255)  # Pale grey-blue — a room of the floor plan (4.4.0)
+FLOOR_PLAN_LINE  = (170, 180, 195, 255)  # Grey — its outline
+FLOOR_PLAN_TEXT  = (110, 120, 135, 255)  # Grey — its name
+OBSTACLE_OUTLINE = (186, 117,  23, 190)  # Amber — obstacle border and hatch
+LAYOUT_WALL      = ( 60,  66,  78, 255)  # Near black — a straight wall of the 900-series layout (4.5.0)
+LAYOUT_FURNITURE = (226, 210, 188, 255)  # Light brown — floor inside a room nothing drove: furniture
+LAYOUT_DOOR      = ( 40, 150,  90, 230)  # Green — a door the robot went through
+
+# ── Robot footprint (real chassis diameter, mm) ───────────────────────────────
+# pose.point.x/y is the robot's own reported navigation centre — the geometric
+# centre of the (round) chassis. The path line therefore traces that centre,
+# not an edge. The "cleaned area" circle drawn at each pose point should
+# match the real chassis radius so the rendered swept area corresponds to
+# the robot's actual physical footprint, not an arbitrary cleaning-width guess.
+# 600/900-series (round, incl. test robot 980): 13.9 in = 353 mm.
+# i/s/j-series (round, slightly slimmer chassis): 13.34 in = 339 mm.
+# Braava (m6/jet, non-round wedge shape) is not represented well by a circle
+# at all — falls back to the generic default below.
+ROBOT_DIAMETER_MM_900_SERIES = 353
+ROBOT_DIAMETER_MM_ISJ_SERIES = 339
+ROBOT_DIAMETER_MM_DEFAULT    = 340   # generic fallback when model tier unknown
+
+# ── Rendering constants ───────────────────────────────────────────────────────
+# v2.9.0 — DOCK_HALF/ROBOT_RADIUS/STUCK_RADIUS/PATH_WIDTH used to be fixed
+# pixel sizes, never adjusted for the auto_fit zoom factor. Only the cleaned-
+# area circles (_draw_cleaned_area) scaled with zoom — causing the path,
+# dock marker, robot icon, and stuck triangle to visually drift relative to
+# the cleaned-area blob at different zoom levels (confirmed from a real
+# field-data screenshot: at one zoom level the path was ~17x thinner than
+# the cleaned-area circle, and the dock marker nearly invisible against it).
+#
+# First attempt at the fix made dock/robot icons literally robot_diameter_mm
+# wide (same as the cleaned-area footprint circle) — confirmed WRONG against
+# real field data (2026-06-19): on a tightly-confined mission (~0.7m x 0.75m
+# span, robot stuck/oscillating), a literal-diameter dock/robot circle
+# swallowed most of the canvas even though the cleaned-area shape itself
+# correctly traced the real room layout at that scale. Dock and robot-
+# position are map MARKERS — like a pin on a map — not footprint paint;
+# only the cleaned-area circles (actual swept coverage) should be literally
+# to-scale. Markers now use a deliberately smaller, fixed real-world
+# reference size, decoupled from cfg.robot_diameter_mm, but still
+# zoom-scaled via _mm_radius_px() so they stay visible (not 6px-fixed)
+# without dominating the canvas.
+ARROW_LENGTH            = 16   # px direction arrow length — kept fixed (small UI element)
+ROBOT_ICON_DIAMETER_MM  = 160  # current-position marker — a recognisable dot, not a footprint
+DOCK_ICON_DIAMETER_MM   = 160  # dock marker — same marker convention as the robot icon
+STUCK_DIAMETER_MM       = 140  # stuck-event marker — slightly smaller, visually distinct
+PATH_WIDTH_MM           = 60   # real-world width of the travel-path line
+DOCK_MIN_PX             = 3
+ROBOT_MIN_PX            = 3
+STUCK_MIN_PX            = 3
+PATH_MIN_PX             = 2
+
+# ── Geometry layer constants ───────────────────────────────────────────────────
+WALL_WIDTH         = 6    # px user wall stroke width
+WALL_CENTRE_WIDTH  = 2    # px wall centre highlight width
+DOOR_MARKER_RADIUS = 5    # px inferred door crossing marker radius
+OBSTACLE_HATCH_GAP = 8    # px obstacle hatching line spacing
+SUGGEST_DASH       = (6, 4)  # px on/off for dashed suggestion outlines
+
+# ── Storage version — bump when dump_state() format changes ──────────────────
+_STATE_VERSION  = 1
+
+# v3.2.1 LANDMARK-LOG — a recorded discontinuity corresponds, per the
+# 980's documented vSLAM sensor-fusion pipeline, to either a genuine
+# move or a camera-landmark relocalisation correction. Logging WHERE
+# these land
+# (not just counting them, as before) is data-collection scaffolding for
+# a future "landmark cluster" structural signal — never consumed
+# anywhere yet. Capped, not unbounded: this is meant to reveal spatial
+# clustering across many missions, not to be a full history.
+MAX_ACCEPTED_JUMP_LOG = 500
+
+
+@dataclass
+class RendererConfig:
+    """User-configurable rendering parameters from Options Flow."""
+
+    size_px: int   = 600     # Canvas size (square)
+    scale: float   = 10.0    # mm per pixel (600px @ 10mm/px → 6m × 6m)
+    persist: bool  = True    # Keep last frame between missions
+    auto_fit: bool = True    # Scale and centre map to fill canvas
+    fit_margin: int = 40     # Pixel margin on each side when auto-fitting
+    robot_diameter_mm: int = ROBOT_DIAMETER_MM_DEFAULT  # Real chassis diameter
+    #: Positions arrive in the Classic pose frame, a mirror image of the
+    #: floor (see map_mm_to_view): draw them mirrored back, and turn the
+    #: firmware's heading with them. Off for Prime, whose polygons come in
+    #: their own frame.
+    mirror_x: bool = False
+    #: Clockwise quarter turns the user chose for the picture (4.3.2,
+    #: see turn_view). Applied after the mirror.
+    quarter_turns: int = 0
+
+
+class MapRenderer:
+    """Converts accumulated pose points into a PNG byte string.
+
+    Thread-safety: all methods are called from the HA event loop via
+    schedule_update_ha_state(). PIL operations are synchronous and fast
+    enough (<5 ms for a typical mission) that executor offload is not needed.
+
+    Usage:
+        renderer = MapRenderer(RendererConfig())
+        renderer.add_pose(x_mm, y_mm, theta_deg)
+        renderer.mark_stuck()          # call when bbrun.nStuck increments
+        png_bytes = renderer.render()
+
+    Persistence (called by image.py):
+        state = renderer.dump_state()          # after mission end
+        renderer.restore_state(state)          # after HA restart
+    """
+
+    def __init__(
+        self,
+        config: RendererConfig,
+        geometry_store: GeometryStore | None = None,
+        room_seg_store: "RoomSegStore | None" = None,
+    ) -> None:
+        self._cfg = config
+        self._geometry_store = geometry_store
+        self._room_seg_store = room_seg_store
+        self._points: list[tuple[int, int]] = []      # pixel coordinates
+        #: MILLIMETRES FOR THE SAME POINTS, index-aligned with _points.
+        #:
+        #: The jump check used to recover the previous position by
+        #: converting _points[-1] back from pixels. The millimetres were
+        #: right there in the caller and got thrown away, so the check
+        #: measured on a quantity that had been through the canvas
+        #: transform. Kept here so the comparison is on the physical
+        #: value.
+        self._points_mm: list[tuple[float, float]] = []
+        #: Indices into _points where continuity BREAKS -- the point at
+        #: this index does not connect to the one before it.
+        #:
+        #: Replaces rejection. A dropped point left _points[-1] as a
+        #: stale anchor, so every later real position measured against
+        #: it too: the field-confirmed cascade (1413 points stranded in
+        #: a 0.7 m pocket in a 106 m2 home). Recording the break instead
+        #: keeps the anchor current, and a wrongly-marked break costs a
+        #: gap in the drawing rather than a lost point.
+        self._breaks: set[int] = set()
+        #: Receipt time per point, for the time-scaled jump threshold.
+        self._point_ts: list[float] = []
+        self._stuck_px: list[tuple[int, int]] = []    # pixel coordinates
+        self._robot_px: tuple[int, int] | None = None # current robot position
+        #: Where the robot docked, in add_pose()'s millimetres (Jamd-pt):
+        #: None until seen, and then the dock marker's place instead of
+        #: the frame's origin. Kept across missions.
+        self._dock_mm: tuple[float, float] | None = None
+        self._theta: float = 0.0                      # current heading (degrees)
+        self._last_png: bytes | None = None           # cached output (not persisted)
+        # Auto-fit state — recomputed at the start of each render().
+        self._fit_scale: float = self._cfg.scale
+        #: Optional pixel-space extent to fit to instead of own content.
+        #: Two corner points; see _compute_fit().
+        self._fit_bounds_px: list[tuple[int, int]] | None = None
+        #: THE FLOOR PLAN UNDER THE PATH (4.4.0, @frnchfrgg): (name or
+        #: None, polygon) per room, in the frame add_pose() takes. Set by
+        #: the map entity before render(); drawn first and part of the
+        #: fit, so the picture holds the whole floor while the path grows.
+        self.floor_plan: list[tuple[str | None, list[tuple[float, float]]]] = []
+        #: THE 900-SERIES LAYOUT (4.5.0): straight walls, doors and
+        #: furniture derived from the areas (room_layout). Set by the map
+        #: entity before render(); drawn instead of the dashed area
+        #: outlines, and like them only while the user has drawn nothing.
+        self.room_layout: RoomLayout | None = None
+        #: The turn a path of requested positions was drawn with, in
+        #: radians (4.4.1), set by the map entity; None for a pose path or
+        #: before the first position. For the diagnostics.
+        self.requested_turn_rad: float | None = None
+        self._fit_cx: int = self._cfg.size_px // 2
+        self._fit_cy: int = self._cfg.size_px // 2
+        # v2.9.0 — see _MAX_POSE_JUMP_MM rationale below. Counts consecutive
+        # rejected jumps so a real, sustained move isn't permanently stranded
+        # behind one stale anchor point.
+        # v3.2.1 LANDMARK-LOG — deliberately NOT cleared in reset(): the
+        # whole point is cross-mission accumulation, unlike self._points
+        # which is intentionally wiped every mission (see reset()).
+        # Widened to include theta_deg: a position jump WITH an
+        # unexplained heading jump is much stronger evidence of a genuine
+        # pickup/relocalisation event than position alone (see the
+        # Dock-Anchor-Korrektur design doc) — feeds both the future
+        # landmark-cluster idea and a potential stuck-independent
+        # detector for exactly this scenario.
+        self._accepted_jump_log: list[tuple[float, float, float, float]] = []
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def reset(self) -> None:
+        """Clear all points for a new mission."""
+        self._points.clear()
+        # Index-aligned with _points -- clearing one without the others
+        # would leave breaks pointing at positions from the last mission.
+        self._points_mm.clear()
+        self._point_ts.clear()
+        self._breaks.clear()
+        self._stuck_px.clear()
+        self._robot_px = None
+        self._theta = 0.0
+        self.requested_turn_rad = None
+        if not self._cfg.persist:
+            self._last_png = None
+        _LOGGER.debug("MapRenderer: mission reset")
+
+    # Maximum plausible displacement between two pose updates in mm.
+    # Roomba top speed is ~300 mm/s; pose updates arrive every 1-5 s.
+    # 500 mm covers normal movement. Anything larger is a bogus jump
+    # (stuck-recovery relocalisation, manual lift, firmware artifact)
+    # and would draw a line across the entire map if not rejected.
+    # Derived from NickWaterton/Roomba980-Python max_distance = 500.
+    _MAX_POSE_JUMP_MM: float = 500.0
+    #: Fallback speed until enough steps have been seen to measure one
+    #: (see _observed_speed_mm_s). Published figure for the chassis is
+    #: ~300 mm/s; the margin here is for the bootstrap phase only.
+    _MAX_SPEED_MM_S: float = 350.0
+    #: How many recent steps the measured speed is taken from.
+    _SPEED_WINDOW: int = 40
+    #: Percentile of observed step speeds taken as the ceiling. High
+    #: enough to cover genuine fast driving, low enough that a minority
+    #: of discontinuities cannot drag it upward -- the same robustness
+    #: argument as the median for dt.
+    _SPEED_PERCENTILE: float = 0.90
+    #: Fallback floor for dt until enough intervals have been seen to
+    #: measure one (see _typical_dt_s). Deliberately generous: a floor
+    #: that is too high costs a missed break, one that is too low costs
+    #: an invented one -- and only the second kind is visible as a
+    #: wrong gap in the drawing.
+    _MIN_STEP_DT_S: float = 2.5
+    #: How many recent intervals the measured floor is taken from.
+    _DT_WINDOW: int = 20
+    #: Past this, continuity is gone whatever the elapsed time.
+    _MAX_STEP_CEILING_MM: float = 3000.0
+
+
+    def _allowed_step_mm(self, dt_s: float) -> float:
+        """How far the robot could plausibly have moved in `dt_s`.
+
+        REPLACES A BORROWED CONSTANT. `_MAX_POSE_JUMP_MM = 500` was
+        taken from another project, and the comment justifying it
+        refutes itself: it cites ~300 mm/s and updates every 1-5 s,
+        which is up to 1500 mm. Measured on a real 980 (coverage
+        counters over four missions): one pose every 1.8 s, so up to
+        542 mm at full speed -- against a 500 mm limit. Normal
+        straight-line driving sat just over the threshold, which is
+        what the cascade was made of.
+
+        LOWER BOUND, because the pose carries no timestamp of its own.
+        Only local receipt time is available, so queued messages can
+        arrive with dt near zero; without the floor this would be
+        STRICTER than today and reject correct poses during exactly the
+        network hiccups that cause the queueing. The floor pins the
+        old behaviour as the minimum -- this can only ever be more
+        permissive.
+
+        UPPER BOUND, because beyond a long gap (an HA restart mid
+        mission) continuity is gone regardless. Allowing 9 m after 30 s
+        would wave through anything; the caller marks a break instead.
+        """
+        return min(
+            self._MAX_STEP_CEILING_MM,
+            self._observed_speed_mm_s() * max(dt_s, self._typical_dt_s()),
+        )
+
+    def _observed_speed_mm_s(self) -> float:
+        """How fast this robot actually moves, from its own steps.
+
+        THE LAST SET NUMBER IN THE FORMULA, and it had no more claim to
+        be here than the borrowed 500 it replaced. A published ~300 mm/s
+        plus an invented margin plus a separate tolerance term is two
+        safety factors stacked on a figure nobody measured for this
+        chassis, this firmware or this floor.
+
+        The apparent circularity -- needing a speed limit to know which
+        steps are real -- dissolves the same way it did for dt:
+        discontinuities are a MINORITY. A high percentile of observed
+        step speeds is barely moved by a few outliers, so the ceiling
+        tracks genuine driving without being dragged up by the very
+        jumps it exists to catch.
+
+        The tolerance term is gone with it: a speed measured from real
+        steps already contains pose noise and acceleration. Adding
+        slack on top would be a second margin on a value that is
+        already one.
+        """
+        if len(self._points_mm) < 10:
+            return self._MAX_SPEED_MM_S
+        pts = self._points_mm[-(self._SPEED_WINDOW + 1):]
+        ts = self._point_ts[-(self._SPEED_WINDOW + 1):]
+        speeds = sorted(
+            math.hypot(b[0] - a[0], b[1] - a[1]) / (tb - ta)
+            for a, b, ta, tb in zip(pts, pts[1:], ts, ts[1:], strict=False)
+            if tb > ta
+        )
+        if not speeds:
+            return self._MAX_SPEED_MM_S
+        idx = min(len(speeds) - 1, int(len(speeds) * self._SPEED_PERCENTILE))
+        # Never below the fallback: an idle stretch of near-zero steps
+        # would otherwise collapse the ceiling and make the check
+        # stricter than it has ever been.
+        return max(speeds[idx], self._MAX_SPEED_MM_S)
+
+    def _typical_dt_s(self) -> float:
+        """The robot's own message interval, measured from its own stream.
+
+        THE FLOOR HAS TO BE MEASURED TOO, or it is the borrowed constant
+        again in a new place. A hardcoded 1.8 s came from averaging four
+        missions of one robot; another install, another firmware, or a
+        busier network has a different rate, and every one of them
+        deserves a threshold that fits.
+
+        MEDIAN, NOT MEAN, and that is the whole point. A mean is dragged
+        upward by exactly the gaps this is meant to catch -- one long
+        stall would raise the allowance and wave the next real jump
+        through. The median of a window ignores a minority of outliers
+        completely, so the floor tracks ordinary operation and stays put
+        when something goes wrong.
+
+        Falls back to the conservative default until the window has
+        filled: with too few samples a median is not robust either.
+        """
+        if len(self._point_ts) < 5:
+            return self._MIN_STEP_DT_S
+        recent = self._point_ts[-(self._DT_WINDOW + 1):]
+        gaps = sorted(
+            b - a for a, b in zip(recent, recent[1:], strict=False) if b > a
+        )
+        if not gaps:
+            return self._MIN_STEP_DT_S
+        median = gaps[len(gaps) // 2]
+        # Never below the fallback: a burst of queued messages would
+        # otherwise pull the floor towards zero and make the check
+        # stricter than it has ever been.
+        return max(median, self._MIN_STEP_DT_S)
+
+    def add_pose(self, x_mm: float, y_mm: float, theta_deg: float) -> bool:
+        """Record a new pose point from the MQTT state update.
+
+        roombapy convention: co_ords["x"] = pose_point_y (swapped axes).
+        Callers pass already-corrected x_mm / y_mm relative to dock origin
+        — true since v3.2.1's axis-swap fix in image.py::_handle_pose()
+        (this docstring line predates that fix; the swap was documented
+        here as an assumption long before it was actually implemented at
+        the call site — confirmed via roombapy's own source, see
+        _handle_pose()'s comment for the full rationale).
+        Ignores (0, 0, any_theta) at mission start to avoid bogus dock point.
+        Rejects jumps > _MAX_POSE_JUMP_MM from the previous point — these
+        indicate stuck-recovery relocalisation or firmware bogus updates and
+        would otherwise draw a line across the entire map. See
+        the discontinuity marking above: the point is kept and only the
+        LINE breaks, so no anchor can go stale and no cascade can form.
+
+        Returns True if THIS call was an accepted sustained jump (added to
+        accepted_jump_log) — v3.2.1 DOCK-ANCHOR: callers use this to mark
+        interpolation waypoints within a buffered post-stuck segment (see
+        Dock_Anchor_Korrektur_Plan.md, 4c). False for a normal point, a
+        rejected jump, or the skipped dock-start point.
+        """
+        if x_mm == 0.0 and y_mm == 0.0 and not self._points:
+            return False  # First point at dock — skip
+
+        # Reject implausibly large jumps from the previous pose point.
+        # v2.6.3 B1 — use cfg constants (not _fit_scale/_fit_cx/cy) for the
+        # inverse transform.  _fit_* values change after every render() call;
+        # using them here caused the inverse to produce wildly wrong mm values
+        # after auto-fit activated, rejecting up to 99% of legitimate poses.
+        was_accepted_jump = False
+        now_ts = _time_mod.time()
+        if self._points_mm:
+            prev_x_mm, prev_y_mm = self._points_mm[-1]
+            jump_mm = math.hypot(x_mm - prev_x_mm, y_mm - prev_y_mm)
+            dt_s = now_ts - self._point_ts[-1] if self._point_ts else 0.0
+            allowed = self._allowed_step_mm(dt_s)
+            if jump_mm > allowed:
+                # MARKED, NOT DROPPED. The point is kept either way --
+                # only the LINE is broken. Dropping it left _points[-1]
+                # as a stale anchor, so every later real position
+                # measured against it too and the rejection cascaded
+                # (field-confirmed: 1413 points stranded in a 0.7 m
+                # pocket in a 106 m2 home).
+                #
+                # Consequence of a wrong call is now asymmetric in our
+                # favour: a false break draws a gap, a missed break
+                # draws one wrong line that the next point corrects.
+                # Neither loses data.
+                self._breaks.add(len(self._points))
+                _LOGGER.debug(
+                    "MapRenderer: discontinuity %.0f mm in %.1f s "
+                    "(allowed %.0f mm) -- line breaks, point kept",
+                    jump_mm, dt_s, allowed,
+                )
+                self._accepted_jump_log.append((x_mm, y_mm, theta_deg, now_ts))
+                if len(self._accepted_jump_log) > MAX_ACCEPTED_JUMP_LOG:
+                    self._accepted_jump_log = self._accepted_jump_log[-MAX_ACCEPTED_JUMP_LOG:]
+                was_accepted_jump = True
+
+        self._points_mm.append((x_mm, y_mm))
+        self._point_ts.append(now_ts)
+        px, py = self._mm_to_px(x_mm, y_mm)
+        self._points.append((px, py))
+        self._robot_px = (px, py)
+        self._theta = theta_deg
+        return was_accepted_jump
+
+    def replace_range(
+        self, start_index: int, corrected_points_mm: list[tuple[float, float]],
+    ) -> None:
+        """v3.2.1 DOCK-ANCHOR — retroactively replace an already-rendered
+        range of points with corrected (x_mm, y_mm) values, then force a
+        re-render.
+
+        Needed because self._renderer.add_pose() is called per pose
+        message in real time (unlike GridStore/RoomSeg/Outline, which are
+        only fed once at mission end) — a buffered, potentially-distorted
+        segment is already drawn and cached by the time a dock-anchor
+        correction is computed. This does NOT clear or reset anything
+        outside [start_index:] — points before the buffered segment stay
+        untouched, exactly as they were.
+
+        start_index: index into self._points where the correction begins
+        (the first point of the buffered segment). Silently clamped/no-op
+        if out of range (e.g. a reset() happened in between) rather than
+        raising — a stale correction arriving late should not crash the
+        live map.
+        """
+        if start_index < 0 or start_index > len(self._points):
+            _LOGGER.debug(
+                "MapRenderer.replace_range: start_index %d out of range "
+                "for %d points — ignoring (renderer state changed since "
+                "the correction was computed)",
+                start_index, len(self._points),
+            )
+            return
+        new_px_points = [self._mm_to_px(x, y) for x, y in corrected_points_mm]
+        self._points = self._points[:start_index] + new_px_points
+        # The parallel lists have to follow, or _breaks and _points_mm
+        # would still describe the uncorrected segment. Timestamps are
+        # kept as-is where they exist -- the correction moves positions,
+        # not when they were received.
+        self._points_mm = self._points_mm[:start_index] + list(corrected_points_mm)
+        self._point_ts = self._point_ts[:start_index + len(new_px_points)]
+        while len(self._point_ts) < len(self._points):
+            self._point_ts.append(self._point_ts[-1] if self._point_ts else 0.0)
+        # A break INSIDE the replaced range described the old geometry;
+        # the correction is a fresh, continuous segment. Breaks before
+        # start_index still stand.
+        self._breaks = {i for i in self._breaks if i < start_index}
+        if new_px_points:
+            self._robot_px = new_px_points[-1]
+        self._last_png = None  # force re-render; the cache reflects stale data
+
+    def transform_path(
+        self,
+        fn: Callable[[float, float], tuple[float, float]],
+        dtheta_deg: float = 0.0,
+    ) -> None:
+        """Move every point drawn so far by `fn` (4.4.1).
+
+        `fn` maps a point of the frame add_pose() takes to its new place
+        and must be linear (a turn about the dock): the stored pixels are
+        that frame scaled about the canvas centre, so they go back through
+        the same transform. For a requested path whose turn the user
+        changed after it was drawn (RoombaMapImage._sync_live_turn).
+        Pixels round to whole numbers on the way, one pixel at most.
+        """
+        c = self._cfg.size_px // 2
+        scale = self._cfg.scale
+
+        def _redo(p: Any) -> tuple[int, int]:
+            x_mm, y_mm = view_to_mm(
+                (p[0] - c) * scale, (c - p[1]) * scale,
+                self._cfg.mirror_x, self._cfg.quarter_turns,
+            )
+            return self._mm_to_px(*fn(x_mm, y_mm))
+
+        self._points_mm = [fn(x, y) for x, y in self._points_mm]
+        self._repixel(_redo)
+        self._theta += dtheta_deg
+
+    def reconfigure(
+        self, *, size_px: int, scale: float, quarter_turns: int,
+    ) -> bool:
+        """Move to a new canvas size, scale or turn (4.4.1).
+
+        Map rotation, size and scale were read once, when the integration
+        set the map up, while the rooms map reads the rotation for every
+        picture: saved without a reload, the two disagreed. Applied here
+        when the options are saved, during a mission too, with the points,
+        breaks and jump check kept. True when anything changed.
+        """
+        was = (
+            self._cfg.mirror_x, self._cfg.quarter_turns,
+            self._cfg.size_px, float(self._cfg.scale),
+        )
+        if (was[1] % 4, was[2], was[3]) == (quarter_turns % 4, size_px, float(scale)):
+            return False
+        self._cfg.size_px = size_px
+        self._cfg.scale = scale
+        self._cfg.quarter_turns = quarter_turns
+        self._fit_scale = self._cfg.scale
+        self._fit_cx = self._fit_cy = self._cfg.size_px // 2
+        self._repixel(lambda p: self._px_from_canvas(p, *was))
+        return True
+
+    def _px_from_canvas(
+        self, p: Any, was_mirrored: bool, was_turns: int, was_size: int, was_scale: float,
+    ) -> tuple[int, int]:
+        """A pixel of another canvas (mirror, turn, size, scale), on this one."""
+        was_c = was_size // 2
+        c = self._cfg.size_px // 2
+        ratio = float(was_scale) / float(self._cfg.scale)
+        x_mm, y_mm = view_to_mm(
+            (p[0] - was_c) * ratio, (was_c - p[1]) * ratio, was_mirrored, was_turns,
+        )
+        u, v = mm_to_view(x_mm, y_mm, self._cfg.mirror_x, self._cfg.quarter_turns)
+        return (int(round(c + u)), int(round(c - v)))
+
+    def _repixel(self, from_old_px: Callable[[Any], tuple[int, int]]) -> None:
+        """Pixels again after a change of frame or canvas (4.4.1).
+
+        From the millimetres where every point has them (a path drawn in
+        this session): exact, as add_pose() would place them. Otherwise,
+        for a restored path, from the old pixels, to within a pixel. The
+        robot and the stuck markers sit on path points and follow them.
+        """
+        old = list(self._points)
+        if self._points_mm and len(self._points_mm) == len(old):
+            new = [self._mm_to_px(x, y) for x, y in self._points_mm]
+        else:
+            new = [from_old_px(p) for p in old]
+        moved: dict[tuple[int, int], tuple[int, int]] = {
+            (int(p[0]), int(p[1])): q for p, q in zip(old, new)
+        }
+
+        def _follow(p: Any) -> tuple[int, int]:
+            return moved.get((int(p[0]), int(p[1]))) or from_old_px(p)
+
+        self._points = new
+        self._stuck_px = [_follow(p) for p in self._stuck_px]
+        if self._robot_px:
+            self._robot_px = _follow(self._robot_px)
+        self._last_png = None
+
+    def remember_dock_at_last_position(self) -> bool:
+        """The robot drove home and is charging: the dock is where its
+        last position was drawn. False without a position."""
+        if not self._points_mm:
+            return False
+        x, y = self._points_mm[-1]
+        self._dock_mm = (float(x), float(y))
+        self._last_png = None
+        return True
+
+    def mark_stuck(self) -> None:
+        """Record a stuck event at the current robot position."""
+        if self._robot_px:
+            self._stuck_px.append(self._robot_px)
+
+    # Minimum content span in mm. Prevents extreme zoom when only a few
+    # points are present (e.g. mission just started).
+    _MIN_FIT_CONTENT_MM: float = 500.0
+
+    # v2.9.0 — the robot footprint circle (cfg.robot_diameter_mm) must never
+    # dominate the canvas just because the pose path happens to stay within
+    # a small area (e.g. robot stuck/spinning in one spot for a long time —
+    # confirmed from real field data: 1413 pose points spanning only ~0.7m,
+    # last_stuck_count=165). _MIN_FIT_CONTENT_MM alone doesn't catch this,
+    # since it's a flat mm value unrelated to the robot's own size. The
+    # effective minimum content span is now whichever is larger: the flat
+    # floor above, or robot_diameter_mm × this multiplier — so the robot's
+    # own diameter is at most 1 / _MIN_FIT_CONTENT_ROBOT_MULTIPLIER of the
+    # visible canvas width, regardless of how small the real path is.
+    _MIN_FIT_CONTENT_ROBOT_MULTIPLIER: float = 4.0
+
+    def _compute_fit(self) -> tuple[float, float, float, float, int, int]:
+        """Compute pixel-space transform for auto-fit rendering.
+
+        Returns (fit_ratio, tx, ty, new_scale, fit_cx, fit_cy) where:
+          fit_ratio        — multiply stored pixel coords by this to scale content
+          tx, ty           — translate after scaling so content is centred
+          new_scale        — mm-per-pixel scale for geometry layers (_mm_to_px)
+          fit_cx, fit_cy   — canvas pixel position of the dock (0,0 mm)
+
+        No instance state is mutated — callers apply all returned values.
+        Falls back to identity transform when no points or auto_fit is off.
+        """
+        size = self._cfg.size_px
+        orig_cx = orig_cy = size // 2
+        identity = (1.0, 0.0, 0.0, self._cfg.scale, orig_cx, orig_cy)
+        if not self._cfg.auto_fit or not self._points:
+            return identity
+
+        # Build bounding box from all content: path, stuck, robot.
+        # A SHARED FRAME, when one is given.
+        #
+        # Every image auto-fits to its OWN content: the room map to all
+        # rooms, the cleaning path to the area one mission covered. Both
+        # then publish `calibration_points` that are correct for
+        # themselves and incompatible with each other, so
+        # xiaomi-vacuum-map-card cannot overlay one on the other -- it
+        # gets two valid, different coordinate systems.
+        #
+        # @Thonno: "the shape and proportions correspond, the problem is
+        # that the Cleaning Path is rendered independently". Exactly
+        # right, and this is where.
+        #
+        # With `fit_bounds_px` set, the fit uses that extent instead, so
+        # every image sharing it lands on one transform.
+        if self._fit_bounds_px is not None:
+            all_px = list(self._fit_bounds_px)
+        else:
+            all_px = list(self._points)
+            all_px.extend(self._stuck_px)
+            for _name, polygon in self.floor_plan:
+                if len(polygon) >= 3:
+                    all_px.extend(self._mm_to_px(x, y) for x, y in polygon)
+        if self._robot_px:
+            all_px.append(self._robot_px)
+        if self._dock_mm is not None and self._fit_bounds_px is None:
+            all_px.append(self._mm_to_px(*self._dock_mm))
+
+        # ROOM OUTLINES BELONG IN THE FIT, and leaving them out silently
+        # cropped them off the canvas.
+        #
+        # The fit scaled to the pose trail alone, but a room outline is
+        # drawn with `wall_offset_mm` OUTSIDE its cells -- it is meant to
+        # suggest where the wall is, so it lies beyond the floor the
+        # robot actually covered. It therefore fell outside the fitted
+        # canvas essentially always. A dashed rectangle draws only its
+        # edges, so nothing of it survived: a real room produced a frame
+        # byte-identical to no room at all.
+        #
+        # Converted with the fixed transform, matching how _points are
+        # stored -- _mm_to_px_fit would be circular here, since the fit
+        # is what is being computed.
+        if self._room_seg_store is not None and not (
+            self._geometry_store is not None
+            and self._geometry_store.has_user_geometry
+        ):
+            offset = (
+                self._geometry_store.wall_offset_mm
+                if self._geometry_store else 200
+            )
+            for room in self._room_seg_store.rooms.values():
+                if room.hidden:
+                    continue
+                x_min, x_max, y_min, y_max = room.bbox
+                all_px.append(self._mm_to_px(x_min - offset, y_max + offset))
+                all_px.append(self._mm_to_px(x_max + offset, y_min - offset))
+
+        xs = [p[0] for p in all_px]
+        ys = [p[1] for p in all_px]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+
+        # v2.9.0 — clamp the content span used for the fit calculation to at
+        # least this effective minimum, rather than the old binary "below
+        # 500mm → no zoom at all, above → zoom to exactly fit" cliff. The
+        # clamp keeps the robot footprint circle proportionally reasonable
+        # at every zoom level, including the small-area/stuck-robot case.
+        min_content_mm = max(
+            self._MIN_FIT_CONTENT_MM,
+            self._cfg.robot_diameter_mm * self._MIN_FIT_CONTENT_ROBOT_MULTIPLIER,
+        )
+        min_content_px = min_content_mm / self._cfg.scale
+
+        content_w = max(max_x - min_x, min_content_px)
+        content_h = max(max_y - min_y, min_content_px)
+
+        available = size - 2 * self._cfg.fit_margin
+        if available < 10:
+            return identity
+
+        # Uniform scale so the larger axis fills the available area.
+        fit_ratio = available / max(content_w, content_h)
+
+        # Translation to centre the scaled content on the canvas.
+        scaled_cx = (min_x + max_x) / 2 * fit_ratio
+        scaled_cy = (min_y + max_y) / 2 * fit_ratio
+        tx = size / 2 - scaled_cx
+        ty = size / 2 - scaled_cy
+
+        # Derive mm/px scale for geometry layers.
+        new_scale = self._cfg.scale / fit_ratio
+
+        # Dock position: (0,0 mm) was at orig_cx/cy in original pixel space.
+        fit_cx = int(orig_cx * fit_ratio + tx)
+        fit_cy = int(orig_cy * fit_ratio + ty)
+
+        return fit_ratio, tx, ty, new_scale, fit_cx, fit_cy
+
+    def render(self) -> bytes:
+        """Render all layers to PNG and return bytes.
+
+        Returns the last cached frame if no new points have been added
+        and a cached frame exists (avoids redundant re-renders).
+        """
+        if not self._points and self._last_png:
+            return self._last_png
+
+        # Compute auto-fit transform once per render.
+        # All fit state is set atomically here — _compute_fit has no side effects.
+        fit_ratio, tx, ty, new_scale, fit_cx, fit_cy = self._compute_fit()
+        self._fit_scale = new_scale
+        self._fit_cx = fit_cx
+        self._fit_cy = fit_cy
+
+        def _fit_px(px: int, py: int) -> tuple[int, int]:
+            """Transform a stored pixel coordinate to the fit canvas space."""
+            return (int(px * fit_ratio + tx), int(py * fit_ratio + ty))
+
+
+        size = self._cfg.size_px
+        img = Image.new("RGBA", (size, size), BG_COLOUR)
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([0, 0, size - 1, size - 1], outline=FLOOR_BORDER, width=2)
+
+        # Layer 1.4 — the floor plan, under everything else (4.4.0).
+        self._draw_floor_plan(draw)
+
+        # Layer 1.5 — inference suggestions (zone outlines + door markers).
+        # Suppressed once user geometry exists, so the two never overlap.
+        self._draw_inference_suggestions(draw)
+
+        # Layer 1.6 — user-authored geometry (walls, doors, obstacles).
+        self._draw_user_geometry(draw)
+
+        if self._points:
+            # SEEN THROUGH (4.4.1): the cleaned area on its own layer,
+            # opaque inside it so overlapping circles do not darken, then
+            # laid over at CLEANED_ALPHA. The path stays opaque.
+            cleaned = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            self._draw_cleaned_area(ImageDraw.Draw(cleaned), _fit_px)
+            cleaned.putalpha(
+                cleaned.getchannel("A").point(lambda a: int(a * CLEANED_ALPHA))
+            )
+            img.alpha_composite(cleaned)
+            self._draw_path(draw, _fit_px)
+
+        # The room names over the path (4.4.1): under it they were hidden
+        # wherever the robot had been.
+        self._draw_floor_plan_names(draw)
+
+        for sx, sy in self._stuck_px:
+            fsx, fsy = _fit_px(sx, sy)
+            stuck_r = self._mm_radius_px(STUCK_DIAMETER_MM / 2, min_px=STUCK_MIN_PX)
+            self._draw_triangle(draw, fsx, fsy, stuck_r, STUCK_COLOUR)
+
+        # v2.9.0 — robot-footprint reference circle around the dock, in
+        # addition to the small marker dot. Filled, semi-transparent green
+        # (not solid) — clearly reads as "the dock zone" while still letting
+        # the cleaned-area/path detail underneath show through. This is a
+        # scale reference ("this much space if the robot were sitting right
+        # here"), not a coverage indicator — kept visually distinct from the
+        # solid CLEANED_COLOUR circles.
+        #
+        # PIL's ImageDraw overwrites destination pixels (alpha channel
+        # included) rather than alpha-compositing onto existing content —
+        # drawing a semi-transparent fill directly with `draw.ellipse(...)`
+        # would erase whatever was underneath instead of blending with it.
+        # Drawing onto a separate fully-transparent overlay and compositing
+        # with Image.alpha_composite() is the correct way to get a real
+        # blend. img is reassigned, so `draw` must be rebound afterwards —
+        # every draw call below this point uses the new `draw`.
+        dock_footprint_r = self._mm_radius_px(
+            self._cfg.robot_diameter_mm / 2, min_px=DOCK_MIN_PX
+        )
+        # THE FRAME'S ORIGIN IS THE DOCK ONLY FOR THE ROBOT'S OWN POSE.
+        # Requested positions come in the cloud map's frame (Jamd-pt), so
+        # the dock is drawn where the robot was seen docking, once it has.
+        dock_px = _fit_px(*(
+            self._mm_to_px(*self._dock_mm) if self._dock_mm is not None
+            else (size // 2, size // 2)
+        ))
+        dcx, dcy = dock_px
+        dock_overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        overlay_draw = ImageDraw.Draw(dock_overlay)
+        overlay_draw.ellipse(
+            [dcx - dock_footprint_r, dcy - dock_footprint_r,
+             dcx + dock_footprint_r, dcy + dock_footprint_r],
+            fill=(80, 180, 80, 90),
+            outline=(30, 120, 30, 200),
+            width=2,
+        )
+        img = Image.alpha_composite(img, dock_overlay)
+        draw = ImageDraw.Draw(img)
+
+        dock_r = self._mm_radius_px(DOCK_ICON_DIAMETER_MM / 2, min_px=DOCK_MIN_PX)
+        draw.ellipse(
+            [dcx - dock_r, dcy - dock_r, dcx + dock_r, dcy + dock_r],
+            fill=DOCK_COLOUR,
+            outline=(30, 120, 30, 255),
+            width=2,
+        )
+
+        if self._robot_px:
+            # v2.9.0 — robot icon uses the smaller marker-convention size
+            # (ROBOT_ICON_DIAMETER_MM), not the literal chassis diameter.
+            # It marks "robot is here" like a pin, distinct from the
+            # to-scale cleaned-area footprint circles along its trail.
+            robot_r = self._mm_radius_px(ROBOT_ICON_DIAMETER_MM / 2, min_px=ROBOT_MIN_PX)
+            rx, ry = _fit_px(*self._robot_px)
+            draw.ellipse(
+                [rx - robot_r, ry - robot_r,
+                 rx + robot_r, ry + robot_r],
+                fill=ROBOT_COLOUR,
+            )
+            angle_rad = math.radians(self._heading_view_deg())
+            ex = rx + int(ARROW_LENGTH * math.cos(angle_rad))
+            ey = ry - int(ARROW_LENGTH * math.sin(angle_rad))
+            draw.line([rx, ry, ex, ey], fill=ARROW_COLOUR, width=3)
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        self._last_png = buf.getvalue()
+        return self._last_png
+
+    # ── Persistence ───────────────────────────────────────────────────────────
+
+    def dump_state(self) -> dict[str, Any]:
+        """Serialise renderer state to a JSON-safe dict for hass.storage.
+
+        Only the pose points, stuck positions, last heading, and robot position
+        are persisted. The cached PNG is intentionally excluded — it will be
+        re-rendered from the persisted points on the first async_image() call
+        after restore, which takes <5 ms and avoids storing large binary blobs
+        in hass.storage.
+
+        The _STATE_VERSION field allows future migrations if the format changes.
+        """
+        return {
+            "version": _STATE_VERSION,
+            "points": list(self._points),           # list[tuple[int, int]]
+            "stuck_px": list(self._stuck_px),       # list[tuple[int, int]]
+            "robot_px": list(self._robot_px) if self._robot_px else None,
+            "dock_mm": list(self._dock_mm) if self._dock_mm is not None else None,
+            "theta": self._theta,
+            # Which way the pixels face. A dump written before the view
+            # was mirrored has no key and is converted on restore.
+            "mirror_x": self._cfg.mirror_x,
+            "quarter_turns": self._cfg.quarter_turns,
+            # The canvas the pixels are on (4.4.1), so a changed map size
+            # or scale is converted on restore like a changed turn.
+            "size_px": self._cfg.size_px,
+            "scale": self._cfg.scale,
+            # v3.2.1 LANDMARK-LOG — additive field, no _STATE_VERSION
+            # bump needed (same precedent as GridStore's FURNITURE/
+            # DUAL-GRID fields): a state dump saved before this existed
+            # simply has no "accepted_jump_log" key.
+            "accepted_jump_log": [list(j) for j in self._accepted_jump_log],
+        }
+
+    def restore_state(self, state: dict[str, Any]) -> bool:
+        """Restore renderer state from a previously dumped dict.
+
+        Returns True if restore succeeded, False if the state is incompatible
+        (e.g. wrong version, missing keys) so the caller can log a warning
+        and continue with a blank renderer rather than crashing.
+
+        The cached PNG is intentionally not restored — it will be re-rendered
+        on the first render() call.
+        """
+        try:
+            version = state.get("version", 0)
+            if version != _STATE_VERSION:
+                _LOGGER.warning(
+                    "MapRenderer: stored state version %d != current %d, skipping restore",
+                    version, _STATE_VERSION,
+                )
+                return False
+
+            self._points = [tuple(p) for p in state["points"]]
+            self._stuck_px = [tuple(p) for p in state["stuck_px"]]
+            robot_px = state.get("robot_px")
+            self._robot_px = tuple(robot_px) if robot_px else None
+            dock_mm = state.get("dock_mm")
+            self._dock_mm = (
+                (float(dock_mm[0]), float(dock_mm[1]))
+                if isinstance(dock_mm, (list, tuple)) and len(dock_mm) == 2
+                else None
+            )
+            # Handed over mirrored or not as the view was then.
+            if self._dock_mm is not None and bool(state.get("mirror_x", False)) != self._cfg.mirror_x:
+                self._dock_mm = map_mm_to_view(*self._dock_mm)
+            # A PATH SAVED THE OTHER WAY ROUND, before 4.3.1 mirrored the
+            # view: the pixels are about the canvas centre, so mirroring
+            # them is 2*cx - x.
+            # ...or turned another way (4.3.2): undone and redone about
+            # the canvas centre, where the fixed-scale pixels are anchored.
+            # ...or on another canvas (4.4.1): map size and scale now
+            # reload the integration, and the pixels are about the old
+            # centre at the old scale. Dumps without them were written on
+            # this canvas, as before.
+            was_mirrored = bool(state.get("mirror_x", False))
+            was_turns = int(state.get("quarter_turns", 0) or 0)
+            was_size = int(state.get("size_px", self._cfg.size_px) or self._cfg.size_px)
+            was_scale = float(state.get("scale", self._cfg.scale) or self._cfg.scale)
+            if (was_mirrored, was_turns % 4, was_size, was_scale) != (
+                self._cfg.mirror_x, self._cfg.quarter_turns % 4,
+                self._cfg.size_px, float(self._cfg.scale),
+            ):
+                def _redo(p: Any) -> tuple[int, int]:
+                    return self._px_from_canvas(
+                        p, was_mirrored, was_turns, was_size, was_scale,
+                    )
+
+                self._points = [_redo(p) for p in self._points]
+                self._stuck_px = [_redo(p) for p in self._stuck_px]
+                if self._robot_px:
+                    self._robot_px = _redo(self._robot_px)
+            self._theta = float(state.get("theta", 0.0))
+            self._last_png = None  # will be re-rendered on demand
+            # v3.2.1 LANDMARK-LOG — .get() with [] default: old dumps
+            # simply predate this field, not an error. Also handles the
+            # OLDER 3-element shape (x,y,timestamp), from before theta_deg
+            # was added: those entries get a placeholder theta=0.0 rather
+            # than being dropped or raising.
+            self._accepted_jump_log = [
+                (float(j[0]), float(j[1]), float(j[2]), float(j[3]))
+                if len(j) >= 4 else
+                (float(j[0]), float(j[1]), 0.0, float(j[2]))
+                for j in state.get("accepted_jump_log", [])
+            ]
+
+            _LOGGER.debug(
+                "MapRenderer: restored %d points, %d stuck events",
+                len(self._points), len(self._stuck_px),
+            )
+            return True
+
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("MapRenderer: restore_state failed: %s", exc)
+            return False
+
+    # ── Read-only properties ──────────────────────────────────────────────────
+
+    @property
+    def accepted_jump_log(self) -> list[tuple[float, float, float, float]]:
+        """Read-only snapshot of (x_mm, y_mm, theta_deg, unix_time) for
+        every sustained pose jump accepted after the reject-streak (see
+        MAX_ACCEPTED_JUMP_LOG docstring). Data-collection scaffolding;
+        not yet consumed anywhere.
+        """
+        return list(self._accepted_jump_log)
+
+    # v3.2.1 REMOVED — render_for_outline() and the whole fixed-window
+    # PNG-extraction pipeline it fed (extract_contour_from_png,
+    # _merge_contours in outline_store.py) are gone. The room outline is
+    # now derived directly from GridStore's unbounded cell dict
+    # (outline_store.compute_boundary_points_mm) instead of a 6x6m PNG
+    # render — see outline_store.py PAYLOAD_VERSION 4 for the full
+    # rationale (field-confirmed: 57% of a real OG's grid fell outside
+    # the fixed window and could never appear in the outline).
+
+    @property
+    def has_data(self) -> bool:
+        """Return True if any pose points have been recorded."""
+        return bool(self._points)
+
+    @property
+    def point_count(self) -> int:
+        """Return number of recorded pose points."""
+        return len(self._points)
+
+    def render_keepout_zones(
+        self,
+        keepout_polygons_px: list[list[tuple[int, int]]],
+    ) -> bytes | None:
+        """v2.3.0 Step 6 — Overlay keep-out zone polygons as semi-transparent red fills.
+
+        Must be called AFTER render() so _last_png is populated.
+        Composites the overlay onto _last_png in-memory and updates _last_png
+        so the caller can use the returned bytes directly without another render().</p>
+
+        Returns updated PNG bytes, or None when _last_png is absent or list empty.
+        Called from image.py async_image(); caller uses the return value directly.
+        """
+        if not keepout_polygons_px or self._last_png is None:
+            return None
+        import io as _io
+        from PIL import Image as PILImage, ImageDraw
+        base    = PILImage.open(_io.BytesIO(self._last_png)).convert("RGBA")
+        overlay = PILImage.new("RGBA", base.size, (0, 0, 0, 0))
+        draw    = ImageDraw.Draw(overlay)
+        for poly in keepout_polygons_px:
+            if len(poly) >= 3:
+                draw.polygon(poly, fill=(255, 0, 0, 80))
+        composite     = PILImage.alpha_composite(base, overlay).convert("RGB")
+        buf           = _io.BytesIO()
+        composite.save(buf, format="PNG")
+        self._last_png = buf.getvalue()
+        return self._last_png
+
+    def render_observed_zones(
+        self,
+        circles_px: list[tuple[int, int, int]],
+    ) -> bytes | None:
+        """v3.0.0 ZONE-OVERLAY — Overlay robot-observed obstacle zones as orange circles.
+
+        Mirrors render_keepout_zones() compositing pattern.
+        Colour: orange (255, 140, 0, 100) — distinct from keepout red and outline grey.
+        Shape: filled circles (draw.ellipse) — observed_zone_centroids carry x/y/radius,
+        not full polygon paths like UMF keepout zones.
+
+        Args:
+            circles_px: list of (cx_px, cy_px, radius_px) tuples in pixel coordinates.
+
+        Must be called AFTER render() so _last_png is populated.
+        Returns updated PNG bytes, or None when _last_png is absent or list empty.
+        """
+        if not circles_px or self._last_png is None:
+            return None
+        import io as _io
+        from PIL import Image as PILImage, ImageDraw
+        base    = PILImage.open(_io.BytesIO(self._last_png)).convert("RGBA")
+        overlay = PILImage.new("RGBA", base.size, (0, 0, 0, 0))
+        draw    = ImageDraw.Draw(overlay)
+        for cx, cy, r in circles_px:
+            bbox = [cx - r, cy - r, cx + r, cy + r]
+            draw.ellipse(bbox, fill=(255, 140, 0, 100))
+        composite     = PILImage.alpha_composite(base, overlay).convert("RGB")
+        buf           = _io.BytesIO()
+        composite.save(buf, format="PNG")
+        self._last_png = buf.getvalue()
+        return self._last_png
+
+    def render_room_outline(
+        self,
+        contour_points_mm: list[tuple[float, float]],
+    ) -> bytes | None:
+        """F-EPHEMERAL — Overlay accumulated room outline on _last_png.
+
+        v3.2.1 REDESIGN — contour_points_mm are now real-world millimetre
+        coordinates (GridStore boundary-cell centres — see
+        outline_store.compute_boundary_points_mm), not pre-rendered pixels
+        from a fixed 6x6m canvas. This fixes two field-confirmed bugs at
+        once, both stemming from the old PNG-based pipeline:
+
+          1. OFFSET — contour pixels were stored in a FIXED identity px
+             space (render_for_outline(), v2.8.2) but composited onto an
+             auto-fitted _last_png. On a real 980 OG this displaced the
+             entire outline ~2.4 m from the cleaning path (fit_ratio 0.667,
+             dock fitted to (332,137) vs. outline anchored at (300,300)).
+          2. CLIPPING — the fixed 600x600px / 10mm-per-px canvas is a hard
+             6x6m window around the dock. On the same OG, 57% of the
+             house's known GridStore footprint (1603/2798 cells) fell
+             outside that window and could never appear in the outline,
+             however many missions accumulated.
+
+        mm coordinates are converted with _mm_to_px_fit() — the SAME
+        transform every other geometry overlay (walls, doors, zones) uses
+        — so the outline is always pixel-aligned with the current
+        auto-fitted render and is never window-clipped, since GridStore
+        itself is unbounded.
+
+        Mirrors render_keepout_zones() compositing pattern.
+        Colour: grey (180, 180, 180, 140) — visible but not distracting.
+        Returns new PNG bytes, or None when _last_png is None or no points.
+        """
+        if not contour_points_mm or self._last_png is None:
+            return None
+        import io as _io
+        from PIL import Image as PILImage, ImageDraw
+        base    = PILImage.open(_io.BytesIO(self._last_png)).convert("RGBA")
+        overlay = PILImage.new("RGBA", base.size, (0, 0, 0, 0))
+        draw    = ImageDraw.Draw(overlay)
+        for (x_mm, y_mm) in contour_points_mm:
+            fx, fy = self._mm_to_px_fit(x_mm, y_mm)
+            # Draw a 2×2 pixel dot per contour point
+            if 0 <= fx < base.width and 0 <= fy < base.height:
+                draw.rectangle([fx, fy, fx + 1, fy + 1], fill=(180, 180, 180, 140))
+        composite     = PILImage.alpha_composite(base, overlay).convert("RGB")
+        buf           = _io.BytesIO()
+        composite.save(buf, format="PNG")
+        self._last_png = buf.getvalue()
+        return self._last_png
+
+    @property
+    def points_mm(self) -> list[tuple[float, float]]:
+        """Return pose points in mm (used by diagnostics.py for
+        last_mission_trajectory_mm)."""
+        cx = cy = self._cfg.size_px // 2
+        scale = self._cfg.scale
+        # Back into the maps' frame: the view's mirror and turn undone.
+        return [
+            view_to_mm(
+                (px - cx) * scale, (cy - py) * scale,
+                self._cfg.mirror_x, self._cfg.quarter_turns,
+            )
+            for px, py in self._points
+        ]
+
+
+    def diagnostic_info(self) -> dict[str, Any]:
+        """Return a diagnostics-safe summary with no private attribute access.
+
+        Called by diagnostics.py so it never needs to reach into _cfg, _last_png
+        or _stuck_px directly.
+        """
+        return {
+            "size_px": self._cfg.size_px,
+            "scale_mm_per_px": self._cfg.scale,
+            "persist": self._cfg.persist,
+            "point_count": len(self._points),
+            "has_cached_image": self._last_png is not None,
+            "stuck_event_count": len(self._stuck_px),
+        }
+
+    def set_floor_plan(
+        self, plan: list[tuple[str | None, list[tuple[float, float]]]]
+    ) -> None:
+        """The rooms to draw under the path (see `floor_plan`)."""
+        self.floor_plan = list(plan)
+
+    def set_room_layout(self, layout: RoomLayout | None) -> None:
+        """The 900-series layout to draw (see `room_layout`)."""
+        self.room_layout = layout
+
+    # ── Geometry layers ───────────────────────────────────────────────────────
+
+    def _draw_floor_plan(self, draw: ImageDraw.ImageDraw) -> None:
+        """Layer 1.4 — the rooms of the floor plan, filled and outlined.
+
+        Their names come later, over the path (_draw_floor_plan_names).
+        """
+        for _name, polygon in self.floor_plan:
+            if len(polygon) < 3:
+                continue
+            points = [self._mm_to_px_fit(x, y) for x, y in polygon]
+            draw.polygon(points, fill=FLOOR_PLAN_FILL, outline=FLOOR_PLAN_LINE, width=2)
+
+    def _draw_floor_plan_names(self, draw: ImageDraw.ImageDraw) -> None:
+        """The names of the floor plan's rooms, over the path (4.4.1).
+
+        At each room's vertex mean: good enough to say which room is
+        which, as the rooms map does.
+        """
+        for name, polygon in self.floor_plan:
+            if not name or len(polygon) < 3:
+                continue
+            cx = sum(x for x, _y in polygon) / len(polygon)
+            cy = sum(y for _x, y in polygon) / len(polygon)
+            draw.text(
+                self._mm_to_px_fit(cx, cy), name,
+                fill=FLOOR_PLAN_TEXT, anchor="mm", font=label_font(name, LABEL_FONT_SMALL),
+            )
+
+    def _draw_inference_suggestions(self, draw: ImageDraw.ImageDraw) -> None:
+        """Layer 1.5 — dashed room outlines and door crossing markers.
+
+        Draws room bounding boxes from RoomSegStore (expanded by
+        wall_offset_mm) as dashed grey rectangles, and each DoorMarker as a
+        small filled circle. Suppressed entirely when user geometry already
+        exists — the two layers must never overlap to avoid confusion.
+
+        ROOM-SEG Stage 5 — room outlines backed by RoomSegStore, not
+        ZoneStore (the gap heuristic proved unreliable — see
+        ROOM_SEGMENTATION_NOTES.md). The door-marker drawing below was
+        ALREADY unaffected by this swap: GeometryStore.door_markers is fed
+        from RoomSegStore.doors since the earlier door-marker-source
+        change (update_from_room_seg_store), so this method's marker loop
+        needed no changes at all.
+        """
+        if self._room_seg_store is None:
+            return
+        if self._geometry_store is not None and self._geometry_store.has_user_geometry:
+            return  # user has confirmed layout — suggestions no longer shown
+        if self.room_layout is not None:
+            self._draw_room_layout(draw, self.room_layout)
+            return
+
+        # Room outline rectangles (dashed)
+        offset = self._geometry_store.wall_offset_mm if self._geometry_store else 200
+        for room in self._room_seg_store.rooms.values():
+            if room.hidden:
+                continue
+            x_min, x_max, y_min, y_max = room.bbox
+            x1, y1 = self._mm_to_px_fit(x_min - offset, y_max + offset)
+            x2, y2 = self._mm_to_px_fit(x_max + offset, y_min - offset)
+            self._draw_dashed_rect(draw, x1, y1, x2, y2, SUGGEST_OUTLINE, SUGGEST_DASH)
+            # Room name label at bbox centroid -- AND THE NUMBER when
+            # there is no name yet. An unnamed area was drawn as a bare
+            # outline, and the naming form asked for "zone_room_1"
+            # with nothing on the map to say which outline that was
+            # (a tester's 980). The form now labels its field "Area 1".
+            # Spelled out rather than imported: this module stays free
+            # of the store's Home Assistant imports. It is
+            # `room_seg_store.area_number`, and a test holds them equal.
+            label = room.name or room.id.removeprefix("room_")
+            lx, ly = self._mm_to_px_fit(
+                (x_min + x_max) / 2,
+                (y_min + y_max) / 2,
+            )
+            draw.text((lx, ly), label, fill=SUGGEST_LABEL, anchor="mm", font=label_font(label, LABEL_FONT))
+
+        # Door crossing markers (filled circles)
+        if self._geometry_store:
+            for marker in self._geometry_store.door_markers:
+                if marker.mission_count < 2:
+                    continue  # only show markers seen in ≥2 missions
+                mx, my = self._mm_to_px_fit(marker.cx, marker.cy)
+                r = DOOR_MARKER_RADIUS
+                draw.ellipse(
+                    [mx - r, my - r, mx + r, my + r],
+                    fill=DOOR_MARKER,
+                    outline=(255, 255, 255, 200),
+                    width=1,
+                )
+
+    def _draw_room_layout(self, draw: ImageDraw.ImageDraw, layout: RoomLayout) -> None:
+        """Furniture, straight walls with their doors, and the room names.
+
+        Walls as thick as the configured wall; a door as a thin green line
+        across its gap, an open passage as the gap alone.
+        """
+        cell = LAYOUT_CELL_MM
+        for x, y in layout.furniture:
+            x1, y1 = self._mm_to_px_fit(x * cell, (y + 1) * cell)
+            x2, y2 = self._mm_to_px_fit((x + 1) * cell, y * cell)
+            draw.rectangle(
+                [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)],
+                fill=LAYOUT_FURNITURE,
+            )
+        width = max(2, int(round(layout.wall_mm / max(self._fit_scale, 1e-6))))
+        for wall in layout.walls:
+            draw.line(
+                [self._mm_to_px_fit(wall.x1, wall.y1), self._mm_to_px_fit(wall.x2, wall.y2)],
+                fill=LAYOUT_WALL, width=width,
+            )
+        for door in layout.doors:
+            if door.open:
+                continue
+            half = door.width_mm / 2
+            if door.along_x:
+                a, b = (door.cx - half, door.cy), (door.cx + half, door.cy)
+            else:
+                a, b = (door.cx, door.cy - half), (door.cx, door.cy + half)
+            draw.line(
+                [self._mm_to_px_fit(*a), self._mm_to_px_fit(*b)],
+                fill=LAYOUT_DOOR, width=2,
+            )
+        for key, cells in layout.rooms.items():
+            if not cells:
+                continue
+            mx = (sum(c[0] for c in cells) / len(cells) + 0.5) * cell
+            my = (sum(c[1] for c in cells) / len(cells) + 0.5) * cell
+            # An area without a name is shown by its number, as the
+            # naming form asks for it (room_seg_store.area_number).
+            label = key.removeprefix("room_")
+            draw.text(
+                self._mm_to_px_fit(mx, my), label,
+                fill=SUGGEST_LABEL, anchor="mm", font=label_font(label, LABEL_FONT),
+            )
+
+    def _draw_user_geometry(self, draw: ImageDraw.ImageDraw) -> None:
+        """Layer 1.6 — user-authored walls, doors, and obstacle rectangles.
+
+        Walls are solid dark-grey lines with a faint white centre highlight.
+        Doors are a dashed blue gap line plus a filled quarter-circle swing arc.
+        Obstacles are amber-filled rectangles with dashed border and hatching.
+        All elements render beneath the cleaned-area layer so the cleaning path
+        remains the dominant visual.
+        """
+        if self._geometry_store is None:
+            return
+
+        for wall in self._geometry_store.walls:
+            x1, y1 = self._mm_to_px_fit(wall.x1, wall.y1)
+            x2, y2 = self._mm_to_px_fit(wall.x2, wall.y2)
+            draw.line([x1, y1, x2, y2], fill=WALL_FILL, width=WALL_WIDTH)
+            draw.line([x1, y1, x2, y2], fill=WALL_CENTRE, width=WALL_CENTRE_WIDTH)
+            if wall.label:
+                mx, my = (x1 + x2) // 2, (y1 + y2) // 2
+                draw.text((mx, my - 8), wall.label, fill=WALL_FILL, anchor="mm", font=label_font(wall.label, LABEL_FONT_SMALL))
+
+        for door in self._geometry_store.doors:
+            cx, cy = self._mm_to_px_fit(door.cx, door.cy)
+            half_w_px = max(1, int(door.width_mm / 2 / self._fit_scale))
+            # The door's angle is in the maps' frame; mirrored with it.
+            door_theta = (
+                180.0 - door.theta_deg if self._cfg.mirror_x else door.theta_deg
+            ) - 90.0 * self._cfg.quarter_turns
+            theta_rad = math.radians(door_theta)
+            # Gap line (dashed) along door orientation
+            dx = int(half_w_px * math.cos(theta_rad))
+            dy = int(half_w_px * math.sin(theta_rad))
+            self._draw_dashed_line(
+                draw, cx - dx, cy + dy, cx + dx, cy - dy,
+                DOOR_FILL, (6, 4), width=3,
+            )
+            # Swing arc — quarter circle from gap end, radius = door width
+            self._draw_door_arc(
+                draw, cx - dx, cy + dy, half_w_px * 2, door_theta,
+                clockwise=self._cfg.mirror_x,
+            )
+            if door.label:
+                draw.text((cx, cy - 10), door.label, fill=DOOR_FILL, anchor="mm", font=label_font(door.label, LABEL_FONT_SMALL))
+
+        for obs in self._geometry_store.obstacles:
+            x1, y1 = self._mm_to_px_fit(obs.x, obs.y + obs.h)   # top-left in image
+            x2, y2 = self._mm_to_px_fit(obs.x + obs.w, obs.y)   # bottom-right in image
+            # Clamp to canvas
+            size = self._cfg.size_px
+            x1, x2 = sorted([max(0, min(size - 1, x1)), max(0, min(size - 1, x2))])
+            y1, y2 = sorted([max(0, min(size - 1, y1)), max(0, min(size - 1, y2))])
+            if x2 <= x1 or y2 <= y1:
+                continue
+            draw.rectangle([x1, y1, x2, y2], fill=OBSTACLE_FILL)
+            self._draw_dashed_rect(draw, x1, y1, x2, y2, OBSTACLE_OUTLINE, (5, 3))
+            self._draw_hatch(draw, x1, y1, x2, y2, OBSTACLE_OUTLINE)
+            if obs.label:
+                lx, ly = (x1 + x2) // 2, (y1 + y2) // 2
+                draw.text((lx, ly), obs.label, fill=OBSTACLE_OUTLINE, anchor="mm", font=label_font(obs.label, LABEL_FONT_SMALL))
+
+    # ── Geometry drawing primitives ───────────────────────────────────────────
+
+    @staticmethod
+    def _draw_dashed_line(
+        draw: ImageDraw.ImageDraw,
+        x1: int, y1: int, x2: int, y2: int,
+        colour: tuple[Any, ...],
+        dash: tuple[int, int] = (6, 4),
+        width: int = 1,
+    ) -> None:
+        """Draw a dashed line from (x1,y1) to (x2,y2)."""
+        length = math.hypot(x2 - x1, y2 - y1)
+        if length < 1:
+            return
+        on, off = dash
+        step = on + off
+        steps = max(1, int(length / step))
+        for i in range(steps + 1):
+            t_start = i * step / length
+            t_end = min(1.0, (i * step + on) / length)
+            if t_start >= 1.0:
+                break
+            sx = int(x1 + (x2 - x1) * t_start)
+            sy = int(y1 + (y2 - y1) * t_start)
+            ex = int(x1 + (x2 - x1) * t_end)
+            ey = int(y1 + (y2 - y1) * t_end)
+            draw.line([sx, sy, ex, ey], fill=colour, width=width)
+
+    @classmethod
+    def _draw_dashed_rect(
+        cls,
+        draw: ImageDraw.ImageDraw,
+        x1: int, y1: int, x2: int, y2: int,
+        colour: tuple[Any, ...],
+        dash: tuple[int, int] = (6, 4),
+    ) -> None:
+        """Draw a dashed rectangle by drawing four dashed sides."""
+        cls._draw_dashed_line(draw, x1, y1, x2, y1, colour, dash)  # top
+        cls._draw_dashed_line(draw, x2, y1, x2, y2, colour, dash)  # right
+        cls._draw_dashed_line(draw, x2, y2, x1, y2, colour, dash)  # bottom
+        cls._draw_dashed_line(draw, x1, y2, x1, y1, colour, dash)  # left
+
+    def _draw_door_arc(
+        self,
+        draw: ImageDraw.ImageDraw,
+        hinge_px: int, hinge_py: int,
+        radius_px: int,
+        theta_deg: float,
+        *,
+        clockwise: bool = False,
+    ) -> None:
+        """Draw a quarter-circle door swing arc.
+
+        The arc starts at theta_deg and sweeps 90° counter-clockwise, or
+        clockwise in a mirrored picture, where a turn changes direction.
+        Filled with DOOR_ARC_FILL and outlined with DOOR_ARC_OUTLINE.
+        Drawn as a polygon of short line segments for broad PIL compatibility.
+        """
+        steps = max(8, radius_px // 2)
+        start_rad = math.radians(theta_deg)
+        end_rad = start_rad + (-math.pi / 2 if clockwise else math.pi / 2)
+        pts = [(hinge_px, hinge_py)]
+        for i in range(steps + 1):
+            a = start_rad + (end_rad - start_rad) * i / steps
+            pts.append((
+                hinge_px + int(radius_px * math.cos(a)),
+                hinge_py - int(radius_px * math.sin(a)),
+            ))
+        pts.append((hinge_px, hinge_py))
+        if len(pts) >= 3:
+            draw.polygon(pts, fill=DOOR_ARC_FILL, outline=DOOR_ARC_OUTLINE)
+
+    @staticmethod
+    def _draw_hatch(
+        draw: ImageDraw.ImageDraw,
+        x1: int, y1: int, x2: int, y2: int,
+        colour: tuple[Any, ...],
+    ) -> None:
+        """Draw diagonal hatching lines inside a rectangle."""
+        w, h = x2 - x1, y2 - y1
+        span = w + h
+        step = OBSTACLE_HATCH_GAP
+        for offset in range(0, span, step):
+            # Diagonal from top-left area to bottom-right area
+            sx = x1 + offset
+            sy = y1
+            ex = x1
+            ey = y1 + offset
+            # Clamp to rectangle
+            if sx > x2:
+                ey += sx - x2
+                sx = x2
+            if ey > y2:
+                sx -= ey - y2
+                ey = y2
+            if sx >= x1 and ey <= y2 and sx <= x2 and ey >= y1:
+                draw.line([sx, sy, ex, ey], fill=colour, width=1)
+
+    # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _heading_view_deg(self) -> float:
+        """The robot's heading as the picture shows it, counter-clockwise
+        from the picture's right: mirrored with the positions, and turned
+        clockwise with them (4.3.2)."""
+        base = (
+            raw_heading_to_view_deg(self._theta)
+            if self._cfg.mirror_x else self._theta
+        )
+        return base - 90.0 * self._cfg.quarter_turns
+
+    def _mm_to_px(self, x_mm: float, y_mm: float) -> tuple[int, int]:
+        """Convert mm dock-relative coordinates to INITIAL canvas pixel space.
+
+        v2.6.3 B1/B2 — always uses the fixed cfg.scale and canvas centre so
+        that all stored _points are in a CONSISTENT coordinate space regardless
+        of when render() was last called.  This eliminates the jump-detection
+        false-reject caused by the previous implementation using the fit-adjusted
+        _fit_scale/_fit_cx/cy which change after every render() call.
+
+        Geometry layers drawn inside render() call _mm_to_px_fit() instead,
+        which uses the fit-adjusted parameters so overlay elements stay aligned
+        with the auto-zoomed content.
+        """
+        cx = cy = self._cfg.size_px // 2
+        x_mm, y_mm = mm_to_view(
+            x_mm, y_mm, self._cfg.mirror_x, self._cfg.quarter_turns
+        )
+        return (
+            int(cx + x_mm / self._cfg.scale),
+            int(cy - y_mm / self._cfg.scale),
+        )
+
+    def _mm_to_px_fit(self, x_mm: float, y_mm: float) -> tuple[int, int]:
+        """Convert mm to FIT-ADJUSTED canvas pixels.
+
+        Only valid inside render() after _compute_fit() has been called for the
+        current frame.  Used by geometry overlay layers (zones, walls, doors,
+        obstacles, door markers) so they stay spatially aligned with the
+        auto-zoomed cleaning path.
+        """
+        x_mm, y_mm = mm_to_view(
+            x_mm, y_mm, self._cfg.mirror_x, self._cfg.quarter_turns
+        )
+        return (
+            int(self._fit_cx + x_mm / self._fit_scale),
+            int(self._fit_cy - y_mm / self._fit_scale),
+        )
+
+    def _mm_radius_px(self, mm: float, min_px: int = 2) -> int:
+        """Convert a real-world mm radius/width to zoom-correct pixels.
+
+        Mathematically: base_r_px * (cfg.scale / fit_scale)
+                      = (mm / cfg.scale) * (cfg.scale / fit_scale)
+                      = mm / fit_scale
+
+        cfg.scale cancels out — this is the single source of truth for
+        converting any real-world mm size to on-canvas pixels, used by
+        every marker (cleaned-area circles, path width, dock, robot icon,
+        stuck triangle) so they all scale together under auto_fit zoom.
+        """
+        return max(min_px, int(mm / self._fit_scale))
+
+    def _draw_cleaned_area(
+        self, draw: ImageDraw.ImageDraw,
+        fit_px: Callable[[int, int], tuple[int, int]],  # noqa: F821 — TYPE_CHECKING forward reference, pyflakes/ruff scope limitation
+    ) -> None:
+        """Draw a filled circle per pose point to approximate cleaned area.
+
+        pose.point.x/y is the robot's own reported navigation centre — the
+        path line traces that centre, not an edge. The circle radius is
+        therefore the real chassis radius (cfg.robot_diameter_mm / 2), so the
+        rendered footprint matches the robot's actual physical size at each
+        point along its path, rather than an arbitrary cleaning-width guess.
+        """
+        r = self._mm_radius_px(self._cfg.robot_diameter_mm / 2, min_px=2)
+        fitted = [fit_px(px, py) for px, py in self._points]
+        for px, py in self._interpolated(fitted, max_gap_px=r):
+            draw.ellipse([px - r, py - r, px + r, py + r], fill=CLEANED_LAYER_COLOUR)
+
+    def _draw_path(
+        self, draw: ImageDraw.ImageDraw,
+        fit_px: Callable[[int, int], tuple[int, int]],  # noqa: F821 — TYPE_CHECKING forward reference, pyflakes/ruff scope limitation
+    ) -> None:
+        """Draw the travel path polyline, clipped to canvas bounds.
+
+        v2.9.0: line width now derives from PATH_WIDTH_MM via the same
+        zoom-correct conversion as the cleaned-area circles (_mm_radius_px),
+        instead of a fixed pixel constant. Previously the path stayed a
+        constant 6px regardless of auto_fit zoom level, while the cleaned-
+        area circles scaled with it — causing the two layers to visually
+        drift apart at different zoom levels (e.g. path looking too thin
+        relative to the cleaned-area blob on a zoomed-in map).
+        """
+        if len(self._points) < 2:
+            return
+        size = self._cfg.size_px
+        width_px = self._mm_radius_px(PATH_WIDTH_MM, min_px=PATH_MIN_PX)
+        clipped = [
+            (max(0, min(size - 1, px)), max(0, min(size - 1, py)))
+            for px, py in (fit_px(px, py) for px, py in self._points)
+        ]
+
+        # ONE POLYLINE PER CONTINUOUS RUN, not one across everything.
+        #
+        # An index in _breaks means the point does not connect to the
+        # one before it. Drawing through a break asserts travel that
+        # did not happen -- the straight line across the room that
+        # rejection used to hide by dropping the point instead. A gap
+        # is the honest picture, and it makes the discontinuity
+        # visible rather than plausible.
+        #
+        # Same shape PrimeRoomsImage already uses for its own trail;
+        # this brings the Classic renderer in line with it.
+        start = 0
+        for end in sorted(i for i in self._breaks if 0 < i < len(clipped)):
+            if end - start >= 2:
+                draw.line(clipped[start:end], fill=PATH_COLOUR, width=width_px)
+            start = end
+        if len(clipped) - start >= 2:
+            draw.line(clipped[start:], fill=PATH_COLOUR, width=width_px)
+
+    @staticmethod
+    def _interpolated(
+        points: list[tuple[int, int]], max_gap_px: int
+    ) -> list[tuple[int, int]]:
+        """Insert intermediate points where gaps exceed max_gap_px."""
+        if not points:
+            return []
+        result: list[tuple[int, int]] = [points[0]]
+        for i in range(1, len(points)):
+            p1, p2 = points[i - 1], points[i]
+            dist = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+            if dist > max_gap_px:
+                steps = int(dist / max_gap_px)
+                for s in range(1, steps):
+                    result.append((
+                        int(p1[0] + (p2[0] - p1[0]) * s / steps),
+                        int(p1[1] + (p2[1] - p1[1]) * s / steps),
+                    ))
+            result.append(p2)
+        return result
+
+    @staticmethod
+    def _draw_triangle(
+        draw: ImageDraw.ImageDraw,
+        cx: int, cy: int,
+        r: int,
+        colour: tuple[int, int, int, int],
+    ) -> None:
+        """Draw a downward-pointing equilateral triangle centred at (cx, cy)."""
+        pts = [
+            (cx, cy + r),
+            (cx - int(r * 0.866), cy - r // 2),
+            (cx + int(r * 0.866), cy - r // 2),
+        ]
+        draw.polygon(pts, fill=colour)
+
+
+# ── Naming map for robots without a map of their own (4.2.20) ────────────────
+#
+# Light fills on white, distinguishable from each other and dark enough
+# for a label in near-black to read on every one of them.
+NAMING_AREA_PALETTE: list[tuple[int, int, int]] = [
+    (166, 206, 227),  # light blue
+    (178, 223, 138),  # light green
+    (251, 154, 153),  # salmon
+    (253, 191, 111),  # light orange
+    (202, 178, 214),  # lavender
+    (255, 237, 160),  # pale yellow
+    (141, 211, 199),  # aqua
+    (217, 217, 217),  # light grey
+]
+NAMING_BORDER = (90, 90, 90, 255)
+NAMING_LABEL = (25, 25, 25, 255)
+NAMING_LABEL_FONT = _load_font(18)
+
+
+def _area_label_cell(cells: frozenset[tuple[int, int]]) -> tuple[int, int]:
+    """The cell deepest inside an area, where its label cannot fall out.
+
+    The middle of the bounding box lies outside an L- or U-shaped area,
+    which is how a number ended up drawn on the neighbouring room. A
+    breadth-first pass from the area's edge finds the cell furthest from
+    any edge; of equally deep cells, the one nearest the centre wins, so
+    the choice is stable.
+    """
+    edge = [
+        c for c in cells
+        if any((c[0] + dx, c[1] + dy) not in cells
+               for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)))
+    ]
+    depth = {c: 0 for c in edge}
+    frontier = list(edge)
+    while frontier:
+        nxt = []
+        for x, y in frontier:
+            for n in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                if n in cells and n not in depth:
+                    depth[n] = depth[(x, y)] + 1
+                    nxt.append(n)
+        frontier = nxt
+    mx = sum(c[0] for c in cells) / len(cells)
+    my = sum(c[1] for c in cells) / len(cells)
+    return max(
+        cells,
+        key=lambda c: (depth.get(c, 0), -((c[0] - mx) ** 2 + (c[1] - my) ** 2), c),
+    )
+
+
+def _area_colours(areas: list[frozenset[tuple[int, int]]]) -> list[int]:
+    """A palette index per area, never the same as a touching neighbour."""
+    owner = {c: i for i, cells in enumerate(areas) for c in cells}
+    colours: list[int] = []
+    for i, cells in enumerate(areas):
+        touching = {
+            owner[n]
+            for x, y in cells
+            for n in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1))
+            if n in owner and owner[n] != i
+        }
+        taken = {colours[j] for j in touching if j < i}
+        colours.append(
+            next(
+                (k for k in range(len(NAMING_AREA_PALETTE)) if k not in taken),
+                i % len(NAMING_AREA_PALETTE),
+            )
+        )
+    return colours
+
+
+def render_area_map(
+    areas: list[tuple[str, frozenset[tuple[int, int]]]],
+    cell_mm: float,
+    size_px: int = 600,
+    quarter_turns: int = 0,
+) -> bytes:
+    """The detected areas as coloured patches with their labels, and the dock.
+
+    FOR THE NAMING FORM, not the live map (a tester's 980). The cleaning
+    path map drew each area as its bounding box, widened past the walls:
+    on an L- or U-shaped floor the boxes overlap their neighbours, and
+    one of nine covered half the picture. Here every area is the cells
+    it actually consists of, in its own colour, with a border where it
+    meets another area and its label inside it. Nothing else is drawn
+    -- no path, no door markers -- except the dock, so there is one
+    known point to turn the picture by.
+
+    Drawn as the cleaning path map is: through map_mm_to_view, y up, the
+    dock at (0, 0), turned by the user's `quarter_turns` (4.3.2). `cell_mm`
+    is the grid the cells index.
+    """
+    img = Image.new("RGBA", (size_px, size_px), BG_COLOUR)
+    draw = ImageDraw.Draw(img)
+    cell_sets = [cells for _label, cells in areas if cells]
+    labelled = [(label, cells) for label, cells in areas if cells]
+    if not labelled:
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="PNG")
+        return buf.getvalue()
+
+    xs = [c[0] for cells in cell_sets for c in cells]
+    ys = [c[1] for cells in cell_sets for c in cells]
+    # The dock is cell (0, 0)'s corner; keep it in the picture.
+    x_min, x_max = min(min(xs), 0) * cell_mm, (max(max(xs), 0) + 1) * cell_mm
+    y_min, y_max = min(min(ys), 0) * cell_mm, (max(max(ys), 0) + 1) * cell_mm
+    # The frame's corners as the picture shows them: mirrored, as every
+    # Classic picture is, and turned as the user chose.
+    corners = [
+        mm_to_view(x, y, True, quarter_turns)
+        for x in (x_min, x_max) for y in (y_min, y_max)
+    ]
+    u_min = min(u for u, _ in corners)
+    u_max = max(u for u, _ in corners)
+    v_min = min(v for _, v in corners)
+    v_max = max(v for _, v in corners)
+    margin = 0.06 * size_px
+    scale = max(u_max - u_min, v_max - v_min) / (size_px - 2 * margin)
+    off_x = (size_px - (u_max - u_min) / scale) / 2
+    off_y = (size_px - (v_max - v_min) / scale) / 2
+
+    def to_px(x_mm: float, y_mm: float) -> tuple[float, float]:
+        u, v = mm_to_view(x_mm, y_mm, True, quarter_turns)
+        return (off_x + (u - u_min) / scale, off_y + (v_max - v) / scale)
+
+    colours = _area_colours(cell_sets)
+    owner = {c: i for i, cells in enumerate(cell_sets) for c in cells}
+    for i, cells in enumerate(cell_sets):
+        fill = (*NAMING_AREA_PALETTE[colours[i]], 255)
+        for x, y in cells:
+            ax, ay = to_px(x * cell_mm, (y + 1) * cell_mm)
+            bx, by = to_px((x + 1) * cell_mm, y * cell_mm)
+            draw.rectangle(
+                [min(ax, bx), min(ay, by), max(ax, bx), max(ay, by)], fill=fill
+            )
+
+    # Borders: wherever a cell's neighbour belongs to another area, or
+    # to none.
+    width = max(1, round(size_px / 300))
+    for i, cells in enumerate(cell_sets):
+        for x, y in cells:
+            for dx, dy, edge in (
+                (1, 0, ((x + 1, y), (x + 1, y + 1))),
+                (-1, 0, ((x, y), (x, y + 1))),
+                (0, 1, ((x, y + 1), (x + 1, y + 1))),
+                (0, -1, ((x, y), (x + 1, y))),
+            ):
+                if owner.get((x + dx, y + dy)) == i:
+                    continue
+                (ax, ay), (bx, by) = edge
+                draw.line(
+                    [to_px(ax * cell_mm, ay * cell_mm), to_px(bx * cell_mm, by * cell_mm)],
+                    fill=NAMING_BORDER,
+                    width=width,
+                )
+
+    dx_px, dy_px = to_px(0.0, 0.0)
+    r = max(5, round(size_px / 70))
+    draw.ellipse(
+        [dx_px - r, dy_px - r, dx_px + r, dy_px + r],
+        fill=DOCK_COLOUR,
+        outline=(30, 120, 30, 255),
+        width=2,
+    )
+
+    for label, cells in labelled:
+        lx, ly = _area_label_cell(cells)
+        px, py = to_px((lx + 0.5) * cell_mm, (ly + 0.5) * cell_mm)
+        draw.text(
+            (px, py),
+            label,
+            fill=NAMING_LABEL,
+            anchor="mm",
+            font=label_font(label, NAMING_LABEL_FONT),
+            stroke_width=2,
+            stroke_fill=(255, 255, 255, 255),
+        )
+
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()

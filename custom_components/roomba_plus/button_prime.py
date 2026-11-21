@@ -1,0 +1,768 @@
+"""Buttons for Prime robots: saved favourites, and locate.
+
+WHY FAVOURITES ARE BUTTONS AND NOT A SELECT.
+
+A favourite is a stored routine -- "clean the kitchen and hall on deep,
+twice" -- and pressing it runs that. There is no state to hold and
+nothing to choose between; a select would imply the robot is currently
+"on" one of them, which it is not.
+
+One button per favourite also means an automation can name the one it
+wants, and a dashboard can show only the ones that matter.
+
+WHAT ELSE THE PLATFORM COULD HOLD, AND DOES NOT.
+
+Classic offers evacuate, power off, sleep, spot clean and map training.
+Prime has a confirmed equivalent for exactly one of them: `find`, via
+send_simple_command. The rest are not "not built yet" -- no command has
+been identified for them, and a button that does nothing when pressed is
+worse than an absent one.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+from homeassistant.components.button import ButtonEntity
+from homeassistant.const import EntityCategory
+
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+
+from .const import (
+    CONF_PRIME_FAVORITE_BUTTONS,
+    DEFAULT_PRIME_FAVORITE_BUTTONS,
+    DOMAIN,
+)
+from .entity import IRobotEntity
+from .structural_failures import record_failure, record_success
+from .prime_commands import _send_confirmed
+from .services import async_send_watched
+from .prime_coordinator import _dock_reports_itself, get_prime_capability_flags
+# Re-exported: the favourites list lives in prime_favorites (4.5.0), which
+# imports nothing that imports prime_coordinator.
+from .prime_favorites import (  # noqa: F401
+    _favorite_is_for,
+    _is_internal_favorite_name,
+    _raw_favorite_is_for,
+    async_favorites_attribute,
+)
+
+if TYPE_CHECKING:
+    from .models import RoombaConfigEntry
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class PrimeFavoriteButton(IRobotEntity, ButtonEntity):
+    """Runs one saved favourite.
+
+    Identified by favorite_id rather than by position or name: a
+    favourite renamed in the iRobot app must not break an automation, and
+    one deleted must not shift every button after it onto a different
+    routine.
+    """
+    _live_state = True   # sends a command to the robot; unavailable when it cannot be reached
+
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        blid: str,
+        config_entry: RoombaConfigEntry,
+        favorite_id: str,
+        name: str,
+    ) -> None:
+        IRobotEntity.__init__(
+            self, roomba=None, blid=blid, config_entry=config_entry
+        )
+        self._config_entry = config_entry
+        self._favorite_id = favorite_id
+        self._attr_translation_key = "prime_favorite"
+        self._attr_translation_placeholders = {"favorite": name or favorite_id}
+        # WITHOUT THIS THE ENTITY IS "UNMANAGEABLE" AND ALWAYS WAS.
+        #
+        # Home Assistant will not register an entity that has no unique
+        # id, so it lives in the state machine and not in the registry:
+        # it cannot be renamed, hidden, assigned to an area, or referred
+        # to reliably. The UI labels that "Unmanageable".
+        #
+        # @chairstacker chased it for three rounds as a leftover
+        # registry entry, and his last report is what ruled that out:
+        # the entity tracks his favourites exactly -- it appears when he
+        # creates one, updates when he adds another, and disappears when
+        # he deletes it. A stale entry does none of those things. It was
+        # never stale; it was never registered.
+        #
+        # @ratpic83's log carried the other half from a different robot:
+        # "attempts to attach a device to an entity without a unique
+        # ID". Two testers, two symptoms, one missing line.
+        #
+        # The id is the favourite's own, matching `suggested_object_id`
+        # below -- a favourite renamed in the iRobot app must not break
+        # an automation, and one deleted must not shift every button
+        # after it onto a different routine.
+        self._attr_unique_id = f"{self.robot_unique_id}_favorite_{favorite_id}"
+
+    @property
+    def suggested_object_id(self) -> str:
+        """Locale-independent slug, keyed on the id.
+
+        has_entity_name plus a translation_key otherwise has HA derive
+        the entity_id from the TRANSLATED name -- different ids per
+        language on first registration, and a rename in the app would
+        move it again.
+        """
+        return f"favorite_{self._favorite_id}"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"favorite_id": self._favorite_id}
+
+    async def async_press(self) -> None:
+        """Runs the favourite, re-reading its commands first.
+
+        NOT CACHED AT SETUP. A favourite edited in the iRobot app should
+        run as edited, and Home Assistant may not have reloaded since.
+        The read costs one request per press, which is the right trade
+        against running a routine the user changed weeks ago.
+
+        Shares the service's implementation, so a button press and a
+        run_favorite call cannot diverge.
+        """
+        if not await async_send_watched(
+            self.hass, self._config_entry, "favorite",
+            lambda: async_run_favorite(self._config_entry, self._favorite_id),
+        ):
+            _LOGGER.warning(
+                "roomba_plus: favorite %s could not be run -- deleted in the "
+                "iRobot app, or carrying no commands",
+                self._favorite_id,
+            )
+
+
+@dataclass(frozen=True, kw_only=True)
+class PrimeDockCommand:
+    """One dock action, its wire command and the flag that gates it."""
+
+    key: str
+    command: str
+    #: Attribute on the DOCK capability object, not the robot one. A
+    #: robot without a self-emptying base still reports robot caps.
+    dock_cap_attr: str
+    #: Dock sub-state values in which the app offers this control, taken
+    #: from its own res/raw availability specs. None means no state rule
+    #: was found for this control.
+    #: Superseded by another entity. The button still works; it is
+    #: hidden by default and slated for removal.
+    #:
+    #: @chairstacker asked for the pad-dry button PAIR to be replaced by
+    #: one switch, and a switch was built BESIDE them -- so he got a
+    #: third entity for the same thing, plus the logbook noise he was
+    #: trying to get rid of. Deprecating rather than deleting outright
+    #: because an automation calling one of these should keep working
+    #: through at least one release.
+    deprecated_by: str | None = None
+    ready_states: tuple[int, ...] | None = None
+    #: Which DockInfo field carries that sub-state.
+    state_attr: str | None = None
+
+
+#: The dock controls the iRobot app shows, as confirmed wire strings.
+#:
+#: All three come from CommandType's @SerialName annotations -- the same
+#: source as `find`, which works. Not guessed:
+#:
+#:     Empty Bin              -> evac
+#:     Wash mop / rinse dock  -> washpad
+#:     Stop mop dry           -> stoppaddry
+#:
+#: `drypad` IS INCLUDED, and that reverses an earlier decision.
+#:
+#: It was left out because the app did not offer it -- drying started on
+#: its own after a wash. @DaRealGuGu pointed out what that costs: stop
+#: the drying and the only way to restart it is another full wash,
+#: wasting a tank of water for nothing.
+#:
+#: The original reasoning conflated two things. Guessing at a COMMAND is
+#: what this project refuses to do; offering a WORKFLOW the app does not
+#: is a different question, and here it was plainly better. `drypad` is a
+#: confirmed @SerialName wire string from the same enum as `evac`,
+#: `washpad` and `stoppaddry` -- all three of which a tester has now
+#: pressed with the dock responding within a second.
+#:
+#: AND THE APP HAS SINCE CAUGHT UP. App 3.0.0's Dock Controls sheet
+#: shows "Dry Mop" as one of three buttons, with a "Start mop drying?"
+#: confirmation (@chairstacker, screenshots). So this is no longer a
+#: workflow the app lacks -- it is the same one, reached the same way.
+#:
+#: WHAT STAYS DIFFERENT is the other direction: the app greys out every
+#: dock control once a task begins, so a drying cycle cannot be STOPPED
+#: there once started. That divergence is deliberate and tested; see
+#: prime_stop_pad_dry below.
+#:
+#: Worst case the robot ignores it, which is visible immediately in the
+#: pad-dry sensor.
+#:
+#: STILL ABSENT: `flushsluice`, `flrefill`, `querydock`. Nobody has
+#: asked for them, none has an observable effect a user could check, and
+#: `querydock` is a read dressed as a command.
+#:
+#: There is no `stopwashpad` in the enum at all, so washing evidently
+#: runs to completion.
+PRIME_DOCK_COMMANDS: tuple[PrimeDockCommand, ...] = (
+    PrimeDockCommand(
+        key="prime_empty_bin", command="evac", dock_cap_attr="evac",
+        # spec_dock_controls_evac_status: Available at 301, 355, 305.
+        # Disabled at 351-354, 360, 365, 302.
+        ready_states=(301, 355, 305), state_attr="state",
+    ),
+    PrimeDockCommand(
+        key="prime_wash_pad", command="washpad", dock_cap_attr="pad_wash",
+        # spec_dock_control_pad_wash_status: Available at 601 only.
+        # Disabled at 602, 603 and the whole 649-699 error family.
+        ready_states=(601,), state_attr="pw_state",
+    ),
+    PrimeDockCommand(
+        key="prime_stop_pad_dry", deprecated_by="switch.<robot>_pad_dry", command="stoppaddry", dock_cap_attr="pad_dry",
+        # spec_dock_control_stop_pad_dry_status: Available at 702 -- the
+        # state that means drying is actually running. Stopping something
+        # that is not running is the one control where the app's rule is
+        # the opposite of the start button's.
+        #
+        # DO NOT IMPLEMENT THE APP'S LOCK HERE. This divergence is
+        # deliberate, it is the behaviour a tester specifically asked us
+        # to keep, and it is the kind of thing a later "align with the
+        # app" pass would quietly delete.
+        #
+        # App 3.0.0's Dock Controls sheet applies a blanket lock on top
+        # of the per-state rules: once any dock task starts, all three
+        # controls grey out and tapping one answers "Dock task in
+        # progress. Try again later" (@chairstacker, screenshots). So a
+        # drying cycle cannot be stopped from the app once begun. He
+        # calls that the big drawback of the new UI, and being able to
+        # stop it from Home Assistant the reason to keep ours as it is.
+        #
+        # The robot disagrees with its own app: `stoppaddry` sent from
+        # here during a running dry cycle works, field-confirmed on the
+        # same account and the same dock. The block is client-side, not
+        # a refusal from the hardware -- the same shape as the nine
+        # rejection reasons in `device_view_model_clean_plan`.
+        #
+        # So this button stays gated on 702 alone. Copying the blanket
+        # lock would remove a capability that demonstrably works, to
+        # match a UI decision iRobot made for its own reasons.
+        ready_states=(702,), state_attr="pd_state",
+    ),
+    PrimeDockCommand(
+        key="prime_start_pad_dry", deprecated_by="switch.<robot>_pad_dry", command="drypad", dock_cap_attr="pad_dry",
+        # spec_dock_control_pad_dry_status: Available at 701, 703.
+        # Disabled across 749-757.
+        ready_states=(701, 703), state_attr="pd_state",
+    ),
+)
+
+
+class PrimeDockButton(IRobotEntity, ButtonEntity):
+    """A dock action -- empty the bin, wash the pad, stop drying.
+
+    GATED ON DOCK CAPABILITIES, not robot ones. A robot without a
+    self-emptying base still reports its own caps happily; the dock flags
+    are what say whether a base is there and what it can do.
+
+    A real Combo reports `{"evac": 1, "pad_dry": 2, "pad_wash": 1}`, so
+    the flags are graduated rather than boolean -- 2 is not "twice as
+    true". Only an explicit 0 means absent, the same contract the other
+    Prime capability checks use.
+    """
+    _live_state = True   # sends a command to the robot; unavailable when it cannot be reached
+
+    _attr_has_entity_name = True
+
+    def __init__(
+        self, blid: str, config_entry: RoombaConfigEntry, command: PrimeDockCommand
+    ) -> None:
+        IRobotEntity.__init__(
+            self, roomba=None, blid=blid, config_entry=config_entry
+        )
+        self._config_entry = config_entry
+        self._command = command
+        self._attr_translation_key = command.key
+        self._attr_unique_id = f"{self.robot_unique_id}_{command.key}"
+        if command.deprecated_by is not None:
+            # HIDDEN, NOT DELETED. An automation already calling this
+            # keeps working; it simply stops appearing in pickers and
+            # on auto-generated dashboards, which is where the confusion
+            # of having three entities for one action actually bites.
+            #
+            # Existing installations are unaffected -- Home Assistant
+            # only applies this default at first registration -- so a
+            # user who already has the button keeps it until it is
+            # removed outright.
+            self._attr_entity_registry_enabled_default = False
+
+    @property
+    def suggested_object_id(self) -> str:
+        return self._command.key
+
+    @property
+    def available(self) -> bool:
+        """Offered only when the dock could actually act on it.
+
+        THESE RULES ARE THE APP'S OWN. `res/raw/spec_dock_control_*.json`
+        in the Prime APK are availability state machines mapping dock
+        state to Available/Disabled, and until now this class had no
+        `available` at all -- every dock button was pressable whenever
+        the capability existed.
+
+        What that cost: @chairstacker pressed Wash Pad with a tank
+        removed, the robot spoke a complaint and the dock reported 671.
+        The app would not have offered the button, because pw_state was
+        not 601.
+
+        Three blanket rules apply to every control, and they are the ones
+        that matter most:
+
+          - a dock error in 500-599 disables all of them
+          - so does a running cycle (clean, spot, dock)
+          - so does another dock command already in flight
+
+        UNKNOWN MEANS AVAILABLE, deliberately. A robot that does not
+        report a sub-state keeps its button: taking function away from a
+        working robot because a field is missing would be the worse
+        mistake, and this project has made it before by gating on a
+        capability flag rather than on a field being present.
+        """
+        if not super().available:
+            return False
+
+        state = self._current_state
+        dock = getattr(state, "dock", None) if state is not None else None
+        if dock is None:
+            return True
+
+        # A dock error blocks every control, whatever the sub-states say.
+        error = getattr(dock, "error", None)
+        if isinstance(error, int) and 500 <= error <= 599:
+            return False
+
+        # And so does a mission: the dock will not wash, dry or empty
+        # while the robot is out working.
+        mission = getattr(state, "mission", None)
+        cycle = getattr(mission, "cycle", None) if mission is not None else None
+        if cycle in ("clean", "spot", "dock"):
+            return False
+
+        rule = self._command
+        if rule.ready_states is None or rule.state_attr is None:
+            return True
+        current = getattr(dock, rule.state_attr, None)
+        # DockState is an IntEnum on the model, a plain int on older
+        # payloads. Both compare correctly against the plain ints above.
+        value = getattr(current, "value", current)
+        if not isinstance(value, int):
+            return True
+        return value in rule.ready_states
+
+    @property
+    def _current_state(self) -> Any:
+        """The parsed ro-currentstate shadow, or None if not seeded."""
+        from roombapy_prime.models import CurrentStateShadow  # noqa: PLC0415
+
+        coordinator = self._config_entry.runtime_data.prime_status_coordinator
+        if coordinator is None or coordinator.data is None:
+            return None
+        raw = coordinator.data.get("ro-currentstate")
+        if raw is None:
+            return None
+        return CurrentStateShadow.from_json(raw)
+
+    async def async_added_to_hass(self) -> None:
+        """Follows the status coordinator so availability keeps up.
+
+        Without this the rules above would be evaluated once and then
+        frozen -- a button correctly hidden during a mission would stay
+        hidden after it, which is worse than never hiding it.
+        """
+        await super().async_added_to_hass()
+        coordinator = self._config_entry.runtime_data.prime_status_coordinator
+        if coordinator is not None:
+            self.async_on_remove(
+                coordinator.async_add_listener(self.schedule_update_ha_state)
+            )
+
+    async def async_press(self) -> None:
+        robot = self._config_entry.runtime_data.prime_robot
+        if robot is None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="robot_not_connected",
+            )
+        # THE RESULT WAS THROWN AWAY. send_simple_command() reports
+        # whether the broker acknowledged the publish; ignoring it made a
+        # command that never left look exactly like one the robot chose
+        # to ignore. See vacuum._send_confirmed for the full note.
+        await _send_confirmed(robot, self._command.command)
+
+
+class PrimeLocateButton(IRobotEntity, ButtonEntity):
+    """Makes the robot announce where it is.
+
+    `find` is the one simple command confirmed for Prime. Classic's other
+    buttons -- evacuate, power off, spot clean, map training -- have no
+    identified Prime equivalent, so they are absent rather than
+    non-functional.
+    """
+    _live_state = True   # sends a command to the robot; unavailable when it cannot be reached
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "prime_locate"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, blid: str, config_entry: RoombaConfigEntry) -> None:
+        IRobotEntity.__init__(
+            self, roomba=None, blid=blid, config_entry=config_entry
+        )
+        self._config_entry = config_entry
+        self._attr_unique_id = f"{self.robot_unique_id}_prime_locate"
+
+    @property
+    def suggested_object_id(self) -> str:
+        return "locate"
+
+    async def async_press(self) -> None:
+        robot = self._config_entry.runtime_data.prime_robot
+        if robot is not None:
+            await _send_confirmed(robot, "find")
+
+
+async def async_build_prime_buttons(
+    config_entry: RoombaConfigEntry,
+) -> list[ButtonEntity]:
+    """One button per favourite, plus locate.
+
+    Favourites are read once at setup. They change rarely -- someone has
+    to create one in the app -- and re-reading on every coordinator
+    update would be a cloud call per battery percent.
+    """
+    data = config_entry.runtime_data
+    robot = getattr(data, "prime_robot", None)
+    if robot is None:
+        return []
+
+    entities: list[ButtonEntity] = [
+        PrimeLocateButton(data.blid, config_entry),
+        # The other half of the room/zone selector -- Classic has had
+        # this pair for years and Prime had only the services.
+        PrimeZoneCleanButton(data.blid, config_entry),
+    ]
+
+    # DOCK CONTROLS, matching what the iRobot app offers.
+    #
+    # Requested by @chairstacker, who screenshotted the app's dock panel.
+    # The wire strings were then confirmed from CommandType's
+    # @SerialName annotations rather than guessed.
+    _cap, dock_cap = get_prime_capability_flags(config_entry)
+    # A ROBOT THAT SAYS IT HAS NO DOCK GETS NO DOCK BUTTONS.
+    #
+    # @utkjmitch's Y351020 reports `dock: {"known": false}` with no
+    # `cap` object, and the rule below reads a missing cap as "unknown,
+    # offer anyway". That gave him wash and dry buttons for a dock that
+    # has neither. `known: false` is a statement, not a gap.
+    #
+    # CORRECTED: this robot is NOT on a plain charge dock. It sits on an
+    # auto-empty dock with a bag in it, and `cap.autoevac = 1` says so.
+    # The tester's own earlier "dockless" label came from inferring
+    # hardware out of an 18-key rw-settings list, and he has since
+    # retracted it.
+    #
+    # SO `known: false` DOES NOT MEAN "NO DOCK". A robot with real
+    # docking hardware reports it. Whatever `known` describes, it is
+    # narrower than presence -- the dock's identity or details, most
+    # likely.
+    #
+    # THE GATE IS RIGHT, AND NO LONGER ON UNCERTAIN GROUND.
+    #
+    # It used to be justified as "the dock does not describe itself, so
+    # withhold". @utkjmitch settled the underlying question, which is
+    # better: there is no evidence this hardware HAS an evac command to
+    # send.
+    #
+    # He checked the app in three states rather than one -- docked and
+    # idle with a full bag, mid-mission with the robot out, and
+    # discarded a fourth taken while the robot was stranded off the
+    # dock, on the grounds that any app would hide dock controls there.
+    # No empty-now action in any of them, and no auto-empty frequency
+    # control either.
+    #
+    # And the robot's side agrees. He ran a full mission with the
+    # coordinator logging `dock` and `bin` on every change: across two
+    # dock arrivals, a mid-mission recharge and a post-mission dock,
+    # **the blocks never changed once**, and no `evac` phase ever
+    # appeared. Read live while docked mid-mission, `dock` was byte for
+    # byte what it reports at rest -- so `known: false` is not an
+    # artifact of sampling a sleeping dock.
+    #
+    # Beside that: `number_of_evacuations: 0` across 49 missions,
+    # `evac: null` across 1,293 timeline events, no evac keys in
+    # rw-settings, and a base that demonstrably empties the robot.
+    # This dock empties on its own and the robot is not party to it.
+    #
+    # WHAT WOULD OVERTURN IT: a `dock` block on some other robot
+    # carrying a `cap` object where this one carries nothing. That would
+    # mean `known: false` is about identity rather than capability, and
+    # this dock is merely mute rather than passive.
+    #
+    # THAT HAS NOW HAPPENED. @chairstacker's dock carries a full `cap`
+    # object -- it is where DockCapabilities came from -- and the
+    # platform shadow fixtures show `known` travelling with `id`, `pn`,
+    # `fwVer`, `hwRev`, `varID`: dock identity, nothing about pads.
+    # @AlakazipLabs then showed `known` is not even stable, flipping
+    # false within seconds of a user `dock` command and returning on its
+    # own minutes later.
+    #
+    # AND THE TEST STAYED WHERE IT WAS. Replacing `known` with evidence
+    # -- fall back to whether the dock has ever reported `pwState` /
+    # `pdState` when `dock.cap` is absent -- was written, tried and
+    # withdrawn: neither key appears at rest in any capture in this
+    # repository, so the rule would have removed the pad buttons from
+    # every dock that had not washed yet. The test suite caught it.
+    #
+    # WHAT CHANGED INSTEAD IS WHEN THIS RUNS. The builder below is
+    # re-run on every shadow rather than once at setup, and it can only
+    # ever ADD (see add_prime_entities_when_available). That is what
+    # makes an unstable source survivable without deciding what it
+    # means: a `known` that dips false takes no button away, and one
+    # that returns adds it without a reload.
+    #
+    # The evidence @utkjmitch assembled for HIS dock (no evac keys in
+    # rw-settings, `evac: null` across 1,293 timeline events) is
+    # mission-history-shaped, not dock-shaped, and belongs in a separate
+    # change.
+
+    # Locate is always offered; favourite buttons are optional.
+    #
+    # They are the only route that needs no setup -- tappable right
+    # after install, and usable by voice, which a service call is not.
+    # They are also the only one costing an entity each, which is why
+    # somebody with fifteen favourites can turn them off and use the
+    # `favorites` attribute and run_favorite service instead.
+    if not config_entry.options.get(
+        CONF_PRIME_FAVORITE_BUTTONS, DEFAULT_PRIME_FAVORITE_BUTTONS
+    ):
+        return entities
+
+    # ONE CLOUD READ, not three.
+    #
+    # Setup already fetched the favourites into runtime_data for the
+    # vacuum attribute. Fetching them again here would mean two requests
+    # for the same list within a second of each other, and a third every
+    # time run_favorite is called.
+    #
+    # The commands are re-read per press instead, which is the right
+    # place for a fresh look: a favourite edited in the app between
+    # setup and the press should run as edited.
+    entities.extend(build_prime_favorite_buttons(config_entry))
+
+    return entities
+
+
+def build_prime_dock_buttons(config_entry: RoombaConfigEntry) -> list[ButtonEntity]:
+    """Dock buttons this dock has evidence for; re-read on every shadow."""
+    data = config_entry.runtime_data
+    built: list[ButtonEntity] = []
+    for command in PRIME_DOCK_COMMANDS:
+        # None means unknown, only an explicit 0 means absent -- so a
+        # robot that has not reported its dock yet still gets the
+        # buttons rather than silently losing them.
+        if not _dock_reports_itself(config_entry):
+            continue
+        _, live_dock_cap = get_prime_capability_flags(config_entry)
+        if (live_dock_cap is not None
+                and getattr(live_dock_cap, command.dock_cap_attr, None) == 0):
+            continue
+        built.append(PrimeDockButton(data.blid, config_entry, command))
+    return built
+
+
+def build_prime_favorite_buttons(
+    config_entry: RoombaConfigEntry,
+) -> list[PrimeFavoriteButton]:
+    """One button per favourite currently on `runtime_data`.
+
+    SPLIT OUT SO IT CAN BE CALLED AGAIN. The full builder above runs
+    once at setup; this half runs on every schedule-coordinator refresh,
+    so a favourite created in the iRobot app gets a button and a deleted
+    one loses it.
+
+    Reads the list rather than fetching: the coordinator refreshes it,
+    and a builder that fetched would turn every entity sync into a
+    network call.
+    """
+    data = config_entry.runtime_data
+    buttons: list[PrimeFavoriteButton] = []
+    for favorite in getattr(data, "prime_favorites", None) or []:
+        # THE FILTER NEVER REACHED THIS PATH.
+        #
+        # @scenicsystemsllc (#80): the same favourites appear live on
+        # every robot in a household. `_favorite_is_for` was written
+        # for exactly this and wired into the favourites *attribute*
+        # only -- the buttons themselves were built for every
+        # favourite the account has.
+        #
+        # His clearest case: a Braava jet m6 offering "Vacuum
+        # Everywhere". No map or region argument makes that right.
+        #
+        # `prime_favorites` here is raw dicts, not parsed objects, so
+        # the check reads `commanddefs` directly rather than
+        # `command_defs`.
+        if not _raw_favorite_is_for(favorite, data.blid):
+            continue
+
+        favorite_id = favorite.get("id")
+        if not favorite_id:
+            # An entry without an id cannot be run and cannot be
+            # identified -- a button for it would be a dead one whose
+            # unique_id collides with the next such entry.
+            continue
+        name = favorite.get("name") or ""
+        if _is_internal_favorite_name(name):
+            continue
+        buttons.append(PrimeFavoriteButton(
+            data.blid,
+            config_entry,
+            str(favorite_id),
+            name,
+        ))
+    return buttons
+
+
+#: READ ONCE, AT SETUP, AND NEVER AGAIN.
+#:
+#: `__init__.py` calls this during entry setup and nothing refreshes it.
+#: A favourite created in the iRobot app after Home Assistant started
+#: therefore does not appear until the entry is reloaded -- which is not
+#: obvious to anyone testing, and has already produced a report that
+#: read as "favourites are broken".
+#:
+#: @chairstacker's sequence on a33: check (absent), delete both in the
+#: app, create a new one, check again (absent). The second check could
+#: not have found anything regardless of whether this path works,
+#: because nothing re-read the list.
+#:
+#: AND THE READ PATH DOES WORK ON AT LEAST ONE ROBOT. @jouwdan's Max 705
+#: returns its favourites through this same code. So "favourites are
+#: broken on Prime" is too broad a claim: something about one account's
+#: data differs, and a reload-then-look is the test that separates the
+#: two.
+#:
+#: NOT FIXED BY POLLING. Schedules are refreshed by a coordinator
+#: because they drive entities that appear and disappear; favourites
+#: drive buttons that would do the same, so the honest fix is a
+#: coordinator here too rather than a timer bolted on. That is a change
+#: worth making deliberately, not as a side effect of a bug report.
+async def async_run_favorite(
+    config_entry: RoombaConfigEntry, favorite_id: str
+) -> bool:
+    """Runs one favourite by ID. Returns whether anything was sent.
+
+    BY ID, not by name. A name is what the user typed in the iRobot app
+    and can change there at any time; an automation keyed on it breaks
+    silently when it does.
+    """
+    robot = getattr(config_entry.runtime_data, "prime_robot", None)
+    if robot is None:
+        return False
+
+    try:
+        favorites = await robot.get_favorites()
+        record_success("favourite list (run)")
+    except Exception:  # noqa: BLE001
+        record_failure("favourite list (run)", "reading favourites to run one")
+        _LOGGER.debug("roomba_plus: could not read favorites", exc_info=True)
+        return False
+
+    for favorite in favorites or []:
+        if str(getattr(favorite, "favorite_id", "")) != str(favorite_id):
+            continue
+        commands = list(getattr(favorite, "command_defs", None) or [])
+        if not commands:
+            return False
+        for command in commands:
+            await robot.send_routine_command_via_cmd_topic(command)
+        return True
+    return False
+
+
+class PrimeZoneCleanButton(IRobotEntity, ButtonEntity):
+    """Clean whatever `PrimeZoneSelect` is set to.
+
+    The other half of a pair Classic has had for years. Prime could send
+    a robot to a room only through a service call, so a dashboard needed
+    an automation behind it to do what a Classic dashboard did with two
+    entities.
+
+    NO ACTIVE-MAP CHECK HERE, and that is deliberate rather than
+    forgotten. Classic's equivalent had one -- written as "prefer the
+    active map", implemented as "require" -- and it silently discarded a
+    selection whenever the chosen room sat on a map the robot was not
+    using, falling through to whatever ran last. A live capture settled
+    that a robot accepts a region command for any of its maps
+    (@ScenicSystemsLLC), so there is nothing here to check for.
+
+    ONE SELECT, so there is nothing to choose between either: the id
+    carries its own map.
+    """
+    _live_state = True   # sends a command to the robot; unavailable when it cannot be reached
+
+    _attr_translation_key = "prime_clean_zone"
+
+    def __init__(self, blid: str, config_entry: RoombaConfigEntry) -> None:
+        """Set up the button."""
+        IRobotEntity.__init__(
+            self, roomba=None, blid=blid, config_entry=config_entry
+        )
+        self._config_entry = config_entry
+        self._attr_unique_id = f"{self.robot_unique_id}_prime_clean_zone"
+
+    async def async_press(self) -> None:
+        """Send the robot to the selected room or zone."""
+        from homeassistant.helpers import entity_platform as ep  # noqa: PLC0415
+
+        wanted = f"{self.robot_unique_id}_prime_zone_select"
+        segment_id: str | None = None
+        for platform in ep.async_get_platforms(self.hass, "roomba_plus"):
+            for entity in platform.entities.values():
+                if getattr(entity, "unique_id", "") != wanted:
+                    continue
+                segment_id = getattr(entity, "selected_segment_id", None)
+                break
+            if segment_id:
+                break
+
+        if not segment_id:
+            raise ServiceValidationError(
+                "No room is selected. Pick one in the zone selector first.",
+                translation_domain=DOMAIN,
+                translation_key="no_zone_selected",
+            )
+
+        from .room_cleaning import async_get_room_cleaning_backend  # noqa: PLC0415
+
+        backend = async_get_room_cleaning_backend(self._config_entry, self.hass)
+        if backend is None:
+            raise ServiceValidationError(
+                "This robot has no room cleaning support.",
+                translation_domain=DOMAIN,
+                translation_key="no_room_cleaning",
+            )
+
+        _LOGGER.info(
+            "PrimeZoneCleanButton: cleaning segment %s on %s",
+            segment_id, self._blid,
+        )
+        await async_send_watched(
+            self.hass, self._config_entry, "zone_button",
+            lambda: backend.clean_segments([segment_id]),
+        )

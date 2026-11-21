@@ -1,0 +1,3796 @@
+"""Constants for the Roomba+ integration."""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from typing import Any, Final
+
+from homeassistant.components.vacuum import VacuumActivity
+from homeassistant.const import Platform
+
+# iRobot's own error texts come from roombapy-prime since 4.3.4: the
+# Prime app's since 4.3.4, the Classic app's since 4.5.0 (roombapy-prime
+# 0.8.0). This integration once carried a copy of the Prime table beside
+# the library's, a release behind it; the copy guarded against nothing
+# and could only fall behind.
+from roombapy_prime.vendor_errors import prime_help_id, vendor_error
+from roombapy_prime.vendor_errors_classic import (
+    classic_dock_text,
+    classic_help_id,
+    classic_not_ready_text,
+    classic_vendor_error,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+# ── Domain ────────────────────────────────────────────────────────────────────
+DOMAIN: Final = "roomba_plus"
+
+# ── Platforms ─────────────────────────────────────────────────────────────────
+LOCAL_PLATFORMS: Final[list[Platform]] = [
+    Platform.VACUUM,
+    Platform.SENSOR,
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.SWITCH,
+    Platform.SELECT,
+    Platform.DEVICE_TRACKER,
+    # EVENT (4.2.19): the mission and room moments as event entities, for
+    # users who cannot subscribe to the bus events -- see event.py.
+    Platform.EVENT,
+    # Platform.TODO moved out of this list: the maintenance list is now
+    # gated on CONF_ENABLE_MAINTENANCE_LIST for BOTH generations, added
+    # at runtime by __init__.py's _optional_platforms(). It arrived on
+    # Classic without an option and on Prime with one, which would have
+    # meant answering @chairstacker's complaint for one robot and not
+    # the other -- and his point, that a to-do list takes a place in the
+    # sidebar and should be asked for, says nothing about which robot it
+    # is.
+]
+# Platform.CALENDAR moved out of this list (this session) -- now gated on
+# CONF_ENABLE_SCHEDULE_CALENDAR (default True, see const.py's own docstring
+# on that option) via __init__.py's _optional_platforms(), called
+# identically at all four platform-list build sites (Classic setup/unload,
+# Prime setup/unload).
+
+# NEW (V4/Prime, v4.0.0a0 MVP scope): deliberately just VACUUM for now.
+# A connectivity/error sensor is planned (see
+# NEW (this session): sensor.py now has a dedicated CLOUD_ONLY branch
+# (sensor_prime.py) -- no longer "not-yet-built".
+#
+# BUG FOUND AND FIXED (later same session): binary_sensor.py's own
+# CLOUD_ONLY entities (PrimeBinPresentSensor/PrimeTankPresentSensor/
+# PrimeRobotConnectivitySensor) and switch.py's PrimeCarpetBoostSwitch
+# were built and tested in isolation, but this list was never updated
+# to include their platforms -- meaning HA never actually called
+# either module's async_setup_entry() for a CLOUD_ONLY config entry,
+# so none of these entities were ever created for a real user despite
+# working code existing for them. Caught by reviewing a real field
+# tester's own screenshots, which only ever showed sensor.py entities,
+# never any of these.
+#
+# SECOND, BIGGER BUG FOUND AND FIXED (this session, caught by a new
+# structural test built specifically to prevent a THIRD occurrence of
+# this exact pattern -- test_const.py's own backward
+# check): image.py's PrimeMapImage (the live cleaning map) has had a
+# real, working CLOUD_ONLY branch since v4.0.0a0/a1 -- Platform.IMAGE
+# was NEVER in this list at all, meaning the live map has been
+# unreachable for every real Prime user since the very first release.
+PRIME_PLATFORMS: Final[list[Platform]] = [
+    Platform.VACUUM,
+    Platform.SENSOR,
+    Platform.BINARY_SENSOR,
+    Platform.SWITCH,
+    Platform.IMAGE,
+    # DEVICE_TRACKER (this session). Reports which room the robot is in,
+    # resolved from the mission timeline's room events -- and, through the
+    # segment-to-area mapping, which Home Assistant AREA that is.
+    #
+    # The entity's own state comes from location_name, which Home
+    # Assistant deprecates in 2027.7. That was an argument against wiring
+    # this for Prime at all, and it was a weak one: the value lives in the
+    # `room` and `area_id` attributes, and neither is deprecated. The
+    # state going away does not remove the entity's usefulness.
+    Platform.DEVICE_TRACKER,
+    # SELECT (this session). Graduated settings a switch cannot express
+    # -- today just suction level.
+    #
+    # It also lights up the xiaomi-vacuum-map-card's menu icons, which
+    # read a select entity's `options` attribute and offer them as a
+    # map-side menu. A select is both the right entity type and the one
+    # that card knows how to use.
+    Platform.SELECT,
+    # BUTTON (this session). Saved favourites, one button each, plus
+    # locate.
+    #
+    # Classic's other buttons -- evacuate, power off, sleep, spot clean,
+    # map training -- are deliberately absent: no Prime command has been
+    # identified for any of them, and a button that does nothing when
+    # pressed is worse than one that is not there.
+    Platform.BUTTON,
+    # EVENT (4.2.19): mission and room moments, see event.py.
+    Platform.EVENT,
+]
+# Platform.CALENDAR moved out of this list too (this session) -- same
+# gating as LOCAL_PLATFORMS, see the comment there.
+
+# Cloud credential keys — stored in config_entry.data (encrypted by HA)
+#: Where users are pointed to report things the integration cannot
+#: resolve itself -- an unrecognised robot SKU, for instance. Kept here
+#: rather than inline so it stays in step with manifest.json.
+ISSUE_TRACKER_URL: Final = "https://github.com/johnnyh1975/ha_roomba_plus/issues"
+
+#: The troubleshooting guide. The library-conflict abort links to it: the
+#: way out when the built-in Roomba integration keeps loading roombapy 1.x
+#: (its discovery does that even with no entry of its own) takes two files
+#: and their caveats, which do not fit in a setup dialog.
+TROUBLESHOOTING_URL: Final = (
+    "https://github.com/johnnyh1975/ha_roomba_plus/blob/main/docs/TROUBLESHOOTING.md"
+)
+
+CONF_IROBOT_USERNAME: Final = "irobot_username"
+CONF_IROBOT_PASSWORD: Final = "irobot_password"
+
+# Cloud-only platforms — added dynamically in __init__.py for SMART robots
+# when cloud credentials are present.
+CLOUD_PLATFORMS: Final[list[Platform]] = [
+    Platform.SELECT,   # CloudRegionSelect, CloudZoneSelect (replace repair flow)
+    Platform.BUTTON,   # FavoriteButton
+]
+
+# ── Config / Options keys ─────────────────────────────────────────────────────
+CONF_BLID: Final = "blid"
+CONF_CONTINUOUS: Final = "continuous"
+CONF_DELAY: Final = "delay"
+
+# NEW (V4/Prime): stores ConnectionType.value ("local_push"/"cloud_only") in
+# config_entry.data. Absent on every entry that predates this field --
+# _connection_type() in __init__.py defaults to LOCAL_PUSH for exactly that
+# reason, so no migration is needed for existing entries.
+CONF_CONNECTION_TYPE: Final = "connection_type"
+
+# Options keys (Phase 2+)
+#: One timestamp entity per room and zone, instead of the single
+#: history sensor's {name: timestamp} attributes.
+#:
+#: OFF BY DEFAULT AND THE SAME OPTION ON BOTH TIERS. @chairstacker
+#: asked for per-region entities so he would not have to build a
+#: helper for each room; @dduff617's four-map account shows the other
+#: side, where that would mean dozens of entities nobody asked for.
+#:
+#: Deliberately not named `prime_*`: the single-sensor form is what
+#: Classic has always shipped, and giving one generation entities and
+#: the other attributes for the same data is the asymmetry this
+#: project keeps having to unpick. Whoever wants the entities can
+#: have them, on either tier.
+CONF_REGION_SENSORS: Final = "region_sensors"
+DEFAULT_REGION_SENSORS: Final = False
+
+CONF_PRIME_FAVORITE_BUTTONS: Final = "prime_favorite_buttons"
+DEFAULT_PRIME_FAVORITE_BUTTONS: Final = True
+
+CONF_MAP_ROOM_LABELS: Final = "map_room_labels"
+DEFAULT_MAP_ROOM_LABELS: Final = False
+
+#: Which zone layers the Rooms Map draws on top of the rooms.
+#:
+#: OFF BY DEFAULT, ALL OF THEM, and that is @chairstacker's own
+#: reasoning rather than caution on our part: "my map in the app is
+#: getting a little busy but it's still readable; the room map would
+#: face the same issue as soon as the zones are being displayed
+#: permanently". He asked for tick boxes, so tick boxes it is.
+#:
+#: Three separate options rather than one, because the three answer
+#: different questions -- where the robot should go, where it must not,
+#: and where it must not mop -- and somebody who wants keep-out zones on
+#: screen does not necessarily want clean zones there too.
+CONF_MAP_CLEAN_ZONES: Final = "map_clean_zones"
+
+CONF_MAP_KEEPOUT_ZONES: Final = "map_keepout_zones"
+CONF_MAP_NOMOP_ZONES: Final = "map_nomop_zones"
+DEFAULT_MAP_ZONES: Final = False
+
+CONF_MAP_ENABLED: Final = "map_enabled"
+#: Ask a robot that does not publish its position where it is, for the
+#: live cleaning map (4.3, live_position.py). Offered only to robots
+#: whose shadow carries no `pose`; on a 900-series it would do nothing.
+CONF_LIVE_POSITION_REQUESTS: Final = "live_position_requests"
+#: How far requested positions are turned: "auto" or a fixed angle (4.4.0).
+CONF_LIVE_PATH_TURN: Final = "live_path_turn"
+CONF_MAP_SIZE_PX: Final = "map_size_px"
+CONF_MAP_SCALE: Final = "map_scale_mm_per_px"
+#: Turn every map picture clockwise by 0/90/180/270 degrees (4.3.2). The
+#: map has no north: its "up" is how the robot left the dock.
+CONF_MAP_ROTATION: Final = "map_rotation"
+#: The 900-series layout (4.5.0, room_layout): how thick the walls are and
+#: how wide a door is, in cm. The wall decides which two rooms' sides are
+#: one wall; the door how wide its gap is drawn.
+CONF_WALL_THICKNESS_CM: Final = "wall_thickness_cm"
+CONF_DOOR_WIDTH_CM: Final = "door_width_cm"
+CONF_FILTER_HOURS: Final = "filter_threshold_hours"
+CONF_BRUSH_HOURS: Final = "brush_threshold_hours"
+#: 4.5.0 -- the other two parts get an hour option too, set under
+#: Configure → Maintenance; until then they had none.
+CONF_SIDE_BRUSH_HOURS: Final = "side_brush_threshold_hours"
+CONF_CLEAN_BASE_BAG_HOURS: Final = "clean_base_bag_threshold_hours"
+
+# NEW: opt-OUT toggle for the schedule calendar entity (Platform.CALENDAR).
+# Default True is deliberate -- CALENDAR is the only platform that's always
+# loaded regardless of hardware capability (unlike IMAGE, gated on
+# map_capability), so an existing installation must keep getting its
+# calendar entity after upgrading to this option unless the user actively
+# opts out (see chairstacker's own feedback: forced sidebar panel, not a
+# request to remove the calendar's DATA). Applies to both Classic and Prime
+# -- see async_step_settings()'s own connection_type branch for why each
+# tier gets a differently-scoped options form.
+CONF_ENABLE_SCHEDULE_CALENDAR: Final = "enable_schedule_calendar"
+#: The Prime maintenance list, and whether it exists at all.
+#:
+#: OFF BY DEFAULT, unlike the calendar. @chairstacker found a todo list
+#: in his sidebar that he had not asked for -- the second time something
+#: appeared there uninvited. A todo list is not a quiet entity: Home
+#: Assistant gives it a place in the navigation, which is the user's
+#: space rather than ours.
+#:
+#: The calendar defaults to on because it existed before there was an
+#: option and turning it off would have removed it from people who use
+#: it. This one has no such history, so it starts off and appears only
+#: when somebody asks.
+#: BOTH GENERATIONS. The list arrived on Classic without an option and
+#: on Prime with one, which would have meant the same complaint answered
+#: for one robot and not the other. @chairstacker's point -- that a to-do
+#: list takes a place in the sidebar and should be asked for -- says
+#: nothing about which robot it is.
+CONF_ENABLE_MAINTENANCE_LIST: Final = "enable_maintenance_list"
+DEFAULT_ENABLE_MAINTENANCE_LIST: Final = False
+
+# ── v1.7.0 — L5 Blocking sensors ─────────────────────────────────────────────
+CONF_BLOCKING_SENSORS: Final = "blocking_sensors"        # list[str] entity IDs
+CONF_BLOCKING_BEHAVIOR: Final = "blocking_behavior"      # "abort" | "queue"
+CONF_BLOCKING_TIMEOUT_MIN: Final = "blocking_timeout_min"
+
+DEFAULT_BLOCKING_BEHAVIOR: Final = "queue"
+DEFAULT_BLOCKING_TIMEOUT_MIN: Final = 30
+
+# ── v1.8.0 — L6 Presence-aware scheduling ────────────────────────────────────
+CONF_PRESENCE_SCHEDULING_ENABLED: Final = "presence_scheduling_enabled"
+CONF_PRESENCE_ENTITIES: Final = "presence_entities"   # list[str] person entity IDs
+CONF_PRESENCE_MODE: Final = "presence_mode"           # "away_only" | "always_ask"
+CONF_AWAY_DELAY_MIN: Final = "away_delay_min"         # int, default 5
+
+DEFAULT_PRESENCE_MODE: Final = "away_only"
+DEFAULT_AWAY_DELAY_MIN: Final = 5
+
+# L6 — Events
+EVENT_ALL_AWAY: Final = f"{DOMAIN}_all_away"
+EVENT_PERSON_DETECTED_DURING_CLEAN: Final = f"{DOMAIN}_person_detected_during_clean"
+
+# v2.9.0 — EVENT-BUS. Unlike the L6 events above, these carry entry_id + name
+# in their payload so multi-robot installs can distinguish the source robot
+# without a separate lookup. The L6 events are intentionally left as-is
+# (out of scope for this pass — see v2.8.6 session notes).
+EVENT_MISSION_COMPLETED: Final = f"{DOMAIN}_mission_completed"
+EVENT_ROOM_COMPLETED: Final = f"{DOMAIN}_room_completed"
+EVENT_HEALTH_CHANGE: Final = f"{DOMAIN}_health_change"
+EVENT_MAP_RETRAIN_STARTED: Final = f"{DOMAIN}_map_retrain_started"
+EVENT_MAP_RETRAIN_COMPLETED: Final = f"{DOMAIN}_map_retrain_completed"
+# v2.9.0 LOGBOOK — fired by services.py's shared reset helper, called from
+# both the roomba_plus.reset_* services AND the Filter/Brush/Battery reset
+# buttons (button.py) — one event regardless of which path the user took.
+EVENT_MAINTENANCE_RESET: Final = f"{DOMAIN}_maintenance_reset"
+EVENT_STUCK: Final = f"{DOMAIN}_stuck"  # v3.2.0 STUCK-CONTEXT
+
+# v3.5.0 Repairs redesign — moment-shaped signals demoted from persistent
+# Repair Issues to fire-once events (+ Logbook). Each fires only on the
+# transition into the condition, not on every re-check while it persists —
+# see _fire_once()/_disarm() in repairs.py.
+EVENT_ERROR_RECURRENCE: Final = f"{DOMAIN}_error_recurrence"
+EVENT_CANCELLATION_RECURRENCE: Final = f"{DOMAIN}_cancellation_recurrence"
+EVENT_STUCK_PATTERN: Final = f"{DOMAIN}_stuck_pattern"
+EVENT_MISSION_ANOMALY: Final = f"{DOMAIN}_mission_anomaly"
+# A Classic mission the cloud's numbers (dirt count, area) show as unusual
+# once they arrive, after the mission-end event said otherwise (4.5.0).
+EVENT_MISSION_REASSESSED: Final = f"{DOMAIN}_mission_reassessed"
+EVENT_MIXED_SCHEDULE: Final = f"{DOMAIN}_mixed_schedule"
+EVENT_SCHEDULE_SUBOPTIMAL: Final = f"{DOMAIN}_schedule_suboptimal"
+EVENT_MAP_DRIFT_DETECTED: Final = f"{DOMAIN}_map_drift_detected"
+EVENT_MAP_RETRAIN_IN_PROGRESS: Final = f"{DOMAIN}_map_retrain_in_progress"
+EVENT_CLOUD_STALE: Final = f"{DOMAIN}_cloud_stale"
+#: 4.6.0 -- a command the robot took and did not act on, and a state that
+#: says "running" while the robot charges (command_watch.py).
+EVENT_COMMAND_NOT_DELIVERED: Final = f"{DOMAIN}_command_not_delivered"
+EVENT_STATE_FROZEN: Final = f"{DOMAIN}_state_frozen"
+#: 4.6.0 -- how a mission ended, as a type (mission_result.py).
+EVENT_MISSION_RESULT: Final = f"{DOMAIN}_mission_result"
+#: Fired by the blocking manager (moved here in 4.6.0 for the event entity).
+EVENT_START_BLOCKED: Final = f"{DOMAIN}_start_blocked"
+EVENT_START_TIMEOUT: Final = f"{DOMAIN}_start_timeout"
+#: 4.6.0 (B2) -- a mission began, with who started it and where
+#: (mission_started.py).
+EVENT_MISSION_STARTED: Final = f"{DOMAIN}_mission_started"
+#: Send a command the robot took and ignored once more (4.6.0, A3). On by
+#: default: it only acts when nothing explains the refusal, and only once.
+CONF_RESEND_SWALLOWED: Final = "resend_swallowed_command"
+DEFAULT_RESEND_SWALLOWED: Final = True
+#: Minutes a robot may stand paused before Roomba+ sends it home (4.6.0,
+#: B15, pause_timeout.py). 0 is off, the default.
+CONF_PAUSE_TIMEOUT_MIN: Final = "pause_timeout_minutes"
+DEFAULT_PAUSE_TIMEOUT_MIN: Final = 0
+
+# ── v1.7.0 — L7 Zone aliases & hidden ────────────────────────────────────────
+# F11 — demand-based cleaning (DirtThresholdManager)
+CONF_DEMAND_CLEANING_ENABLED: Final = "demand_cleaning_enabled"
+CONF_DEMAND_MULTIPLIER: Final     = "demand_clean_multiplier"
+
+CONF_SMART_ZONE_ALIASES: Final = "smart_zone_aliases"   # dict[str, str]: region_id → display name
+CONF_SMART_ZONE_HIDDEN: Final = "smart_zone_hidden"     # list[str]: hidden region IDs
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+DEFAULT_CONTINUOUS: Final = True
+DEFAULT_DELAY: Final = 30
+
+DEFAULT_MAP_ENABLED: Final = True
+DEFAULT_LIVE_POSITION_REQUESTS: Final = True
+DEFAULT_LIVE_PATH_TURN: Final = "auto"
+#: Its choices; the angles in the sense of cloud_coordinator.requested_position_turn().
+LIVE_PATH_TURN_CHOICES: Final[tuple[str, ...]] = ("auto", "0", "90", "180", "270")
+DEFAULT_ENABLE_SCHEDULE_CALENDAR: Final = True
+DEFAULT_MAP_SIZE_PX: Final = 600
+DEFAULT_MAP_SCALE: Final = 10.0  # mm per pixel → 600px = 6 m × 6 m
+DEFAULT_MAP_ROTATION: Final = "0"
+DEFAULT_WALL_THICKNESS_CM: Final = 15
+DEFAULT_DOOR_WIDTH_CM: Final = 80
+
+
+def door_width_mm(options: Any) -> float:
+    """The door width the user set, in mm, for the map aligner (4.5.4).
+
+    Read once here so the setup, the rebuild after a new map version and
+    the bootstrap all use it; the last two used the built-in width. A
+    value that is not a number falls back to the default.
+    """
+    value = options.get(CONF_DOOR_WIDTH_CM) if isinstance(options, Mapping) else None
+    try:
+        return 10.0 * float(DEFAULT_DOOR_WIDTH_CM if value is None else value)
+    except (TypeError, ValueError):
+        return 10.0 * float(DEFAULT_DOOR_WIDTH_CM)
+
+# ── Replacement intervals when the cloud gives none (4.3.2) ─────────────────
+#
+# IROBOT'S OWN BUDGETS, NOT OURS. The cloud's part counters carry the
+# life iRobot gives each part, in minutes of use (count_used +
+# count_remaining). Two series have been read:
+#
+#   i3+ (tests/fixtures/irobot_parts_i3plus.json)
+#       filter 52.4 h, side brush 156.5 h, main brushes 312.4 h, bag 28.7 h
+#   j9+ (@msva17)
+#       main brushes 312.7 h -- the i3+'s figure to the minute; the rest
+#       of his counters were exhausted or freshly reset
+#
+# THE LAST FALLBACK, NOT THE FIRST. A robot's interval comes from, in
+# order: its own cloud counter, its owner's learned replacements, an
+# hour option, its series in ROBOT_PROFILES (maintenance_profile_hours),
+# and only then from these -- for a series without a profile (Combo,
+# unknown SKUs) and for the bag, which no profile carries. The i3+ is
+# the only robot read in full; they replace the earlier round numbers
+# (60, 200, 150, 30). A series' profile is corrected the same way once
+# one of its counters is read: count_used + count_remaining of a part
+# that is neither used up nor just reset.
+#
+# iRobot's published guidance is in months and is shown alongside, not
+# counted: see REPLACEMENT_GUIDANCE_MONTHS.
+DEFAULT_FILTER_HOURS: Final = 52
+DEFAULT_BRUSH_HOURS: Final = 312
+DEFAULT_SIDE_BRUSH_HOURS: Final = 157
+DEFAULT_CLEAN_BASE_BAG_HOURS: Final = 29
+
+#: iRobot's published replacement guidance, in months (min, max), per
+#: series and role (4.3.2). Shown next to the hour count, never counted:
+#: the counters measure use, the months assume it. From iRobot's "care
+#: procedure frequency" articles (i, j, 400-900: 2454, 31042, 11179;
+#: s: 20966). A role a series' article does not name is absent -- the
+#: i and j articles give the side brush a cleaning interval only.
+REPLACEMENT_GUIDANCE_MONTHS: Final[dict[str, dict[str, tuple[int, int]]]] = {
+    "classic": {"filter": (2, 2), "main_brush": (6, 12)},
+    "s": {"filter": (2, 2), "side_brush": (3, 3)},
+}
+
+
+def guidance_series(sku: Any) -> str | None:
+    """The guidance table's series for a SKU: "classic" for 600-900, e,
+    i and j; "s" for the s-series; None otherwise (Braava, Prime -- whose
+    cloud counters answer instead)."""
+    if not isinstance(sku, str) or not sku:
+        return None
+    first = sku[0].lower()
+    if first in ("r", "6", "8", "9", "e", "i", "j"):
+        return "classic"
+    if first == "s":
+        return "s"
+    return None
+
+
+def replacement_guidance_months(sku: Any, role: str) -> tuple[int, int] | None:
+    """iRobot's month guidance for a role on this robot, or None."""
+    series = guidance_series(sku)
+    if series is None:
+        return None
+    return REPLACEMENT_GUIDANCE_MONTHS.get(series, {}).get(role)
+
+
+# ── Care reminders (4.3.2) ───────────────────────────────────────────────────
+#
+# Cleaning, not replacing. iRobot's "care procedure frequency" articles
+# give these in calendar time for every series (2454, 31042, 11179,
+# 20966): filter and main brushes once a week, twice a week in homes
+# with pets; side brush once a month; front caster every two weeks;
+# cliff sensors and charging contacts once a month. The bin is "after
+# each use" and has no reminder -- a reminder after every run is noise.
+#
+# Calendar time is right here and wrong for replacement: hair wraps a
+# brush whether the robot ran three hours or ten, and the articles
+# themselves give these in days.
+
+#: Option: care reminders at all. OFF BY DEFAULT: a reminder sensor and
+#: four buttons per robot are entities nobody asked for, and a weekly
+#: "clean the filter" is advice some households follow and many do not.
+#: Off means no sensor, no "cleaned" buttons and no cleaning items in
+#: the to-do list; the replacement counters are not affected.
+CONF_CARE_REMINDERS: Final = "care_reminders"
+DEFAULT_CARE_REMINDERS: Final = False
+
+#: Option: pets in the household -- filter and brush cleaning twice as
+#: often, as iRobot's articles say. Only read with care reminders on.
+CONF_PETS: Final = "pets_in_household"
+DEFAULT_PETS: Final = False
+
+#: Unique-id suffixes of the entities that exist only with care
+#: reminders on, so switching the option off removes them from the
+#: registry instead of leaving them "unavailable".
+CARE_ENTITY_KEYS: Final[tuple[str, ...]] = (
+    "next_care",
+    "reset_filter_cleaning",
+    "reset_brushes_cleaning",
+    "reset_side_brush_cleaning",
+    "reset_cliff_sensors_cleaning",
+)
+
+
+def care_reminders_enabled(options: Mapping[str, Any]) -> bool:
+    """True when the user switched care reminders on."""
+    return bool(options.get(CONF_CARE_REMINDERS, DEFAULT_CARE_REMINDERS))
+
+
+@dataclass(frozen=True)
+class CareTask:
+    """One calendar cleaning task.
+
+    `slot` names the store's `{slot}_cleaned_at` field. `braava` says
+    whether a Braava has the part -- it has cliff sensors and charging
+    contacts, and no filter, brushes or caster.
+    """
+
+    slot: str
+    days: float
+    days_with_pets: float
+    braava: bool = False
+    #: The interval on a Prime robot where it differs (4.5.0). iRobot's
+    #: care articles for the 2025 lines -- the Prime robots -- give the
+    #: side brush, the cliff sensors and the charging contacts every two
+    #: weeks, where the earlier series' say once a month.
+    days_prime: float | None = None
+
+    def interval_days(self, pets: bool, prime: bool = False) -> float:
+        """Days between cleanings for this household and generation."""
+        if prime and self.days_prime is not None:
+            return self.days_prime
+        return self.days_with_pets if pets else self.days
+
+
+CARE_TASKS: Final[tuple[CareTask, ...]] = (
+    CareTask("filter", 7, 3.5),
+    CareTask("brushes", 7, 3.5),
+    CareTask("side_brush", 30, 30, days_prime=14),
+    CareTask("wheel", 14, 14),
+    CareTask("cliff_sensors", 30, 30, braava=True, days_prime=14),
+    CareTask("contact", 30, 30, braava=True, days_prime=14),
+)
+
+# ── Maintenance model (4.5.0) ────────────────────────────────────────────────
+
+#: Option: when a part counts as "soon" -- at 80 % of its interval
+#: (iRobot's Prime app warns there), at 60 %, or never ("due": only
+#: due and overdue are reported).
+CONF_MAINTENANCE_SOON: Final = "maintenance_soon_at"
+DEFAULT_MAINTENANCE_SOON: Final = "80"
+MAINTENANCE_SOON_SHARES: Final[dict[str, float | None]] = {
+    "80": 0.8,
+    "60": 0.6,
+    "due": None,
+}
+
+#: Option: where a robot error's care guide appears (E12). The list by
+#: default; "repairs" a repair issue instead, "off" neither.
+CONF_CARE_GUIDE_ON_ERROR: Final = "care_guide_on_error"
+DEFAULT_CARE_GUIDE_ON_ERROR: Final = "list"
+CARE_GUIDE_ON_ERROR_CHOICES: Final[tuple[str, ...]] = ("list", "repairs", "off")
+
+#: Option: a repair issue for a part a week overdue (E3, D1). Off by
+#: default: repair issues count on the settings icon, and the list
+#: shows what is overdue anyway.
+CONF_MAINTENANCE_OVERDUE_REPAIRS: Final = "maintenance_overdue_repairs"
+DEFAULT_MAINTENANCE_OVERDUE_REPAIRS: Final = False
+
+#: Option: a read-only maintenance calendar (E13, K). Off by default:
+#: a calendar entity puts the calendar in the sidebar, and the due dates
+#: are in the list and the sensors already.
+CONF_MAINTENANCE_CALENDAR: Final = "maintenance_calendar"
+DEFAULT_MAINTENANCE_CALENDAR: Final = False
+
+#: Option: hide the maintenance diagnostic entities (E2). The way for an
+#: installation from before 4.5.0 to the lean set a new one starts with.
+CONF_HIDE_MAINTENANCE_DIAGNOSTICS: Final = "hide_maintenance_diagnostics"
+
+#: Unique-id suffixes of the maintenance diagnostic entities: when a part
+#: was last replaced, how fast it wears, how many days are left. Their
+#: figures are attributes of the part sensors and the status sensor's
+#: entries since 4.5.0; created disabled on a new installation, and
+#: hidden on request on an existing one.
+MAINTENANCE_DIAGNOSTIC_KEYS: Final[tuple[str, ...]] = (
+    "filter_last_replaced",
+    "brush_last_replaced",
+    "pad_last_replaced",
+    "battery_last_replaced",
+    "filter_wear_rate",
+    "brush_wear_rate",
+    "pad_wear_rate",
+    "side_brush_wear_rate",
+    "clean_base_bag_wear_rate",
+    "filter_days_until_due",
+    "brush_days_until_due",
+    "pad_days_until_due",
+    "side_brush_days_until_due",
+    "clean_base_bag_days_until_due",
+)
+
+# ── Cloud consumable parts (/v1/robots/{blid}/parts) ─────────────────────────
+#
+# iRobot's cloud tracks each consumable by a numeric `part_id` and returns
+# NO name for it. The official app resolves names client-side from a per-SKU
+# catalog that the endpoint does not serve, so the mapping below has to live
+# here.
+#
+# STATUS: FIELD-INFERRED, NOT VENDOR-CONFIRMED. What is confirmed is the
+# response itself, captured live from an i3+ (sku i355640, firmware
+# daredevil+2.6.0) which reports exactly these four ids, and whose app shows
+# exactly four tiles: Clean Base bag, side brush, main brushes, filter.
+# The id->role assignment rests on three agreeing signals:
+#
+#   * `part_id` 139 is numerically far from the 35/36/37 cluster, and the
+#     app's own `PartCategoryItem` enum has exactly two values, Robot and
+#     Dock — so 139 is the one Dock-side part, i.e. the Clean Base bag.
+#     It also has the shortest budget, which fits a bag.
+#   * Budget (count_used + count_remaining) for 35 is ~52 h, against
+#     the earlier filter default of 60 h (iRobot's "every 2 months") — the
+#     closest pairing of any id to any published interval.
+#   * 36 (~157 h) and 37 (~312 h) are then the two brushes, both inside
+#     iRobot's "every 6-12 months" guidance. The longer-lived pair member
+#     is taken as the main (multi-surface) brushes and the shorter as the
+#     edge-sweeping side brush, which wears faster.
+#
+# 36 = SIDE BRUSH IS FIELD-CONFIRMED, not inferred: @mdarocha replaced the
+# side brush on an i3+ and confirmed the reset in iRobot's app, and 36 is
+# the id whose counter went to 0 (observed live in the same session). The
+# remaining three keep the reasoning above until someone confirms them the
+# same way.
+#
+# THE j-SERIES NUMBERS ITS PARTS 46/47/48 (4.3.2, @msva17's j9+), in the
+# i3's order shifted by eleven; the bag stays 139. Read off the app
+# against the attributes: 48 was "Dual Multi-Surface Brushes, ~112 HRS
+# LEFT" with 6720 minutes remaining, 46 the filter tile, red and empty,
+# with 0 remaining. 47 and 139 were both freshly reset, so 47 is the
+# side brush by elimination -- the one assignment here not read off a
+# screen. A j7+ reports the same four ids (@msva17, 4.5.0 cycle), and
+# its part sensors read `interval_source: cloud` as the j9+ does. Unmapped, these surfaced as generic part sensors only, with
+# no role: no remaining hours on the maintenance sensors and no reset
+# sent to iRobot.
+#
+# A wrong guess here is visible and cheap to correct: every part sensor
+# carries its raw `part_id` and counters as attributes, so comparing one
+# screen of the official app against the entity attributes settles it.
+# Unknown ids are NOT dropped — they surface as a generic part sensor
+# (see sensor_cloud.py), so a j7/s9/Braava reporting different ids still
+# gets working entities instead of nothing.
+IROBOT_PART_ROLE_FILTER: Final = "filter"
+IROBOT_PART_ROLE_SIDE_BRUSH: Final = "side_brush"
+IROBOT_PART_ROLE_MAIN_BRUSH: Final = "main_brush"
+IROBOT_PART_ROLE_CLEAN_BASE_BAG: Final = "clean_base_bag"
+
+IROBOT_PART_ROLES: Final[dict[str, str]] = {
+    "35":  IROBOT_PART_ROLE_FILTER,
+    "36":  IROBOT_PART_ROLE_SIDE_BRUSH,
+    "37":  IROBOT_PART_ROLE_MAIN_BRUSH,
+    "139": IROBOT_PART_ROLE_CLEAN_BASE_BAG,
+    # j-series (j9+, @msva17): see above.
+    "46":  IROBOT_PART_ROLE_FILTER,
+    "47":  IROBOT_PART_ROLE_SIDE_BRUSH,
+    "48":  IROBOT_PART_ROLE_MAIN_BRUSH,
+}
+
+#: Everything the four maintenance consumables differ in, in one place.
+#:
+#: `slot` is the MaintenanceStore field prefix; every role has one, so
+#: wear-rate/days-until-due keep a baseline through a cloud outage. The
+#: main brushes keep the legacy "brush" slot name because a Braava's pad
+#: shares it -- hence `due_key` and `mop_due_key` differing for that one
+#: role. `conf_key` is None for the two roles with no configuration
+#: option, which is what makes `default_hours` their only threshold.
+@dataclass(frozen=True)
+class ConsumableRole:
+    slot: str
+    due_key: str
+    conf_key: str | None
+    default_hours: int
+    action_slug: str
+    mop_due_key: str | None = None
+
+    #: True when the robot has no hardware this consumable belongs to.
+    #:
+    #: NOT EVERY ROBOT HAS EVERY PART. `clean_base_bag` is the case:
+    #: a 900-series charges on a plain dock and has no bag to replace.
+    #: Every per-part ENTITY was already suppressed for those robots by
+    #: `has_clean_base`, but the maintenance-due path iterated all four
+    #: roles regardless -- so a Roomba 980 reported a bag due after
+    #: ~105 hours of runtime, for a bag that does not exist
+    #: (a tester's R980020, diagnostics attached to the report).
+    #:
+    #: Only `clean_base_bag` carries this. Filters, main brushes and
+    #: side brushes exist on every robot in scope, Clean Base or not --
+    #: gating side_brush too, as the report suggested, would stop
+    #: legitimate side-brush reminders on every robot without a Clean
+    #: Base.
+    absent_when: Callable[[dict[str, Any]], bool] | None = None
+
+
+CONSUMABLE_ROLES: Final[dict[str, ConsumableRole]] = {
+    IROBOT_PART_ROLE_FILTER: ConsumableRole(
+        slot="filter",
+        due_key="filter",
+        conf_key=CONF_FILTER_HOURS,
+        default_hours=DEFAULT_FILTER_HOURS,
+        action_slug="replace_filter",
+    ),
+    IROBOT_PART_ROLE_MAIN_BRUSH: ConsumableRole(
+        slot="brush",
+        due_key="brush",
+        conf_key=CONF_BRUSH_HOURS,
+        default_hours=DEFAULT_BRUSH_HOURS,
+        action_slug="replace_main_brushes",
+        mop_due_key="pad",
+    ),
+    IROBOT_PART_ROLE_SIDE_BRUSH: ConsumableRole(
+        slot="side_brush",
+        due_key="side_brush",
+        conf_key=CONF_SIDE_BRUSH_HOURS,
+        default_hours=DEFAULT_SIDE_BRUSH_HOURS,
+        action_slug="replace_side_brush",
+    ),
+    IROBOT_PART_ROLE_CLEAN_BASE_BAG: ConsumableRole(
+        absent_when=lambda state: not has_clean_base(state),
+        slot="clean_base_bag",
+        due_key="clean_base_bag",
+        conf_key=CONF_CLEAN_BASE_BAG_HOURS,
+        default_hours=DEFAULT_CLEAN_BASE_BAG_HOURS,
+        action_slug="replace_clean_base_bag",
+    ),
+}
+
+IROBOT_PART_ROLE_TO_STORE_SLOT: Final[dict[str, str]] = {
+    role: spec.slot for role, spec in CONSUMABLE_ROLES.items()
+}
+
+#: The action slug for a due consumable key, for the `required_actions`
+#: attribute. Prose lives in strings.json/translations, not here.
+MAINTENANCE_ACTION_SLUGS: Final[dict[str, str]] = {
+    **{spec.due_key: spec.action_slug for spec in CONSUMABLE_ROLES.values()},
+    **{
+        spec.mop_due_key: "replace_mop_pad"
+        for spec in CONSUMABLE_ROLES.values()
+        if spec.mop_due_key
+    },
+}
+
+
+def part_role(part_id: Any) -> str | None:
+    """Return the consumable role for a cloud `part_id`, or None if unknown.
+
+    Ids arrive from the cloud as strings but are compared as strings after
+    normalisation, so an int-typed id from a future firmware still matches.
+    """
+    if part_id is None:
+        return None
+    return IROBOT_PART_ROLES.get(str(part_id).strip())
+
+
+
+ROOMBA_SESSION: Final = "roomba_session"
+
+# ── clean_room action ─────────────────────────────────────────────────────────
+SERVICE_CLEAN_ROOM: Final = "clean_room"
+SERVICE_CLEAN_ZONE: Final = "clean_zone"
+ATTR_ROOM_NAME: Final = "room_name"
+ATTR_ORDERED: Final = "ordered"
+ATTR_TWO_PASS: Final = "two_pass"
+#: Vacuum, mop, or both, per call. The select holds the everyday
+#: default; this is for a run that should differ from it.
+#: THE CLEANING MODE VOCABULARY, AND IT DIFFERS BY GENERATION.
+#:
+#: Both tiers send `operatingMode` in a region command's params, and
+#: three of the four values agree. "Vacuum and mop" does not:
+#:
+#:     Prime    32   field-verified before the mode select shipped --
+#:                   the robot answered `command 32 -> status 6`, so it
+#:                   accepts a value its own app does not send.
+#:     Classic   6   captured from the iRobot app's own outbound
+#:                   command on a mopping Classic robot (a user's capture on
+#:                   roomba_rest980's issue tracker), where
+#:                   `operatingMode: 6` appears with `padWetness`.
+#:
+#: Sending the vendor's own value per tier rather than picking one and
+#: hoping: 32 is confirmed on Prime and unknown on Classic, and this is
+#: not a field to be adventurous with -- it decides whether water goes
+#: on the floor.
+# THE FULL `operatingMode` BITMASK, for reference. CLASSIC ONLY.
+#
+# SEEN LIVE ON THREE FIRMWARE FAMILIES. Decompiled from `ruby` and
+# `lewis`; observed in the field on `soho` (@ScenicSystemsLLC, nine
+# unbroken seconds at a confirmed crossing) and on `daredevil`
+# (@AlakazipLabs, an ordered three-room run where both returns to 2 fall
+# exactly where the commanded order puts the boundaries).
+#
+# `sanmarino` is the exception: a Braava polled at 40 ms across a whole
+# mission produced not one flip, which is thirty-five samples inside
+# every travel window. That robot does not emit the bit.
+#
+# Decoded from the iRobot app's own `core::OperatingMode::toString()` in
+# `libcore_base.so`: each block there loads a Type value, calls
+# `contains()`, and appends a name -- the Type sits as an immediate
+# right before it.
+#
+#     Type 0   value   1   Traveling        <- `str wzr` into the vector
+#     Type 1   value   2   Vacuuming
+#     Type 2   value   4   Mopping
+#     Type 3   value   8   VideoStreaming
+#     Type 4   value  16   AirPurifying
+#     Type 5   value  32   VacMopComboOnly  <- a mode of its own
+#     Type 6   value  64   Scrubbing
+#     Type 8   value 256   MopOnly
+#     {1,2}    value   6   ComboCleaning
+#
+# NOT CONSTANTS, because nothing reads them yet and a constant nobody
+# uses is dead weight -- there is a guard for that. Written here so the
+# next person does not repeat the decompilation.
+#
+# TWO CORRECTIONS TO WHAT THIS FILE USED TO ASSUME:
+#
+#   * Command and status are the SAME enum, not two tables. The
+#     difference is requested versus currently active.
+#   * `32` on Prime is not "6 encoded differently" -- it is Type 5,
+#     a distinct mode. Prime is a plain bitmask like the rest.
+#
+# WHY A TRAVELLING ROBOT REPORTS 1 AND NOT 3: travelling and cleaning
+# are mutually exclusive. The robot reports either a repositioning drive
+# or active cleaning, never both -- which is what makes the value usable
+# as a room-transition signal.
+#
+# Observed in the field before it was named: an S9+ over a 73-minute
+# whole-house run showed six excursions to 1, three verified live as
+# room changes, with flip duration scaling with distance driven
+# (@ScenicSystemsLLC).
+#
+# CONFIRMED IN THE FIRMWARE, independently of the app.
+#
+# `MissionStatusMessage::get_operating_mode()` (ruby @0x00d4fd40, lewis
+# @0x0118d7bc, 126 bytes, byte-identical structure) opens with a
+# branch-free test:
+#
+#     bl    robot_cleaning_mode_get()   ; current mode -> r0
+#     sub.w r0, r0, #6                  ; r0 - 6
+#     clz   r0, r0                      ; 32 iff r0 == 0
+#     lsrs  r0, r0, #5                  ; -> 1 iff mode == 6
+#
+# Bit 0 of the status value is set exactly when the internal cleaning
+# mode is 6, and mode 6 is `CLEANING_MODE_TRAVEL`:
+#
+#     0 NONE · 1 PERF · 2 AUTO · 3 ECO · 4 TRAIN · 5 BINLESS
+#     6 TRAVEL · 7 GYRO_NULL
+#
+# Two entirely different mechanisms agreeing: the app reads a bitmask
+# class with a name table, the firmware computes the same bit from its
+# own mode. Supporting strings in the same binary:
+#
+#     [DBG] Strategy: switch to travel mode for evade
+#     [DBG] Strategy: switch to travel mode for reloc
+#     set_travel_mode_and_update_cleanbits
+#
+# -- evading, relocalising and driving to a target, which is exactly
+# when the S9+ reported 1.
+#
+# ONE SOFT SPOT: the enum ORDER was read off the string order in the
+# binary, not off a jump table. A `%s (%d)` mapper makes it very likely
+# but it is not proven the way the error codes were. The conclusion does
+# not rest on it -- the comparison against 6 plus the presence of
+# `CLEANING_MODE_TRAVEL` in sixth position carries it alone.
+#
+# `512` in the tables below is bit 9 and appears in NO decoded block.
+# Its name here is ours, not the app's.
+#
+# PRIME DOES NOT WORK THIS WAY. `operatingMode` occurs exactly once in
+# Prime firmware -- an entry in a pass-through shadow key list beside
+# `oModeStats`, `rid`, `zid`, `pmap_id`, `regions`. There is no
+# counterpart to `MissionStatusMessage::get_operating_mode()`, and the
+# names `Traveling`, `Vacuuming`, `Mopping` do not appear anywhere.
+#
+# Prime models a repositioning drive as a MISSION TIMELINE EVENT
+# instead. Its vocabulary, from `everest-server`:
+#
+#     start · fin · oClean · room · zone · polygon · disc · explore ·
+#     travel · traversal · reloc · plan · cmd · pause · kidnap ·
+#     charge · error · binFull
+#
+# That fits the split in that platform: navigation and mission history
+# belong to the 3irobotix layer, while `operatingMode` is an iRobot
+# cloud field passed through. Prime robots DO report it -- observed as
+# `0` -- so absence is not a safe test; anything reading it for travel
+# has to be scoped to Classic explicitly.
+#
+# `travel` and `traversal` in that list are the Prime equivalent, and
+# the obvious place to look if room progress is ever wanted there.
+
+CLEANING_MODES_PRIME: Final[dict[str, int]] = {
+    "vacuum": 2,
+    "mop": 4,
+    "vacuum_and_mop": 32,
+    "vacuum_then_mop": 512,
+}
+
+CLEANING_MODES_CLASSIC: Final[dict[str, int]] = {
+    "vacuum": 2,
+    "mop": 4,
+    "vacuum_and_mop": 6,
+    "vacuum_then_mop": 512,
+}
+
+
+def cleaning_mode_select_unique_id(blid: str) -> str:
+    """The unique id of the *Cleaning mode* select (4.4.3).
+
+    ONE PLACE FOR BOTH SIDES. The select registered itself as
+    `roomba_plus_<blid>_prime_cleaning_mode` (IRobotEntity.robot_unique_id)
+    while the reader looked it up as `<blid>_prime_cleaning_mode` --
+    since 4.0.0a37. The lookup never found the entity, so the selector's
+    mode reached no command at all, on either generation: not a room,
+    not a zone, and in 4.4.2 not the Start button (@homux-tech, #214).
+    The tests mocked the registry and so agreed with whatever was asked.
+    """
+    return f"roomba_plus_{blid}_prime_cleaning_mode"
+
+
+def cleaning_modes_for(is_prime: bool) -> dict[str, int]:
+    """The mode table for one generation.
+
+    A function rather than a lookup at the call site, so the one place
+    the two tables differ stays in one place.
+    """
+    return CLEANING_MODES_PRIME if is_prime else CLEANING_MODES_CLASSIC
+
+
+#: Which job bits each offered mode needs the robot to have.
+#:
+#: Same vocabulary as `operatingMode`: bit 1 vacuum, bit 2 mop. Both
+#: combination modes need both.
+_MODE_REQUIRES: Final[dict[str, int]] = {
+    "vacuum": 2,
+    "mop": 4,
+    "vacuum_and_mop": 6,
+    "vacuum_then_mop": 6,
+}
+
+
+def cleaning_modes_available(
+    is_prime: bool, o_mode: object
+) -> dict[str, int]:
+    """The modes this robot can actually perform.
+
+    `cap.oMode` is a capability mask in the same bits as
+    `operatingMode`: an S9+ reports 2 (vacuum), a Braava jet m6 reports
+    4 (mop). A robot that can do both reports both bits.
+
+    WHY THIS EXISTS: the selector offered all four modes to every robot.
+    @chairstacker picked a mopping mode, it stuck, and the robot went off
+    and vacuumed -- an option that could never work, presented as though
+    it could. That is the silent kind of failure: no error, no log line,
+    just a robot doing something other than what was asked.
+
+    UNKNOWN MEANS OFFER EVERYTHING. A robot that has not reported its
+    capabilities yet, or one whose firmware omits `oMode`, must not end
+    up with an empty selector -- the previous behaviour is the safe
+    fallback there.
+    """
+    modes = cleaning_modes_for(is_prime)
+    if not isinstance(o_mode, int) or isinstance(o_mode, bool) or o_mode <= 0:
+        return modes
+    return {
+        name: value
+        for name, value in modes.items()
+        # Every bit the mode needs must be one the robot has.
+        if not (_MODE_REQUIRES.get(name, 0) & ~o_mode)
+    }
+
+
+ATTR_CLEANING_MODE: Final = "cleaning_mode"
+
+#: Smart scrub for one run. Shape and meaning from a real Classic
+#: capture (a user's, on roomba_rest980's issue tracker): the iRobot app sends `swScrub: 1` for "strength 3
+#: with smart scrub" and `0` otherwise -- the app's own control was
+#: labelled beside the value, so this is not a guess off the field name.
+ATTR_SMART_SCRUB: Final = "smart_scrub"
+
+#: Pad wetness for one run: 1 light, 2 standard, 3 hard (same capture).
+#: Distinct from `ATTR_PAD_WETNESS` below, which is the Braava spray
+#: amount and was never wired to anything.
+ATTR_RUN_PAD_WETNESS: Final = "pad_wetness"
+# CLEAN-ROOM-PER-ROOM-PASSES (v2.9.0) — optional structured field for
+# individual pass control per room within the same multi-room sequence.
+# Mutually exclusive with ATTR_ROOM_NAME at the service-call level.
+# NOTE: named "room_passes", not "rooms" — ATTR_ROOMS ("rooms") already
+# exists below for smart_start's plain string list; reusing that name would
+# have collided with a different schema shape (list[str] vs list[dict]).
+ATTR_ROOM_PASSES: Final = "room_passes"
+# Options key — stores {region_id: {name, pmap_id}} for smart-map robots.
+# Replaces the older flat smart_zone_labels dict; both are written on save
+# so that a rollback to an older version still sees the label names.
+CONF_SMART_ZONE_DATA: Final = "smart_zone_data"
+#: Written by the naming flow. `smart_zone_data` above is written only by
+#: the rest980 migration, so for anyone who named rooms through our own
+#: flow this is the key that holds them.
+CONF_SMART_ZONE_LABELS: Final = "smart_zone_labels"
+
+# ── v1.7.0 — Services ────────────────────────────────────────────────────────
+SERVICE_SMART_START: Final = "smart_start"
+#: Writes the household's Do Not Disturb window.
+#:
+#: A SERVICE RATHER THAN AN ENTITY, and that is the honest shape for
+#: what this can promise. The setting is household-wide, not per robot;
+#: it takes either a daily window or a one-off end moment, never both;
+#: and its EFFECT is unproven -- a Prime robot has been observed
+#: cleaning inside its own quiet hours.
+#:
+#: A switch would imply "quiet hours are on now". A service says "write
+#: this window", which is exactly what the endpoint does and no more.
+SERVICE_SET_QUIET_HOURS: Final = "set_quiet_hours"
+ATTR_ROOMS: Final = "rooms"
+ATTR_OVERRIDE_BLOCKING: Final = "override_blocking"
+
+# ── v2.2.0 — new options keys ─────────────────────────────────────────────────
+CONF_FLOOR: Final = "floor_label"          # str — user-assigned floor name for household view
+CONF_CLEAN_DELAY_MIN: Final = "clean_delay_min"   # int — delay before second robot start (F10c)
+
+DEFAULT_CLEAN_DELAY_MIN: Final = 0         # minutes
+
+# v2.9.0 — CONFIRMED UNIT BUG (field data, 2026-06-19, 980 OG):
+# firmware-reported pose.point.x / pose.point.y are in CENTIMETRES, not
+# millimetres as every consumer in this codebase previously assumed (the
+# "_mm" suffix on variables throughout image.py/callbacks.py/map_renderer.py/
+# grid_store.py/zone_store.py was an unverified naming assumption, never
+# checked against real hardware). Evidence: a real mid-mission checkpoint
+# showed pose data confined to an apparent ~0.7m x 0.75m pocket; the user
+# confirmed the robot had in fact covered roughly half of a 106 m² home by
+# that point. Multiplying the raw pose values by 10 (cm -> mm) gives
+# 7.0m x 7.5m = 52.5 m^2 = 49.5% of 106 m^2 — matching the user's own
+# estimate almost exactly. This also explains why GAP_THRESHOLD_MM (800) /
+# MIN_DOOR_WIDTH_MM (600) / MAX_DOOR_WIDTH_MM (1200) in zone_store.py could
+# essentially never fire correctly: real ~600-1200mm door gaps were
+# arriving as ~60-120 raw units, an order of magnitude under threshold.
+# Apply this factor at every point pose.point.x/y is first read from the
+# raw MQTT payload — never downstream, since downstream mm-calibrated
+# constants (CELL_SIZE_MM, MAX_POSE_JUMP_MM, door widths, etc.) are correct
+# once given genuine millimetres.
+POSE_POINT_CM_TO_MM: Final = 10.0
+
+# ── ROOM-SEG Stage 6 — relocated from zone_store.py (deleted) ────────────────
+# Used by image.py's SMART-tier door-marker detection (inline gap-distance
+# check on the raw pose trajectory, independent of EPHEMERAL's RoomSegStore
+# pipeline) and by the historical comment above documenting the
+# POSE_POINT_CM_TO_MM unit-mismatch bug.
+GAP_THRESHOLD_MM: Final = 800     # > 80 cm gap -> doorway crossing
+MIN_DOOR_WIDTH_MM: Final = 600.0  # Narrower -> likely furniture gap, not a door
+MAX_DOOR_WIDTH_MM: Final = 1200.0 # Wider -> likely open archway
+
+# ── v2.2.0 — new service ──────────────────────────────────────────────────────
+SERVICE_CLEAN_SEQUENCE: Final = "clean_sequence"   # F10d — start robot B when robot A finishes
+SERVICE_CLEAN_OVERDUE_ROOMS: Final = "clean_overdue_rooms"  # v3.3.0 ROOM-SCHED
+SERVICE_AUTO_CLEAN_DIRTY_ROOMS: Final = "auto_clean_dirty_rooms"  # v3.3.0 SMART-ORDER
+SERVICE_EXPLAIN_MISSION: Final = "explain_mission"  # v3.2.0 ANOMALY-EXPLAIN
+SERVICE_RETRY_MISSED_ROOMS: Final = "retry_missed_rooms"  # 4.6.0, A5
+#: 4.6.0, B6 and B8 -- response actions (mission_queries.py).
+SERVICE_GET_ROOMS: Final = "get_rooms"
+SERVICE_GET_MISSIONS: Final = "get_missions"
+SERVICE_GET_MISSION: Final = "get_mission"
+SERVICE_PLAN_CLEAN: Final = "plan_clean"
+SERVICE_DEBUG_CAPTURE_START: Final = "debug_capture_start"  # 4.6.0, A1
+SERVICE_DEBUG_CAPTURE_STOP: Final = "debug_capture_stop"
+SERVICE_DEBUG_CAPTURE_GET: Final = "debug_capture_get"
+SERVICE_CREATE_BACKUP: Final = "create_backup"  # v3.5.0 FULL-BACKUP
+SERVICE_RESTORE_BACKUP: Final = "restore_backup"  # v3.5.0 FULL-BACKUP
+
+# ── Roomba 980 hardware constants ─────────────────────────────────────────────
+ROOMBA_CLEAN_WIDTH_MM: Final = 320  # 980 AeroForce cleaning path width
+
+# ── Unit conversion ───────────────────────────────────────────────────────────
+SQFT_TO_M2: Final = 0.09290304   # exact SI definition: 1 ft² = 0.09290304 m²
+
+#: `bbrun.sqft` is not square feet. It counts in units of 100 ft².
+#:
+#: A 900-series reporting `sqft: 1947` over `hr: 450` gives 0.40 m² per
+#: operating hour if read as square feet. A 980 cleans 30-60. The time
+#: counters on the same robot are consistent (445 missions × 77 min
+#: average = 571 h against 450 reported), so the fault is in the area
+#: field alone.
+#:
+#: With ×100 it comes to 40.2 m²/h. dorita980's own README example --
+#: `sqft: 251` over `hr: 103` on a different robot -- gives 22.6 m²/h
+#: the same way, and 0.23 without. Two robots, one plausible reading.
+#:
+#: The mission count does not explain it either: 1947 ft² over the 135
+#: successful missions would be 1.34 m² each.
+#:
+#: PRIOR ART, and it disagrees with itself. @ia74's `roomba_rest980`
+#: applies exactly this factor in `LegacyCompatibility.py`
+#: (`sqft / 10.764 * 100`) and NOT in its newer `sensor.py`, which
+#: emits the raw value labelled as square metres. Which of those is the
+#: later understanding is unknown.
+#:
+#: THE CLASSIC APP DOES THE SAME (APK research, 21 Oct 2026,
+#: claude/APK_RUNTIMESTATS_RECHERCHE.md, [C]). iRobot Home 7.18.0 reads
+#: `bbrun` and `runtimeStats` in one branch of its native
+#: `RoombaBlackBoxRunDataDeserializer` and multiplies `sqft` by 100
+#: before it becomes the total area in the app's performance log. An
+#: earlier note here said the official app did not read `bbrun.sqft`
+#: at all: that search had covered the Java side only, and the reading
+#: is in `libcore_base.so`.
+#:
+#: Still a reading of the app, not of the firmware: the app could be
+#: wrong too. Two field observations, one prior implementation and the
+#: app's own code now agree.
+BBRUN_SQFT_SCALE: Final = 100
+
+# ── RF0 — Robot manufacturer reference profiles ────────────────────────────────
+# Prior data for all self-calibrating learning features.  Consumed by L1–L8
+# and sensor.py for battery/maintenance computations.
+#
+# Data sources: iRobot support docs, FCC filings (battery mAh), NickWaterton
+# cross-reference (confirmed June 2026). Where iRobot's cloud counters
+# exist (i and j series) they corrected the hours; the others are
+# researched values awaiting the same check from the field.
+#
+# 9-series (Roomba 980): OEM battery is Li-ion 14.4V, confirmed June 2026.
+# Aftermarket batteries exist as 14.4V NiMH or 14.8V Li-ion — aftermarket
+# detection (L3) handles these at runtime via the estCap rolling-maximum.
+# estCap BMS scaling: 9-series firmware reports raw_estcap ÷ 3.73 ≈ mAh for
+# Li-ion; ÷ 1.87 for NiMH aftermarket packs.  Scalar applied in sensor.py.
+
+@dataclass(frozen=True)
+class RobotProfile:
+    """Manufacturer reference data for a robot family.
+
+    Used as the 'prior' by all self-calibrating features before enough
+    personal history exists.
+    """
+    name: str
+    battery_mah: int            # nominal NEW battery capacity (mAh)
+    battery_chemistry: str      # "lipo" | "nimh"
+    battery_voltage: float      # nominal pack voltage (V)
+    battery_cycles_eol: int     # manufacturer rated cycle count at ~80% capacity
+    # Replacement intervals in hours of use, per series (4.3.2: USED, as
+    # the fallback before the global defaults -- see
+    # maintenance_profile_hours()). Research values; corrected where a
+    # cloud counter of the series was read. 0 = the series has no such
+    # part, and the next fallback answers.
+    filter_hours: int
+    main_brush_hours: int
+    side_brush_hours: int
+    typical_coverage_sqft: int | None   # typical per-mission area; None for mops
+    map_capability: str         # "none" | "ephemeral" | "smart"
+    # estCap BMS scaling factors — confirmed June 2026.
+    # For i/s/j/e/6/m series: raw estCap == mAh directly → scale = 1.0.
+    # For 9-series old firmware: raw estCap is chemistry-scaled by the BMS:
+    #   Li-ion: raw ÷ 3.73 ≈ mAh   NiMH: raw ÷ 1.87 ≈ mAh  (ratio = 2.0 exactly)
+    # Usage: actual_mah = raw_estcap / estcap_scale_liion (or _nimh)
+    estcap_scale_liion: float = 1.0
+    estcap_scale_nimh:  float = 1.0
+
+
+ROBOT_PROFILES: Final[dict[str, RobotProfile]] = {
+    # key = first character of SKU (case-insensitive), matching iRobot SKU convention
+    "6": RobotProfile(
+        name="600-series",
+        battery_mah=1800, battery_chemistry="nimh", battery_voltage=14.4,
+        battery_cycles_eol=400,
+        filter_hours=60, main_brush_hours=120, side_brush_hours=120,
+        typical_coverage_sqft=800, map_capability="none",
+    ),
+    "e": RobotProfile(
+        name="e-series",
+        battery_mah=1800, battery_chemistry="lipo", battery_voltage=14.8,
+        battery_cycles_eol=400,
+        filter_hours=60, main_brush_hours=150, side_brush_hours=150,
+        typical_coverage_sqft=1000, map_capability="ephemeral",
+    ),
+    "9": RobotProfile(
+        # OEM: Li-ion 14.4V, confirmed June 2026 (Roomba 980 R980040).
+        # battery_mah=3300 confirmed via raw_estcap ÷ 3.73 ≈ 3300 mAh nominal.
+        # Aftermarket: 14.4V NiMH (÷1.87) or 14.8V Li-ion (÷3.73).
+        name="900-series",
+        battery_mah=3300, battery_chemistry="lipo", battery_voltage=14.4,
+        battery_cycles_eol=400,
+        filter_hours=60, main_brush_hours=150, side_brush_hours=150,
+        typical_coverage_sqft=1500, map_capability="ephemeral",
+        estcap_scale_liion=3.73,   # raw ÷ 3.73 = mAh for OEM Li-ion
+        estcap_scale_nimh=1.87,    # raw ÷ 1.87 = mAh for NiMH aftermarket
+    ),
+    "i": RobotProfile(
+        name="i-series",
+        # v2.8.0 RF0-IMAH: corrected from manufacturer spec (1800 mAh) to
+        # field-validated value from 3 community robots (Thonno i7+, veronoicc
+        # i7+ / i8+): estCap median ≈ 2488 mAh on lewis firmware (directly in
+        # mAh, no BMS scale factor needed unlike 9-series).
+        # Previous value (1800) caused battery_capacity_retention to read
+        # ~138% for a healthy battery, making the sensor meaningless.
+        battery_mah=2488, battery_chemistry="lipo", battery_voltage=14.8,
+        battery_cycles_eol=400,
+        # 4.3.2: CORRECTED from 60/150/150 to the i3+'s own cloud
+        # counters (tests/fixtures/irobot_parts_i3plus.json): 52.4 h,
+        # 312.4 h, 156.5 h. The research value for the main brushes was
+        # half of what iRobot counts.
+        filter_hours=52, main_brush_hours=312, side_brush_hours=157,
+        typical_coverage_sqft=1200, map_capability="smart",
+    ),
+    "j": RobotProfile(
+        name="j-series",
+        battery_mah=2700, battery_chemistry="lipo", battery_voltage=14.8,
+        battery_cycles_eol=300,
+        # 4.3.2: main brushes CORRECTED from 150 to 312 -- @msva17's j9+
+        # counter, 312.7 h. Its filter counter had run out at 110 h, so
+        # the budget is at most that: 60 stays. Side brush not read.
+        filter_hours=60, main_brush_hours=312, side_brush_hours=150,
+        typical_coverage_sqft=1400, map_capability="smart",
+    ),
+    "s": RobotProfile(
+        name="s9-series",
+        battery_mah=3300, battery_chemistry="lipo", battery_voltage=14.8,
+        battery_cycles_eol=300,
+        filter_hours=60, main_brush_hours=200, side_brush_hours=200,
+        typical_coverage_sqft=2000, map_capability="smart",
+    ),
+    "m": RobotProfile(
+        name="Braava m6",
+        battery_mah=2600, battery_chemistry="lipo", battery_voltage=14.8,
+        battery_cycles_eol=300,
+        # 4.3.2: filter CORRECTED from 60 to 0 -- a Braava has no filter.
+        filter_hours=0, main_brush_hours=0, side_brush_hours=0,
+        typical_coverage_sqft=None, map_capability="smart",
+    ),
+}
+
+# APK-CONFIG-VERIFY (July 2026) — SKU prefixes confirmed real by iRobot's own
+# res/raw/base_roomba_config.json (Classic app decompilation), covering the
+# full public SKU list: R1/R67/R69/R89/R96/R97/R98, e4/e5/e6, s5/s9, m6,
+# i1-i8, c3/c7, t72, q7, j7/j8/j9, a, p, q0, y0 (XST0020 is a VMRS test rig,
+# excluded here). Prefixes with no ROBOT_PROFILES entry below are genuine
+# iRobot product families (at minimum Combo "c", plus a/p/q/t/y) that no
+# field tester in this project currently owns — not typos or noise. Kept
+# separate from ROBOT_PROFILES so an unmatched-but-known prefix can be
+# logged distinctly from a truly unrecognised one (see get_robot_profile()).
+#
+# V4-SKU-VERIFY (July 2026) — "g" added separately: the first, and so far
+# only, confirmed V4/Prime-generation SKU prefix, from two independent real
+# accounts (chairstacker, jadestar1864 — both a Roomba 405 Combo, SKU
+# G185020, different households). NOT the same thing as the pre-existing "c"
+# prefix above: "c" comes from the Classic app's own config file and predates
+# any V4/Prime work in this project — whether it refers to the same physical
+# product family as "g" is not established, so the two are kept distinct
+# rather than merged on the assumption they mean the same "Combo". No
+# ROBOT_PROFILES entry for "g" yet — no real battery/maintenance-interval
+# field data has been collected for this SKU, only login/state confirmation
+# via roombapy-prime (see roombapy-prime's CHANGELOG v0.1.2a0/fifty-sixth
+# gap-analysis addendum). Building one from guessed numbers would repeat
+# exactly the kind of silent wrong-data mistake this project's own RF0
+# battery work has been careful to avoid elsewhere.
+_KNOWN_IROBOT_SKU_PREFIXES: Final[frozenset[str]] = frozenset(
+    "6 e r a c i j m p q s t y g".split()
+)
+
+
+def get_robot_profile(
+    sku: str | None,
+    battery_type: str | None = None,
+) -> RobotProfile | None:
+    """Return the RobotProfile for a given SKU string, or None when unknown.
+
+    Matches on the first character of the SKU (case-insensitive):
+        "i755840"  → ROBOT_PROFILES["i"]   (i-series)
+        "R980040"  → ROBOT_PROFILES["9"]   (900-series, note: "R" is not "9"!)
+        "s955840"  → ROBOT_PROFILES["s"]   (s9-series)
+
+    Note: some iRobot SKUs start with "R" for 900-series (e.g. "R980040").
+    These are handled by the "r" → "9" alias below.
+
+    battery_type — when provided (from the live MQTT ``batteryType`` field),
+    overrides the profile's default ``battery_chemistry``.  This matters for
+    900-series robots where the OEM Li-Ion pack may have been replaced with an
+    aftermarket NiMH pack (or vice-versa).  The profile always stores both
+    ``estcap_scale_liion`` and ``estcap_scale_nimh``; only the active chemistry
+    selector needs to be updated so battery-related sensors pick the right
+    scale factor.
+
+    Example: Roomba 980 with aftermarket NiMH battery →
+        battery_type="nimh", profile default="lipo"
+        → returned profile has battery_chemistry="nimh"
+        → battery_capacity_retention uses estcap_scale_nimh (1.87×) ✅
+    """
+    if not sku:
+        return None
+    prefix = sku[0].lower()
+    # "r" prefix used on some 900-series SKUs (R980040, R960040)
+    if prefix == "r":
+        prefix = "9"
+    profile = ROBOT_PROFILES.get(prefix)
+    if profile is None:
+        # APK-CONFIG-VERIFY — distinguish "real iRobot SKU family we just
+        # haven't profiled yet" (e.g. a Combo "c"-series) from a genuinely
+        # unrecognised prefix, so a field report about this is actionable
+        # instead of a silent no-op.
+        original_prefix = sku[0].lower()
+        if original_prefix in _KNOWN_IROBOT_SKU_PREFIXES:
+            _LOGGER.info(
+                "Roomba+: SKU '%s' belongs to a known iRobot product family "
+                "('%s'-prefix) without a RobotProfile entry yet — self-"
+                "calibrating features will have no manufacturer prior until "
+                "one is added.",
+                sku, original_prefix,
+            )
+        else:
+            _LOGGER.debug(
+                "Roomba+: SKU '%s' has an unrecognised prefix — no "
+                "RobotProfile available.",
+                sku,
+            )
+        return None
+
+    # Override battery_chemistry from live device state when it differs from
+    # the profile default.  Only "lipo" and "nimh" are recognised; unknown
+    # values are silently ignored so the profile default is preserved.
+    if battery_type and battery_type.lower() in ("lipo", "nimh"):
+        resolved = battery_type.lower()
+        if resolved != profile.battery_chemistry:
+            import dataclasses as _dc
+            profile = _dc.replace(profile, battery_chemistry=resolved)
+
+    return profile
+
+def maintenance_profile_hours(sku: str | None) -> dict[str, int]:
+    """The series' replacement intervals by role, from ROBOT_PROFILES.
+
+    Empty for an SKU without a profile -- the global defaults answer
+    then. A 0 in the profile (no such part on the series) is left out
+    for the same reason.
+
+    "R6" IS THE 600-SERIES HERE. `get_robot_profile()` reads every "R"
+    SKU as a 900, which a 675 (R675020) is not; that mapping stays as it
+    is for the battery figures, where nobody has checked a 600's estCap
+    scale, but the parts of a 600 are the 600's.
+    """
+    if not isinstance(sku, str) or not sku:
+        return {}
+    if sku[:2].lower() == "r6":
+        profile: RobotProfile | None = ROBOT_PROFILES["6"]
+    else:
+        profile = get_robot_profile(sku)
+    if profile is None:
+        return {}
+    hours = {
+        IROBOT_PART_ROLE_FILTER: profile.filter_hours,
+        IROBOT_PART_ROLE_MAIN_BRUSH: profile.main_brush_hours,
+        IROBOT_PART_ROLE_SIDE_BRUSH: profile.side_brush_hours,
+    }
+    return {role: value for role, value in hours.items() if value > 0}
+
+# ── State/Phase mappings ──────────────────────────────────────────────────────
+# Extended phase map (superset of Core's STATE_MAP)
+
+PHASE_TO_ACTIVITY: Final[dict[str, VacuumActivity]] = {
+    "": VacuumActivity.IDLE,
+    "charge": VacuumActivity.DOCKED,
+    "evac": VacuumActivity.RETURNING,
+    # padWash CONFIRMED LIVE (@DaRealGuGu, 1 Aug 2026): pressing the new
+    # "wash pad" button put the robot into `phase: "padWash"`, which
+    # this map did not know. An unmapped phase logs a warning and leaves
+    # the vacuum entity showing its previous activity -- so the robot
+    # sat on the dock being washed while Home Assistant said whatever it
+    # had said before.
+    #
+    # DOCKED, not CLEANING: the robot is on the dock and not moving.
+    # RETURNING would be wrong for the same reason -- it has arrived.
+    #
+    # The dedicated pad-wash sensor carries the detail; this map only
+    # has to keep the vacuum entity honest.
+    "padWash": VacuumActivity.DOCKED,
+    # NOT ADDED ON THE SAME REASONING: `padDry` and `refilling`.
+    #
+    # The app's RobotMissionPhase has twelve values and this map now
+    # knows eleven, so at least one is still out there. `padDry` looks
+    # like the obvious sibling -- the same tester triggered drying in
+    # the same session -- but his capture never showed that string, and
+    # a phase invented from a plausible pattern is how wrong values get
+    # into a map that HA reads on every state change.
+    #
+    # An unmapped phase costs a log warning and a stale activity, which
+    # is recoverable. A wrongly mapped one is silently wrong forever.
+    "hmMidMsn": VacuumActivity.CLEANING,
+    "hmPostMsn": VacuumActivity.RETURNING,
+    "hmUsrDock": VacuumActivity.RETURNING,
+    "pause": VacuumActivity.PAUSED,
+    "run": VacuumActivity.CLEANING,
+    # PRIME MISSION SUB-PHASES. The robot reports a finer phase during a
+    # Prime clean than Classic's "run": which room, which sub-activity.
+    # Names read from the firmware image's `cleanMissionStatus.phase`
+    # enum (3.8.126) and cross-checked against what this project has
+    # already OBSERVED -- "room", "zone" and "refill" were confirmed
+    # from real data before this list existed, which is why the rest
+    # are trusted enough to map rather than left to fall through.
+    #
+    # All the cleaning sub-phases collapse to CLEANING: a user does not
+    # need the vacuum entity flipping between "exploring" and
+    # "traversing", and the detail is on the phase sensor for anyone who
+    # wants it. Only the phases that mean a DIFFERENT activity are
+    # mapped to a different one.
+    #
+    # MEASURED vs ASSUMED, because the difference matters here. Three
+    # of these were seen in real data BEFORE the firmware enum existed;
+    # the rest are names read out of a firmware image that no robot in
+    # this project has yet been observed reporting. They are mapped
+    # anyway -- the three that were confirmed are the evidence that the
+    # list names real phases -- but "in the firmware" is not "seen on a
+    # robot", and if one of them ever behaves oddly, its ASSUMED tag is
+    # where to start.
+    #
+    # OBSERVED in real data:
+    "room": VacuumActivity.CLEANING,      # OBSERVED
+    "zone": VacuumActivity.CLEANING,      # OBSERVED
+    "refill": VacuumActivity.RETURNING,   # OBSERVED -- at the dock for water
+    #
+    # ASSUMED from the firmware 3.8.126 enum, never yet seen reported:
+    "oClean": VacuumActivity.CLEANING,    # ASSUMED -- ordinary clean
+    "polygon": VacuumActivity.CLEANING,   # ASSUMED -- a drawn area
+    "explore": VacuumActivity.CLEANING,   # ASSUMED -- mapping run
+    "disc": VacuumActivity.CLEANING,      # ASSUMED -- discovery
+    "travel": VacuumActivity.CLEANING,    # ASSUMED -- driving to a target
+    "traversal": VacuumActivity.CLEANING, # ASSUMED
+    "plan": VacuumActivity.CLEANING,      # ASSUMED
+    "reloc": VacuumActivity.CLEANING,     # ASSUMED -- relocalising mid-run
+    "tankEmpty": VacuumActivity.ERROR,    # ASSUMED -- cannot continue
+    "binFull": VacuumActivity.ERROR,      # ASSUMED
+    "kidnap": VacuumActivity.ERROR,       # ASSUMED -- picked up mid-mission
+    "error": VacuumActivity.ERROR,        # ASSUMED
+    # `virtual` and `cmd` are deliberately NOT mapped: their activity is
+    # unclear from the name alone, and an unmapped phase falls through
+    # safely (keeps the previous activity, logs once) rather than being
+    # guessed at. They go in when a real robot shows what they mean.
+    "stop": VacuumActivity.IDLE,
+    "stuck": VacuumActivity.ERROR,
+}
+
+# NEW (V4/Prime). Maps confirmed mission/timeline/report event_type
+# strings (roombapy_prime.models.MissionTimelineEvent.event_type) to a
+# VacuumActivity. Confidence varies per entry -- see
+# ROOMBA_PLUS_VERSION_PLAN_v4_onwards.md and
+# PrimeCoordinator's own module docstring for the full evidence trail:
+#
+#   - start/reloc/travel/room: confirmed LIVE on mission/timeline/report
+#     itself (chairstacker, roombapy-prime v0.1.11a5).
+#   - pause/fin: ALSO confirmed LIVE (chairstacker, second capture, this
+#     session) -- "pause" fires when send_simple_command("stop") is
+#     sent (our "stop" command produces a timeline event_type of
+#     "pause", not "stop" -- there is no confirmed "stop" event_type at
+#     all so far). "fin" fires once the mission fully concludes,
+#     observed here right after stop-then-dock. "fin" is mapped to
+#     IDLE, not DOCKED -- it marks the mission/report as concluded, not
+#     confirmed physical arrival at the dock (dock was commanded right
+#     before it, but travel time back to base isn't captured by this
+#     event on its own).
+#   - traversal/zone/charge/evac/padWash: confirmed only via the
+#     HISTORICAL get_mission_history() endpoint (a separate, earlier
+#     real capture) -- same event schema (see MissionTimelineReport's
+#     own docstring for that cross-confirmation), but not yet
+#     independently observed on THIS live push channel specifically.
+#   - error: never observed in any real capture so far, included
+#     defensively since MissionTimelineEvent has a dedicated ErrorEvent
+#     sub-field.
+#
+# "evac" -> RETURNING (not DOCKED) and "padWash" -> DOCKED deliberately
+# mirror/extend PHASE_TO_ACTIVITY's own existing evac reasoning above:
+# self-emptying bases can evac MID-mission, not only at the very end,
+# so it is NOT reliably "docked" the way charge/padWash are.
+MISSION_EVENT_TYPE_TO_ACTIVITY: Final[dict[str, VacuumActivity]] = {
+    "start": VacuumActivity.CLEANING,
+    "reloc": VacuumActivity.CLEANING,
+    "travel": VacuumActivity.CLEANING,
+    "room": VacuumActivity.CLEANING,
+    "traversal": VacuumActivity.CLEANING,
+    "zone": VacuumActivity.CLEANING,
+    "pause": VacuumActivity.PAUSED,
+    "charge": VacuumActivity.DOCKED,
+    "evac": VacuumActivity.RETURNING,
+    "padWash": VacuumActivity.DOCKED,
+    "fin": VacuumActivity.IDLE,
+    "error": VacuumActivity.ERROR,
+}
+
+# v2.3.0 — Phases used by image.py (pose handling) and vacuum.py (live CR4 source).
+# Moved from image.py module-locals so vacuum.py can import without circular deps.
+# v2.6.3 B1 — evac moved to CLEANING_PHASES: robots with self-emptying bases
+# (i7+, s9+) go through evac mid-mission; treating it as MISSION_END would
+# prematurely trigger _handle_mission_end() and reset the map renderer.
+# THE VENDOR'S OWN RULE, and it disagrees with both sets.
+# `isMissionPhaseStillRunning` (app 3.0.0) declares:
+#
+#   still running   run · mapupd · hmMidMsn · hmUsrDock · hmUsrChrg
+#                   hmPostMsn · stuck
+#   not running     stop · evac · refill · padWash · padDry
+#
+# THREE DIFFERENCES, and one of them we are right about.
+#
+# `evac` is "not running" for the vendor and CLEANING_PHASES for us --
+# deliberately, since v2.6.3: an i7+ or s9+ goes through evac MID-
+# mission, and treating it as an ending prematurely reset the map
+# renderer. A field observation beats a rule table, and this one is
+# eight months old.
+#
+# `hmPostMsn` is "still running" for the vendor and MISSION_END for us.
+# Ours is the useful reading for a mission-end trigger; theirs is
+# probably about whether the robot is still busy. Different questions,
+# and worth knowing they are not the same one.
+#
+# THE PHASE GAP HAS AN ANSWER AND IT WAS IN THE PACKAGE. `padWash`,
+# `padDry` and `refill` sit in neither set here, and this project has
+# been asking testers which category they belong to since the mid-
+# mission wash was found. The vendor puts all three in "not running" --
+# and `isCleanDockTask` puts the same three in a category of their own:
+# a DOCK task, which is why they are neither a cleaning phase nor an
+# ending.
+#
+# So the gap is not a missing decision; it is a third state this
+# project does not model. Leaving them out of both sets is closer to
+# right than adding them to either.
+CLEANING_PHASES: Final[frozenset[str]] = frozenset({"run", "hmMidMsn", "evac"})
+MISSION_END_PHASES: Final[frozenset[str]] = frozenset({"charge", "hmPostMsn", "stop"})
+
+#: `isCleanDockTask` (app 3.0.0) -- the robot is at the dock doing
+#: something that is not a mission.
+#:
+#: Not consumed anywhere yet. Recorded because it names the third state
+#: the two sets above leave out, and because a "mission running" sensor
+#: built from CLEANING_PHASES alone will read false during a mid-mission
+#: pad wash -- which is correct by this rule and surprising to a user
+#: watching the robot work.
+DOCK_TASK_PHASES: Final[frozenset[str]] = frozenset(
+    {"padWash", "padDry", "refill"}
+)
+
+# v2.8.1 (END-DEBOUNCE) — shared between callbacks.py (MissionTimerStore /
+# MissionStore mission-end detection) and image.py (map renderer / ZoneStore /
+# GeometryStore / GridStore / OutlineStore mission-end detection). Both files
+# independently implement the same "is this phase a genuine mission end or a
+# transient inter-room transition blip" check; these two phases are the ones
+# observed to appear both at genuine mission end AND transiently between
+# rooms — "stop"/"completed"/"cancelled" are unambiguous, deliberate terminal
+# phases never used for inter-room signalling and always confirm immediately.
+ROOM_TRANSITION_CANDIDATE_PHASES: Final[frozenset[str]] = frozenset({"charge", "hmPostMsn"})
+
+#: WHAT A `room` EVENT'S `status` MEANS — Classic, Stufe A (lewis and ruby
+#: firmware, byte-identical where compared; established over four research
+#: rounds for 4.2.11). The wire value IS the firmware's TimelineAreaStatus,
+#: unchanged (`end_given_room_or_zone_event` writes it straight through).
+#: Values come from different places:
+#:
+#:   0  last pass done — the ROOM is finished. CleanStatus 3 (done) with
+#:      no passes remaining (`get_remaining_sub_clean_zone_passes() == 0`).
+#:   1  a pass done, MORE FOLLOW. CleanStatus 3 with passes remaining.
+#:      The field registry's "pass in progress" was wrong.
+#:   3  "done, other variant" from CleanStatus 4/5 — but ALSO emitted for
+#:      the not-done CleanStatus 0/1 on an unexpected path (with a
+#:      warning). Ambiguous; never observed on the wire.
+#:   4  the robot was picked up (`update_robot_was_kidnapped`).
+#:   5, 6  the room was STILL OPEN when the mission ended, and
+#:      `handle_mission_end` closed it (lewis: `movne #5 / moveq #6` on a
+#:      timeline flag). Produced nowhere else. The old reading of 6 as
+#:      "finished after error recovery" was an interpretation of real
+#:      observations, not a meaning.
+#:   2  internal only; it does not close the event.
+#:   7, 8  a SKIPPED room or zone (4.3.7). The iRobot app (7.18.0,
+#:      `MissionTimelineProvider`, `TimelineItem::isSkippedEvent`) shows
+#:      an event with either value as skipped. The firmware read above
+#:      (ruby `cleantrack`) had 7 as internal and never on the wire; a
+#:      newer firmware or another family evidently sends it. Which of the
+#:      two is a user skip and which an automatic one is open.
+#:
+#: `status` is optional; a second field `reason` (0–7) is not decoded yet,
+#: except that the app counts a `travel` to the dock with `reason` 3 as
+#: skipped too. One parser of the app (`MissionTimelineDeserializer`)
+#: ignores `status`, which is where the earlier note "the app does not
+#: evaluate it" came from; the timeline the app displays does.
+#:
+#: THREE QUESTIONS, three sets. They must not be mixed up: a room still
+#: in progress counted as finished closes a mission after its first room
+#: (v2.9.0), and half a pass counted as a finished one distorts what is
+#: learned about the room.
+
+#: "Is the ROOM finished?" — the end gate, stuck recovery, the dirt index,
+#: room coverage, the archive's completed list. {0, 6}. Not 1 (more passes
+#: follow), not 3 (ambiguous — may come from a not-done status), not 4
+#: (picked up), not 5.
+#:
+#: WHY 6 STAYS, although the firmware says it marks a room still OPEN at
+#: mission end. That finding tells where 6 comes from, not whether the
+#: room was finished: an event can still be open while the room is fully
+#: cleaned — most plausibly the LAST room of a mission, if the mission
+#: ends before the regular close runs (lewis has a quirk exactly there).
+#: If that is the common case, dropping 6 would, on lewis robots, drop
+#: the last room from coverage and keep it out of the dirt index. How often
+#: a 6 marks a fully covered last room is a question for field data
+#: (.storage/roomba_plus_missions_*), not for the binary. Kept until then.
+#:
+#: Since 4.2.11 this rule is used only for LEARNED figures -- coverage, the
+#: dirt index, the archive's completed rooms. The end gate and the stuck
+#: classification ask different questions and have their own rules.
+ROOM_EVENT_DONE_STATUSES: Final[frozenset[int]] = frozenset({0, 6})
+
+#: "Is the mission over as far as this room is concerned?" -- for the END
+#: GATE only. 0 is a finished room; 5 and 6 are room events the firmware
+#: closed in `handle_mission_end`, which it only runs when the mission has
+#: ended. Any of the three in the cloud record proves the mission is over,
+#: whether or not the room was finished -- which is all the end gate asks.
+#: 5 had been left out, so a mission whose last room closed on 5 waited out
+#: the full cap instead of being confirmed.
+#:
+#: 7 and 8 are a skipped room (4.3.7): the iRobot app (7.18.0,
+#: `TimelineItem::isSkippedEvent`) shows a room event with either status
+#: as skipped. Nothing more will happen in that room either.
+#:
+#: 3 as well (4.4.2, @Thonno's i7+, lewis 22.52.10): the room he skipped
+#: ended on 3, not 7 or 8. The firmware writes 3 for a finished room
+#: ("done, another variant") and for one left unfinished; either way the
+#: event is closed and the robot will not come back to the room. Without
+#: it, a room skipped from the iRobot app kept the end gate waiting out
+#: its cap.
+ROOM_EVENT_SKIPPED_STATUSES: Final[frozenset[int]] = frozenset({7, 8})
+ROOM_EVENT_CLOSED_AT_END_STATUSES: Final[frozenset[int]] = (
+    frozenset({0, 3, 5, 6}) | ROOM_EVENT_SKIPPED_STATUSES
+)
+
+#: "Was a PASS completed here?" — 0 and 1. A completed pass means the
+#: robot drove and cleaned the room, so room history counts it outright.
+ROOM_EVENT_PASS_DONE_STATUSES: Final[frozenset[int]] = frozenset({0, 1})
+
+
+def recovered_after_stuck(events: Any, stuck_at: Any) -> bool:
+    """Did a mission carry on after its stuck event, by its timeline?
+
+    Two signals, each counted only AFTER `stuck_at` (Unix seconds,
+    compared with the events' own timestamps): a pass the robot finished
+    (status 0 or 1), or a `travel` to the dock -- how a mission ends when
+    the robot drove home rather than being freed by hand or giving up.
+    Either is enough. Status 5 and 6 do not count: the firmware closes
+    them at mission end, which says the mission stopped, not that the
+    robot worked on. False for no stuck time or no events.
+    """
+    try:
+        stuck = float(stuck_at)
+    except (TypeError, ValueError):
+        return False
+    if not stuck or not isinstance(events, list):
+        return False
+
+    def _after(ev: dict[str, Any]) -> bool:
+        # A room event carries its start (`ts`) and its end (`ets`); the
+        # end is what must come after the stuck. A travel event has `ts`.
+        when = ev.get("ets") or ev.get("ts")
+        try:
+            return when is not None and float(when) > stuck
+        except (TypeError, ValueError):
+            return False
+
+    for ev in events:
+        if not isinstance(ev, dict) or not _after(ev):
+            continue
+        if ev.get("type") == "room" and (
+            (ev.get("room") or {}).get("status") in ROOM_EVENT_PASS_DONE_STATUSES
+        ):
+            return True
+        if ev.get("type") == "travel" and (ev.get("travel") or {}).get("dest") == "dock":
+            return True
+    return False
+
+
+#: A record's `rooms_source` while its rooms are a guess waiting for the
+#: cloud's room events (4.2.15, callbacks._rooms_are_guesses), and once
+#: the cloud has answered.
+ROOMS_AWAITING_CLOUD: Final[str] = "awaiting_cloud"
+ROOMS_FROM_CLOUD: Final[str] = "cloud"
+#: The cloud reported the mission without room events: the guess stands.
+ROOMS_TRACKED: Final[str] = "tracked"
+#: Nothing observed the rooms -- no room tracking, no cloud room events
+#: yet -- so `last_cleaned_rooms` holds the rooms the mission was SENT to
+#: (4.5.0). Shown as such (`last_cleaned_rooms_source`,
+#: `cleaned_rooms_source`); a later cloud answer replaces it with
+#: ROOMS_FROM_CLOUD.
+ROOMS_REQUESTED: Final[str] = "requested"
+
+#: How long a guessed record waits for the cloud before its guess is used
+#: after all -- a mission the cloud never reports keeps some answer.
+ROOMS_AWAITING_CLOUD_MAX_SEC: Final[int] = 24 * 3600
+
+#: Below this share of a room's floor, a room event does not count as a
+#: cleaned room, whatever its status (4.2.15). @FJSoninC's closed-door
+#: test: the bathroom behind the closed door came back as status 0 with
+#: 4 of 106 sq ft -- the doorway strip -- while the office cleaned in the
+#: same mission had 97 of 160 (61 %), and a one-pass room in our data 96
+#: of 173 (55 %). Furniture keeps real cleans far below 100 %, so the
+#: line sits low: it separates "reached into the room" from "cleaned it".
+MIN_CLEANED_ROOM_SHARE: Final[float] = 0.10
+
+
+def fin_events_in_order(timeline: object) -> list[dict[str, Any]]:
+    """A mission timeline's `finEvents`, OLDEST FIRST.
+
+    THE CLOUD SENDS THEM NEWEST FIRST. Both captures there are -- an i3+
+    (tests/fixtures/irobot_missionhistory_i3plus.json) and a Braava m6
+    (@ScenicSystemsLLC, 28 Sep 2026) -- list the last event first; the
+    Braava's are ordered by `ets`, so not even strictly by `ts`. Every
+    reader that walked the list as a sequence got the mission backwards:
+    rooms listed last-cleaned first, and time per room computed from
+    negative gaps, which it then threw away.
+
+    Sorted by `ts`, stably. Events without a numeric `ts` keep their
+    relative order after the rest; anything that is not an object is
+    dropped.
+    """
+    if not isinstance(timeline, dict):
+        return []
+    events = [ev for ev in timeline.get("finEvents") or [] if isinstance(ev, dict)]
+
+    def _key(ev: dict[str, Any]) -> tuple[int, float]:
+        ts = ev.get("ts")
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+            return (1, 0.0)
+        return (0, float(ts))
+
+    return sorted(events, key=_key)
+
+
+def room_event_covered_share(room: object) -> float | None:
+    """The share of the room's floor this event covered, 0.0-1.0, or
+    None when the event carries no area figures.
+
+    `totalArea` (the union over all passes) when present -- the firmware
+    writes it only from the second pass on -- else `passArea`, which for
+    one pass is the same thing. `area` is the room's size.
+    """
+    if not isinstance(room, dict):
+        return None
+    covered = _number(room.get("totalArea"))
+    if covered is None:
+        covered = _number(room.get("passArea"))
+    area = _number(room.get("area"))
+    if covered is None or area is None or area <= 0:
+        return None
+    return min(1.0, max(0.0, covered / area))
+
+
+def _number(value: object) -> float | None:
+    """A JSON number as float; None for anything else, booleans included."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def room_event_was_cleaned(room: object) -> bool:
+    """Whether a `room` event says the robot cleaned in that room.
+
+    For ROOM HISTORY — "when was this room last cleaned". A completed
+    pass counts (status 0 or 1, ROOM_EVENT_PASS_DONE_STATUSES); so does
+    any event with cleaned floor (`passArea > 0`) — a room force-closed
+    at mission end (5, 6) or where the robot was picked up (4) was still
+    cleaned as far as it got, and the iRobot app shows it as cleaned.
+
+    One step stricter than the app, on purpose: an event with no cleaned
+    area and no finished status does not count. Skipped regions — the
+    user's `skip` command and the area clean's own "Skipping region" —
+    ARRIVE AS ROOM EVENTS, through `send_timeline_notification` with
+    their own status; the app has no "skip" event type. The firmware
+    writes `passArea` only when it has coverage data for the room
+    (`end_given_room_or_zone_event`); a region it never drove has none,
+    so all area fields are absent and it cannot slip in here. A pass is
+    done means it has coverage data, so a done pass on status 1 counts.
+    `status` is optional in the schema; an event without one counts by
+    its area.
+
+    NOT for the end gate or for learned figures — see
+    ROOM_EVENT_DONE_STATUSES.
+
+    AND NOT A ROOM THE ROBOT ONLY REACHED INTO (4.2.15). An event whose
+    covered share is below MIN_CLEANED_ROOM_SHARE does not count, even
+    with a finished status: the cloud reports a room behind a closed
+    door as finished when the robot cleaned its doorway strip. An event
+    without area figures is judged as before.
+    """
+    if not isinstance(room, dict):
+        return False
+    share = room_event_covered_share(room)
+    if share is not None and share < MIN_CLEANED_ROOM_SHARE:
+        return False
+    if room.get("status") in ROOM_EVENT_PASS_DONE_STATUSES:
+        return True
+    pass_area = room.get("passArea")
+    return (
+        isinstance(pass_area, (int, float))
+        and not isinstance(pass_area, bool)
+        and pass_area > 0
+    )
+# Number of consecutive "looks like a genuine end" messages required on an
+# ambiguous phase before committing to end-of-mission processing.
+END_SIGNAL_DEBOUNCE_COUNT: Final[int] = 2
+# v2.8.3 — minimum wall-clock seconds the end signal must have been active
+# before committing to a mission end on an ambiguous phase (charge/hmPostMsn).
+# Lewis firmware 22.52.10 sends exactly END_SIGNAL_DEBOUNCE_COUNT rapid
+# cleanMissionStatus messages (~21 ms apart) during an inter-room transition,
+# both with cycle outside {"clean","quick"} — this exactly satisfies the
+# count-only gate, causing a false MissionTimerStore.clear().  A genuine
+# mission end (robot docked) holds the "end-looking" signal for many seconds
+# between MQTT updates; a burst resolves in milliseconds.  Requiring the
+# signal to persist for at least this many seconds defeats the burst case
+# without meaningfully delaying genuine end detection.
+# Applies only to ROOM_TRANSITION_CANDIDATE_PHASES (ambiguous phases).
+# Unambiguous terminal phases (stop/completed/cancelled) are unaffected.
+END_SIGNAL_MIN_HOLD_SECONDS: Final[float] = 2.0
+
+# v2.9.0 — UNVISITED-ROOMS SAFETY CAP. ROOM-INDEX CORROBORATION (added
+# v2.9.0 for Thonno's progress-reset report) suppresses end confirmation on
+# an ambiguous phase while MissionTimerStore still has unvisited planned
+# rooms — but this assumes current_room_idx reliably advances via
+# AUTO-ADVANCE-ROOM. Confirmed broken in the field (Thonno, i7+, lewis
+# 22.52.10, 2026-06-19): a genuine 2-room mission that the robot fully
+# completed and docked from never confirmed — end_signal_streak reached 10,
+# time_held reached 66+ seconds, yet unvisited_rooms stayed True the entire
+# time (current_room_idx never advanced past 0), permanently blocking
+# MissionStore recording and MissionTimerStore.clear(). A corroboration
+# signal that can hang a real mission end forever is worse than the
+# false-positive it was built to prevent. This cap bounds the room-index
+# suppression: past this many seconds of held ambiguous-phase signal, end
+# confirmation proceeds regardless of unvisited_rooms — either
+# current_room_idx tracking is unreliable for this firmware/scenario, or
+# it really is a genuine end; either way, never hang indefinitely.
+UNVISITED_ROOMS_MAX_SUPPRESSION_SECONDS: Final[float] = 90.0
+
+# v2.8.3 — Cloud-staleness threshold (CLOUD-STALE Repair Issue).
+# A cloud coordinator that has not successfully refreshed for this many minutes
+# fires the cloud_stale Repair Issue.  Chosen to be comfortably larger than
+# the coordinator's default 30-minute update interval — two consecutive missed
+# refreshes before alerting.
+CLOUD_STALE_MINUTES: Final[int] = 60
+
+# v2.8.3 — MQTT-watchdog silence threshold (MQTT-WATCHDOG Repair Issue).
+# If no MQTT message arrives for this many seconds while phase==run is active,
+# the mqtt_stale binary sensor turns ON and the mqtt_watchdog Repair Issue fires.
+# 300 s (5 min) is conservative — the robot normally sends multiple messages
+# per minute while cleaning.
+MQTT_WATCHDOG_SECONDS: Final[int] = 300
+
+# v2.9.0 BUGFIX (field reports: boutXIII, Jean-Christoph — both observed the
+# Repair Issue firing with minutes≈5, i.e. right at MQTT_WATCHDOG_SECONDS)
+# — a genuine, common MQTT gap of a few minutes right after undocking
+# (Wi-Fi reassociation while the robot physically moves away from the
+# router, motor startup interference; the 980 OG with its aftermarket
+# NiMH battery is more prone to this than newer i/s/j-series robots) was
+# being misreported as a sustained connectivity problem. The watchdog's
+# last-received message already showed phase=="run" before the gap, so it
+# fired the instant the 5-minute silence threshold was crossed, regardless
+# of how recently the mission had actually started.
+# 420 s (7 min) chosen with margin above the observed ~5 min reports —
+# exact gap duration wasn't precisely measured in either field report, so
+# this errs slightly generous rather than risk re-introducing false
+# positives at a tighter value. Suppresses the watchdog entirely (not just
+# resets the silence clock) until this many seconds after mssnStrtTm — a
+# genuine outage starting early in the mission is still caught once both
+# this grace window AND the normal silence threshold have elapsed.
+MQTT_WATCHDOG_START_GRACE_SECONDS: Final[int] = 420
+
+# v2.9.0 — INTEG-HEALTH meta-sensor thresholds.
+# Score (0-100) combines: active Repair Issue count, MQTT message age, and
+# ARC1 (MissionArchive) freshness. See sensor.py's _compute_integration_health
+# docstring for the exact scoring formula and the rationale for which
+# originally-planned signals (cloud age, "last store save") were folded in
+# or dropped.
+INTEGRATION_HEALTH_TICK_SECONDS: Final[int] = 60
+INTEGRATION_HEALTH_LOW_THRESHOLD: Final[int] = 50
+INTEGRATION_HEALTH_SUSTAINED_MINUTES: Final[int] = 30
+# MQTT silence beyond this is penalised even outside an active mission —
+# distinct from MQTT_WATCHDOG_SECONDS (5 min, mission-specific): this is a
+# much longer bar meant to catch "the integration's local connection appears
+# entirely dead", not routine idle-time quiet.
+INTEGRATION_HEALTH_MQTT_STALE_HOURS: Final[float] = 24.0
+# ARC1 (MissionArchive) freshness — the newest archived mission is older
+# than this despite cloud being enabled, suggesting the sync pipeline itself
+# may be stuck (distinct from CLOUD-STALE, which only checks whether the
+# coordinator's OWN refresh call is succeeding, not whether new missions are
+# actually making it into the archive).
+INTEGRATION_HEALTH_ARC1_STALE_HOURS: Final[float] = 48.0
+# v2.9.0 EVENT-BUS — band split for health_change event (band-crossing only,
+# not raw delta, to avoid event spam on minor score jitter). Three bands:
+# critical (<50, shares INTEGRATION_HEALTH_LOW_THRESHOLD), degraded
+# (50-79), healthy (>=80).
+INTEGRATION_HEALTH_GOOD_THRESHOLD: Final[int] = 80
+# v2.9.0 TRIGGER+ — ordinal ranking of sensor.py's _health_band() output
+# strings, shared here (not duplicated in device_trigger.py) so the
+# health_score_drop device trigger's "did it get worse" comparison can
+# never silently diverge from the band names _health_band() actually
+# returns. Higher = healthier.
+HEALTH_BAND_RANK: Final[dict[str, int]] = {"critical": 0, "degraded": 1, "healthy": 2}
+
+# CORRECTED (APK analysis of iRobot Home 7.18.0, 3 August 2026).
+#
+# This said "cleanMissionStatus.notReady is a bitmask; bit 64 means Smart
+# Map updating". It is not a bitmask. The app decodes it as a scalar
+# index into a 73-entry readiness enum, with an offset:
+#
+#     mReadyState = jsonInt <= 10 ? values()[jsonInt] : values()[jsonInt - 3]
+#
+# Indexing an enum by the value would be meaningless if it were a mask.
+#
+# CONFIRMED FROM THE FIELD, independently and later: @AlakazipLabs
+# watched the field switch from 1 (cliff) straight to 15 (insufficient
+# charge) as the battery fell past about 15 per cent -- one code
+# replacing another, never both together. A mask would have carried
+# them at once.
+#
+# WHERE THE 64 CAME FROM: wire value 67 decodes to `DownloadingMap` --
+# literally "the map is being updated". The intent was right and the
+# mechanism was inferred. But `67 & 64` is true, and so is `64 & 64`,
+# `65 & 64` and every value from 64 to 71:
+#
+#     64 FleetDisabled          68 OffDock
+#     65 SubscriptionExpired    69 TankLeaking
+#     66 DeadNavigationBoard    70/71 fluid level sensor broken
+#
+# So a user with an expired subscription was told to wait for a map
+# update -- a wrong reason they cannot act on, which is exactly what the
+# guard's own error message set out to avoid.
+#
+#: The wire value that means "Smart Map updating". A scalar, not a mask.
+MAP_UPDATING_NOT_READY: Final[int] = 67
+
+#: Kept as an alias so nothing outside this module breaks silently on the
+#: rename. Do not use: it invites `&`, which is the bug.
+MAP_UPDATING_NOT_READY_BIT: Final[int] = MAP_UPDATING_NOT_READY
+
+
+def decode_not_ready(raw: object) -> int | None:
+    """`cleanMissionStatus.notReady` as the app reads it.
+
+    Returns the READINESS INDEX, not the wire value: the app maps wire
+    values above 10 down by three, so wire 25 and index 22 are the same
+    state (`MapVersionMisMatch`). Anything comparing readiness states has
+    to agree on which of the two it is holding.
+
+    WIRE 11, 12 AND 13 COLLIDE with 8, 9 and 10 under that offset, and
+    the app has no way to tell them apart either. They are returned as
+    the colliding index rather than as an error, because that is what the
+    robot's own app would show -- but nobody has observed one, and if a
+    diagnostics capture ever carries one it is worth knowing.
+
+    Non-integers return None: a robot reporting a string, or a test
+    fixture handing back a mock, must not make a caller raise. A wrong
+    refusal is worse than no refusal.
+    """
+    if not isinstance(raw, int) or isinstance(raw, bool):
+        return None
+    if raw < 0:
+        return None
+    mapped = READINESS_WIRE_TO_INDEX.get(raw)
+    if mapped is not None:
+        return mapped
+    return raw if raw <= 10 else None
+
+
+#: Wire value -> index into READINESS_STATE_LABELS, where confirmed.
+#:
+#: THERE IS NO OFFSET RULE. This decoder applied `raw <= 10 ? raw :
+#: raw - 3`, taken from the app, and it is wrong for most of the range.
+#: The firmware maps wire values to states through an ARBITRARY LOOKUP
+#: TABLE whose order is deliberately broken -- `BUMPED` sits at wire 33
+#: while its state is index 21, and no arithmetic connects the two.
+#:
+#: The old rule happened to work below 10, where wire and index were
+#: assigned in step, and happened to look plausible above 60, where they
+#: run parallel again but four apart rather than three. Everywhere else
+#: it produced a confident wrong label.
+#:
+#: WHAT IT COST: two field reports. @Thonno's i7+ and
+#: @ScenicSystemsLLC's S9+ both reported wire 68 while docked and
+#: charging, and this decoder called it "Off dock". It is `LOADING_MAP`.
+#: @Thonno had also noticed his map-saving notification stop and his
+#: automations stall -- the same cause, read as a docking fault.
+#:
+#: Confirmed pairs only. An unconfirmed value above 10 returns None and
+#: is reported as its raw number, because a wrong state name sends
+#: someone to the wrong place -- which is exactly what happened here.
+#:
+#: EXTRACTED FROM `ruby-0.7.12`, initialiser @0x008fb0b8, where the wire
+#: value is the cloud constant minus 200. The wire values and firmware
+#: names are read from the binary; the mapping onto a state index is
+#: inference by name, and it was checked independently against this
+#: project's own 73-entry label table -- all 22 land on a label whose
+#: name matches.
+#:
+#: CONFIRMED ACROSS TWO FIRMWARES. Read from `ruby` first, then found in
+#: `lewis` -- which builds the same table as half-word stores on the
+#: stack rather than 32-bit immediates, which is why it took a second
+#: attempt to locate. The `CleaningResult` keys are shifted by one
+#: between them (lewis' enum has one extra entry below index 31), but
+#: the WIRE VALUES are identical. The table travels between generations.
+#:
+#: `soho` and `sanmarino` remain unread, and there is no way to read
+#: them: no firmware image of either exists, and the availability
+#: endpoint returns nothing for both. The only route would be a tester
+#: being offered an update on one of those robots.
+#:
+#: TWO ARGUMENTS SAY THEY WILL NOT DIFFER IN MEANING.
+#:
+#: First, ruby and lewis agree on every wire value they share -- all 33
+#: -- despite building the table differently (32-bit immediates versus
+#: half-word stores on the stack) and carrying enums of different
+#: length. Two independent implementations reaching the same mapping is
+#: not a coincidence worth betting against.
+#:
+#: Second, and stronger: the iRobot app has exactly ONE
+#: `RobotReadinessState` enum, 73 entries, and no branch on codename or
+#: SKU anywhere in the readiness path. One binary serves i7, S9+, j9 and
+#: m6. It therefore CANNOT read the same wire value differently per
+#: family -- either the values are family-independent, or iRobot's own
+#: app shows wrong states on half its fleet.
+#:
+#: A THIRD SOURCE AGREES: the app's own display strings, keyed by wire
+#: value as `history_start_refuse_<n>`. Wire 68 reads "Map was
+#: unavailable" -- which settles the value that caused two field
+#: reports, from a third direction after the firmware constant
+#: (`LOADING_MAP`) and the enum index (`DownloadingMap`).
+#:
+#: Those strings are keyed by the NUMBER, family-independent, with
+#: explicit variants only where hardware differs -- wire 6 has three
+#: wordings for brush/brushes/extractors, and the mower values carry
+#: `_mow` suffixes. Same number, different noun. If a Braava needed a
+#: different MEANING for a shared value, iRobot would have needed a
+#: variant key rather than the same one; they did not.
+#:
+#: The Braava-relevant values are in that set already: 31 "Tank low",
+#: 34/35 "Unrecognized cleaning pad", 72 "Check tank for leaks".
+#:
+#: ONE CORRECTION FROM THAT SOURCE: wire 40 was read from lewis as
+#: `HARDWARE_MISMATCH`, but the app shows "Software update required".
+#: Firmware constant and user-facing label disagree there, which is
+#: another reason it stays unmapped.
+#:
+#: NOT ADOPTED FROM IT: the display strings cover roughly fifty wire
+#: values, many more than the 35 pairs extracted from firmware. They
+#: are user prose ("Not on charging station"), not enum names ("Not
+#: docked"), so bridging them onto this table would be inference of
+#: exactly the kind that produced a wrong label once already. They are
+#: worth revisiting if someone maps the string keys to enum ordinals
+#: directly.
+#:
+#: WHAT REMAINS UNCERTAIN IS EXTRA VALUES, not different ones. A Braava
+#: may emit wire values neither ruby nor lewis assigns -- mop-specific
+#: refusals. Those show as their raw number, which is correct.
+#:
+#: WIRE 99 IS NOT MAPPED HERE, ON PURPOSE. The firmware returns it for
+#: anything it cannot express -- `ctv_get_cloud_not_ready` logs
+#: "UNKNOWN START REFUSE" and returns 299, i.e. wire 99. The app's enum
+#: does carry `Unknown` at index 71, confirmed. But the step FROM 99 TO
+#: 71 was never found in the app, and this table takes only what is
+#: read, not what is plausible. 99 therefore shows as `not_ready_99`,
+#: which is at least honest about being unknown.
+#:
+#: THREE WIRE VALUES FROM lewis ARE STILL UNNAMED: 25, 32 and 40 are in
+#: its table and absent from ruby's. Their meaning needs lewis'
+#: `CleaningResult` enum counted out -- the extra entry that shifts the
+#: keys sits between index 17 and 31.
+#:
+#: SOME STATES HAVE NO WIRE VALUE AT ALL. `LocalizationFailed`,
+#: `NotDocked`, `LidOpen`, `ChargeTimeout`, `NoPad` and `OtaUpdate` are
+#: in the app's enum and absent from the firmware's map. A robot that
+#: hits one reports **99** -- `UNKNOWN START REFUSE`, logged as such by
+#: `ctv_get_cloud_not_ready`.
+#:
+#: That matters for reading reports: @Thonno's start failed with error
+#: 224 "Smart Map localization failed", and `notReady` showed 68
+#: (LOADING_MAP) rather than a localisation state. Not a contradiction
+#: -- the firmware cannot express that one through this field.
+READINESS_WIRE_TO_INDEX: Final[dict[int, int]] = {
+    # Below 10 wire and index coincide; firmware-confirmed.
+    1: 1,    # CLIFFED            -> Cliff
+    2: 2,    # WHEEL_DROP_BOTH    -> Wheel drop both
+    3: 3,    # WHEEL_DROP_LEFT    -> Wheel drop left
+    4: 4,    # WHEEL_DROP_RIGHT   -> Wheel drop right
+    6: 6,    # MAIN_BRUSH_STALLED -> Brush stall
+    7: 7,    # BIN_NOT_PRESENT    -> No bin
+    10: 10,  # INSIDE_RCON            -> In rcon
+    15: 12,  # LOW_BATTERY            -> Insufficient charge
+    16: 13,  # BIN_FULL               -> Bin full
+    18: 15,  # UPGRADING_SOFTWARE     -> In cloud upgrade
+    21: 18,  # SAFETY_OFFLINE         -> Safety offline
+    22: 19,  # GYRO                   -> Gyro
+    24: 22,  # MAP_VERSION_MISMATCH   -> Map version mismatch
+    26: 26,  # POWER_OFFLINE          -> Power offline
+    28: 31,  # INVALID_CAL            -> Invalid cal
+    29: 32,  # INSIDE_HALO            -> In dock halo
+    31: 23,  # TANK_LOW               -> Tank low
+    34: 17,  # INVALID_PAD            -> Invalid pad
+    35: 33,  # PAD_DETECTION_TIMEOUT  -> Pad detection timeout
+    36: 34,  # EVAC_CLOGGED           -> Auto evacuation clogged
+    51: 38,  # CAMERA_DEAD            -> Dead camera
+    57: 39,  # BACKUP_REFUSED         -> Backup refused
+    72: 66,  # TANK_LEAKING           -> Tank leaking
+    # lewis-only, from its own table.
+    25: 25,  # BUMPER_OFFLINE         -> Bumper offline
+    32: 20,  # LID_OPEN               -> Lid open
+    # ------------------------------------------------------------------
+    # WHERE THE FAMILIES DIFFER, THEY ADD -- THEY DO NOT CONFLICT.
+    #
+    # Both firmwares carry a hardware-mismatch state, on different wire
+    # values under different names:
+    #
+    #     ruby   CSSC_HW_MISMATCH   -> wire 78, unknown to lewis
+    #     lewis  HARDWARE_MISMATCH  -> wire 40, unknown to ruby
+    #
+    # That looks like a contradiction and is not. A value-by-value
+    # comparison of the two tables shows every wire value present in
+    # BOTH means the same thing -- all 33 of them. The differences are
+    # values one family uses and the other never emits.
+    #
+    # Each family draws a subset of one shared value space. That is the
+    # opposite of a divergence, and it is why the table travels.
+    #
+    # 78 is mapped because ruby's name pins it to a known state. 40 was
+    # not, until the Classic app's own refusal table settled it (below):
+    # it is NewCleaningHead, not CleaningHeadHwMismatch.
+    78: 69,  # CSSC_HW_MISMATCH (ruby) -> Cleaning head hw mismatch
+    # THREE BATTERY CONSTANTS, THREE STATES (4.5.0). These three were
+    # collapsed onto `BatteryAuthError` because no closer state was known.
+    # The Classic app's own refusal table (`kCommonStartRefuseStates*`,
+    # libcore_jni.so of iRobot Home 7.18.0, keyed by the wire value) names
+    # them: 37 SMBusPermanentFailure, 38 ChargeTimeout -- which is what
+    # "replace the battery" and "remove the battery" were saying.
+    23: 29,  # BATTERY_AUTH_FAILED    -> Battery auth error
+    37: 35,  # CHARGING_REPLACE_BATT  -> SM bus permanent failure (app)
+    38: 36,  # CHARGING_REMOVE_BATT   -> Charge timeout (app)
+    # FROM THE CLASSIC APP'S REFUSAL TABLE (4.5.0): wire values this table
+    # showed as a bare number, each with the state the app files it
+    # under. 27 is the `PP_COMM` the note below hesitated over: the app
+    # says MobilityOffline.
+    14: 11,  # -> Invalid command
+    17: 14,  # -> Nav comms down
+    19: 16,  # -> Charging sleep
+    27: 30,  # PP_COMM -> Mobility offline
+    40: 27,  # HARDWARE_MISMATCH (lewis) -> New cleaning head
+    65: 61,  # -> Fleet disabled
+    73: 67,  # -> Robot fluid level sensor broken
+    74: 68,  # -> Tank fluid level sensor broken
+    271: 70,  # -> Dead floor type sensor
+    # WIRE 27 WAS DELIBERATELY ABSENT until 4.5.0: the firmware calls it
+    # `PP_COMM`, and "Peripheral Processor comms" is not obviously
+    # mobility. The app's own table confirms the bridge (above). Unmapped
+    # values still report their number, for the same reason it waited: a
+    # wrong label sends someone to the wrong hardware.
+    # Where the arithmetic breaks down entirely.
+    33: 21,  # BUMPED             -> Bumped
+    # `Saving map`, NOT the app's "Clean Map problem".
+    #
+    # The app frames it as a fault because it blocks a start. It is a
+    # normal step: @Thonno watched the sensor run
+    # `Saving map -> Downloading map -> Ready` on his i7+, which is a
+    # map lifecycle, not a problem followed by a recovery.
+    #
+    # That observation also confirms 39 and 68 as adjacent stages of
+    # one process, which is why "Off dock" for 68 read so wrongly.
+    39: 37,  # SAVING_MAP         -> Saving map
+    #
+    # 23, 39 and 68 have independent field support, from an archive
+    # rather than from the firmware (@AlakazipLabs, i3 on `daredevil`):
+    #
+    #   23  four appearances, each under half a second, every one
+    #       followed by `batInfo` being re-published -- the battery
+    #       identification step, not the "Lid open" the old formula
+    #       named. Their own correction of their own earlier report.
+    #   39  87 spells, all under 16 s, never mid-mission, always right
+    #       after a stop, a dock or a mission close, with 68 following
+    #       in 36 of them.
+    #   68  78 spells, 64 of them while docked and charging, usually
+    #       2-10 s after a spell of 39, never mid-mission.
+    #
+    # 39 THEN 68 IS ONE PROCESS. @Thonno watched his i7+ run
+    # `Saving map -> Downloading map -> Ready`, which is the same pair
+    # in the same order on a different firmware.
+    # The 62-68 block, four apart rather than three.
+    66: 62,  # RAAS_SUBSCRIPTION_ERROR -> Subscription expired
+    67: 63,  # VISION_BOARD_DEAD       -> Dead navigation board
+    68: 64,  # LOADING_MAP             -> Downloading map
+    69: 65,  # DRC_OFF_DOCK            -> Off dock
+}
+# Escalation thresholds for the map_retrain_workflow Repair Issue: WARNING
+# once notReady has read 68 (LOADING_MAP, shown as DownloadingMap)
+# continuously for this long -- 67 is VISION_BOARD_DEAD and was the wrong
+# value to watch (a
+# normal retrain
+# is usually done within a few minutes; this is a conservative first-pass
+# value, not derived from field data), ERROR if it's still set after the
+# longer threshold (genuinely stuck, not just slow).
+MAP_RETRAIN_WARN_MINUTES: Final[int] = 15
+MAP_RETRAIN_STUCK_MINUTES: Final[int] = 45
+
+# Human-readable phase labels (from rest980 — extended)
+
+# ── Error texts: whose words, for which robot (4.5.0) ────────────────────────
+#
+# THE ROBOT'S OWN APP SAYS WHAT HAPPENED. A Classic robot's code is looked
+# up in the Classic app's table (iRobot Home 7.18.0,
+# `roombapy_prime.vendor_errors_classic`), a Prime robot's in the Prime
+# app's (Roomba Home 3.2.0, `roombapy_prime.vendor_errors`).
+#
+# THIS ANSWERED EVERY ROBOT FROM THE PRIME TABLE UNTIL 4.5.0b2. The two apps
+# disagree on what some codes MEAN, not only on the words: 2 is "Main Brush
+# stuck" in Prime and the two rubber brushes in Classic (a j7 was told to
+# clean a part it does not have), 6 is "clean the cliff sensors" against
+# "stuck near a cliff", 47 and 228 an update against a reboot. Of the 71
+# codes both apps know, none has the same text in both, and of 16 codes in
+# both of iRobot's help catalogues all 16 point to different articles.
+# Prime is its own namespace (a20), and so is Classic.
+#
+# OURS ONLY WHERE THE APP SAYS NOTHING SPECIFIC. Of 110 texts written here,
+# 59 labels were the Classic app's own and most of the rest were worse (21,
+# 36, 453 were wrong). What stays are the battery and charging errors
+# 101-121: the Classic app shows "Charging error", "@val has a battery
+# error." or "Follow our step-by-step guide", while iRobot's help page for
+# the code says what is wrong -- and these texts say it too. The page
+# behind each is in OWN_ERROR_SOURCES. A new entry needs the same two
+# things: an app that says nothing specific, and a source that does.
+#
+# WHAT IS TO BE DONE is not here at all: a care task's guide
+# (care_guides.py) and iRobot's help article for the code and the robot's
+# model (parts_catalog.py, `help_url`).
+#
+# ARE THE NUMBERS THE SAME ON EVERY CLASSIC ROBOT? Firmware analysis of
+# ruby-0.7.12 (j9) found `CONSTANT_CLIFF` absent from its RECOVERABLE
+# literals while lewis (i7/i8) has it; if those literals were the enum,
+# `error: 5` would differ between an i7 and a j9. Not acted on: the field
+# matches across families (42 on a Braava jet m6, 46 on an i3), and the
+# Classic app ships ONE table for every Classic robot.
+
+#: OUR OWN TEXTS, English. Only where the robot's app says nothing specific
+#: and iRobot's help page for the code does (see the block above).
+#: Translations in error_translations.py.
+ERROR_CATALOGUE: Final[dict[int, dict[str, str]]] = {
+    101: {"label": "Battery not connected",     "description": "The battery is not detected.",                             "action": "Check that the battery is firmly seated. Contact support if needed."},
+    102: {"label": "Battery not charging",      "description": "A fault was detected and the battery is not charging.",    "action": "Take the battery out and put it back in. If the robot has been near liquid, check it for water damage. Contact iRobot support if the error persists."},
+    103: {"label": "Charging system fault",     "description": "The robot's charging system is not working correctly.",    "action": "Contact iRobot support."},
+    104: {"label": "No charge current",         "description": "No charging current is being received.",                  "action": "Check the home base power cable and outlet. Clean the charging contacts."},
+    105: {"label": "Charging current too low",  "description": "The charging current is below the expected level.",       "action": "Clean the charging contacts on the robot and home base."},
+    106: {"label": "Battery too warm",          "description": "The battery temperature is too high to charge.",          "action": "Move the robot to a cooler location and wait before charging."},
+    107: {"label": "Battery too cold",          "description": "The battery is too cold to charge.",                       "action": "Move the robot and its base to a room at normal room temperature (about 15–23 °C) and let it charge there."},
+    108: {"label": "Battery not charging",      "description": "The battery does not charge, usually because of its temperature or because it is not an original iRobot battery.", "action": "Charge the robot at room temperature and use an original iRobot battery."},
+    109: {"label": "Permanent battery fault",   "description": "The battery reports a fault that does not clear by itself.", "action": "Take the battery out for at least 15 minutes and put it back in. If the error returns, replace the battery."},
+    110: {"label": "Battery cell imbalance",    "description": "Battery cells are out of balance.",                       "action": "The battery needs to be replaced. Contact iRobot support."},
+    111: {"label": "Battery hardware fault",    "description": "The battery has a hardware fault.",                       "action": "Take the battery out for 15 minutes and put it back in. If the error returns, contact iRobot support about replacing the battery."},
+    114: {"label": "Internal battery failure",  "description": "An internal battery failure has been detected.",          "action": "Contact iRobot support for battery replacement."},
+    115: {"label": "Cell failure during charging", "description": "A battery cell failed during a charging cycle.",       "action": "Contact iRobot support for battery replacement."},
+    117: {"label": "Battery not recognised",    "description": "The robot does not recognise the battery as an original iRobot battery.", "action": "Use an original iRobot battery."},
+    119: {"label": "Charging timeout",          "description": "The charging cycle timed out.",                           "action": "Check the home base contacts and try restarting the charging cycle."},
+    120: {"label": "Battery not ready to charge", "description": "The battery reports a fault or is not ready to charge.", "action": "Take the battery out for 15 minutes, put it back and charge again."},
+    121: {"label": "Docked but not charging",   "description": "The robot is on its base but is not charging.",          "action": "Clean the charging contacts on the robot and on the base."},
+}
+
+#: Where each of our texts comes from: iRobot's help pages on
+#: prod-help-content.care.irobotapi.com, read 10.10.2026
+#: (claude/IROBOT_PFLEGE_ONLINEINHALTE.md §6, §7). "C" = the Classic page
+#: for the 980 ("Charging Error N-100"), "P" = the Prime page. A test
+#: holds every entry of ERROR_CATALOGUE to one.
+OWN_ERROR_SOURCES: Final[dict[int, str]] = {
+    101: "C 8978, P 10601",
+    102: "C 2436, P 10602",
+    103: "C 8980, P 10603",
+    104: "C 19560, P 10604",
+    105: "C 8981, P 10605",
+    106: "C 9945, P 10606",
+    107: "C 8983, P 10607",
+    108: "C 10803",
+    109: "C 8985, P 10609",
+    110: "P 10610",
+    111: "P 10611",
+    114: "P 10614",
+    115: "P 10615",
+    117: "P 10617",
+    119: "C 19562, P 10619",
+    120: "P 10620",
+    121: "C 26166, P 10622",
+}
+
+#: Where a text came from, as `source` on every entry.
+SOURCE_CLASSIC_APP: Final = "classic_app"
+SOURCE_PRIME_APP: Final = "prime_app"
+SOURCE_ROOMBA_PLUS: Final = "roomba_plus"
+
+
+def _short_language(language: str | None) -> str:
+    return str(language or "en").replace("_", "-").split("-")[0].lower() or "en"
+
+
+def _own_entry(code: int, language: str) -> dict[str, str]:
+    base = ERROR_CATALOGUE.get(code)
+    if base is None:
+        return {}
+    from .error_translations import ERROR_CATALOGUE_TRANSLATIONS
+
+    localised = ERROR_CATALOGUE_TRANSLATIONS.get(language, {}).get(code, {})
+    entry = {key: localised.get(key) or value for key, value in base.items()}
+    entry["source"] = SOURCE_ROOMBA_PLUS
+    return entry
+
+
+def _app_entry(found: Mapping[str, str] | None, source: str) -> dict[str, str]:
+    label = (found or {}).get("label") or (found or {}).get("title")
+    if not label:
+        return {}
+    entry = {"label": label, "source": source}
+    if (found or {}).get("content"):
+        entry["description"] = str((found or {})["content"])
+    return entry
+
+
+def get_localized_error_entry(
+    code: Any,
+    language: str | None,
+    *,
+    prime: bool,
+    sku: str | None = None,
+    clean_base: bool = False,
+    robot_name: str | None = None,
+) -> dict[str, str]:
+    """`label`, `description` (and `action` for our own) of an error code.
+
+    WHOSE TEXT, IN THIS ORDER:
+      Classic: ours (101-121) -> the Classic app's (`sku` picks the 69x and
+               Essential wordings, `clean_base` 36's) -> its dock text, for
+               a dock code in the error field (450-509, never observed) ->
+               the Prime app's.
+      Prime:   the Prime app's -> ours -> the Classic app's.
+    `source` says which. The other app answers only where the robot's own
+    has no entry: 110 codes on Prime (none of them 2, 6, 47, 106 or 228,
+    the numbers the two apps give different meanings, which Prime's own
+    app covers), 23 on Classic (Prime-only numbers: 283-290, 464,
+    670-672, 1025-1034, 3212, 3310, 4001-4004).
+
+    `@val` is the robot's name in iRobot's texts; `robot_name` is put in,
+    and without one "Roomba", the name the integration gives an unnamed
+    robot (diagnostics and the cloud's raw attributes have none).
+
+    A code nobody has a text for returns an empty dict, never a dict of
+    empty strings: callers fall back with `entry.get("label", f"Error
+    {code}")`, which only works when the key is absent.
+    """
+    try:
+        number = int(code)
+    except (TypeError, ValueError):
+        return {}
+    if number <= 0:
+        # 0 IS "NO ERROR". The Classic app has a text for it ("Error"), the
+        # status card's default line; shown as a label it would announce a
+        # fault on a robot that has none.
+        return {}
+    lang = _short_language(language)
+    if prime:
+        entry = (
+            _app_entry(vendor_error(number, lang), SOURCE_PRIME_APP)
+            or _own_entry(number, lang)
+            or _app_entry(classic_vendor_error(number, lang), SOURCE_CLASSIC_APP)
+        )
+    else:
+        entry = (
+            _own_entry(number, lang)
+            or _app_entry(
+                classic_vendor_error(number, lang, sku=sku, clean_base=clean_base),
+                SOURCE_CLASSIC_APP,
+            )
+            or _app_entry(classic_dock_text(number, lang), SOURCE_CLASSIC_APP)
+            or _app_entry(vendor_error(number, lang), SOURCE_PRIME_APP)
+        )
+    name = robot_name if isinstance(robot_name, str) and robot_name else "Roomba"
+    return {key: value.replace("@val", name) for key, value in entry.items()}
+
+
+def error_label(
+    code: Any,
+    *,
+    prime: bool,
+    sku: str | None = None,
+    clean_base: bool = False,
+    robot_name: str | None = None,
+) -> str | None:
+    """The English label of an error code, or None: for a sensor's state
+    and for diagnostics, where the text must not change with the UI
+    language."""
+    return get_localized_error_entry(
+        code, "en", prime=prime, sku=sku, clean_base=clean_base, robot_name=robot_name
+    ).get("label")
+
+
+def not_ready_entry(
+    raw: Any,
+    language: str | None,
+    *,
+    sku: str | None = None,
+    robot_name: str | None = None,
+) -> dict[str, str]:
+    """What the Classic app says to a refusal to start (4.5.0b4).
+
+    `raw` is `notReady` as the robot sends it: the app keys its texts by
+    that wire value, not by the index READINESS_STATE_LABELS uses. Only
+    for the attributes; the readiness state stays its slug. `label` is
+    the app's short line, `description` what it says to do. Empty for
+    0, for anything that is not a whole number, and for a value the app
+    has no text for.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+        return {}
+    text = classic_not_ready_text(raw, _short_language(language), sku=sku)
+    if not text:
+        return {}
+    name = robot_name if isinstance(robot_name, str) and robot_name else "Roomba"
+    return {
+        key: text[app].replace("@val", name)
+        for key, app in (("label", "label"), ("description", "content"))
+        if text.get(app)
+    }
+
+
+def not_ready_help_id(raw: Any) -> str | None:
+    """The help catalogue's key for a Classic refusal to start."""
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+        return None
+    help_id = classic_help_id(not_ready=raw)
+    return help_id if isinstance(help_id, str) else None
+
+
+def error_help_id(code: Any, *, prime: bool) -> str | None:
+    """The key iRobot's help catalogue files the error under: the Classic
+    and Prime catalogues number the charging errors differently."""
+    help_id = prime_help_id(code) if prime else classic_help_id(code)
+    return help_id if isinstance(help_id, str) else None
+
+
+#: Robot phase -> translation state key.
+#:
+#: LOWERCASE KEYS, because Home Assistant only accepts those under a
+#: `state` block -- `hmPostMsn` cannot be a translation key, `hmpostmsn`
+#: can. That constraint is why this sensor showed English to everyone
+#: for as long as it existed: Classic translated in code (one language)
+#: and Prime reported raw firmware words (no language).
+#:
+#: The VALUE the entity reports is the key here. Automations therefore
+#: match `charging`, not `charge` -- a break, taken deliberately while
+#: this is still alpha rather than after a stable release.
+#:
+#: `completed`, `cancelled`, `resume` and `recharge` appear in no
+#: diagnostics download this project has seen, and callbacks.py's own
+#: comment calls them "valid end states in some firmware variants".
+#: Kept, because three downloads from two robots cannot disprove a
+#: firmware variant -- but they are not offered on the Prime side,
+#: where the equivalent arrives as a mission RESULT and is already
+#: translated there.
+PHASE_LABELS: Final[dict[str, str]] = {
+    "new":           "new_mission",
+    "resume":        "resumed",
+    "recharge":      "recharging",
+    "completed":     "mission_completed",
+    "cancelled":     "cancelled",
+    "pause":         "paused",
+    "chargingerror": "base_unplugged",
+    "chgerr":        "base_unplugged",
+    "chargingError": "base_unplugged",
+    "charge":        "charging",
+    "run":           "running",
+    "evac":          "emptying_bin",
+    "stop":          "stopped",
+    "stuck":         "stuck",
+    "hmUsrDock":     "sent_home",
+    "hmUsrChrg":     "sent_to_charge",
+    "hmMidMsn":      "docking_mid_mission",
+    "hmPostMsn":     "returning_after_mission",
+    "mapUpd":        "updating_map",
+    # Second spelling seen in the vendor enum, like chgerr/chargingerror.
+    "mapupd":        "updating_map",
+    "refill":        "refilling_tank",
+    "padWash":       "washing_pad",
+    "padDry":        "drying_pad",
+    "stale":         "not_responding",
+    # PHASES THAT REACHED PHASE_TO_ACTIVITY BUT NEVER GOT A LABEL.
+    #
+    # A guard has required every mapped phase to have one for a long
+    # time; these fifteen were missing before this table was rewritten
+    # and only surfaced when the rewrite made the guard fail loudly.
+    # A phase the vacuum entity can map but the status sensor cannot
+    # name reads as `unknown` to the user.
+    # NOT mapped: an absent cleanMissionStatus and a robot genuinely
+    # between phases both arrive as "", and reporting idle for the
+    # first would claim knowledge we do not have.
+    "binFull":    "bin_full",
+    "disc":       "discovering",
+    "error":      "error",
+    "explore":    "exploring",
+    "kidnap":     "picked_up",
+    "oClean":     "spot_cleaning",
+    "plan":       "planning",
+    "polygon":    "cleaning_area",
+    "reloc":      "relocating",
+    "room":       "cleaning_room",
+    "tankEmpty":  "tank_empty",
+    "travel":     "travelling",
+    "traversal":  "traversing",
+    "zone":       "cleaning_zone",
+}
+
+#: DEFINED HERE AND READ BY NOTHING, for as long as it has existed.
+#:
+#: The orphan guard in tests/test_prime_setup.py catches private
+#: FUNCTIONS whose name appears once. This is a public CONSTANT, so it
+#: fell through the same shape one level over — see that guard's own
+#: constants half, added alongside this note.
+#:
+#: Kept rather than deleted: `cycle` is displayed nowhere today, but it
+#: is read in several places as a raw value, and a caller wanting to
+#: show it should not have to rebuild the table. Four values from
+#: `MissionCycle` were missing here too.
+CYCLE_LABELS: Final[dict[str, str]] = {
+    "clean": "Clean",
+    "quick": "Clean (quick)",
+    "spot": "Spot",
+    "evac": "Emptying",
+    "dock": "Docking",
+    "dockupg": "Docking for update",
+    "train": "Training",
+    "tidy": "Tidying",
+    "manual": "Manual",
+    "monitor": "Monitoring",
+    "none": "Ready",
+}
+
+#: The readiness states, by INDEX (see decode_not_ready). Names come
+#: from RobotReadinessState in the iRobot Home app, 73 entries.
+#:
+#: REPLACES a nine-entry table of which six were wrong. It read
+#: notReady as a bitmask and carried labels nobody could source:
+#: 2 as "Uneven ground" where the app says WheelDropBoth, 16 as
+#: "Bumped unexpectedly" where it says BinFull, 48 as "Path
+#: blocked" where it says SafetyFaultHardware.
+#:
+#: And 68 as "Updating map" -- the seed of the whole bitmask
+#: story, since 68 & 64 is true. The state that actually means
+#: the map is updating is wire 67, index 64, DownloadingMap.
+#: Wire 68 is OffDock.
+#:
+#: CONFIRMED IN THE FIELD (@Young9898, i3+, own capture pipeline).
+#: Two independent observations, neither compatible with "Updating map":
+#: 68 flashed during a docking sequence in exactly the moments the robot
+#: was off the dock between contact attempts, with no map update in
+#: progress; and a 40-second run of 68 after a reboot mid-floor, filed
+#: at the time as a boot transient, reads simply as a robot that was not
+#: on its dock.
+#:
+#: So the replacement table is not only better sourced than the nine
+#: guesses it replaced -- this entry is now field-verified behaviourally
+#: as well as read from the app.
+#:
+#: Names are transliterated, not translated: "Wheel drop both"
+#: rather than an invented phrase. Less fluent than the old
+#: labels and traceable to a source, which the old ones were not.
+READINESS_STATE_LABELS: Final[dict[int, str]] = {
+    0: 'None',
+    1: 'Cliff',
+    2: 'Wheel drop both',
+    3: 'Wheel drop left',
+    4: 'Wheel drop right',
+    5: 'Final docking',
+    6: 'Brush stall',
+    7: 'No bin',
+    8: 'Nav crash',
+    9: 'Misconfigured',
+    10: 'In rcon',
+    11: 'Invalid command',
+    12: 'Insufficient charge',
+    13: 'Bin full',
+    14: 'Nav comms down',
+    15: 'In cloud upgrade',
+    16: 'Charging sleep',
+    17: 'Invalid pad',
+    18: 'Safety offline',
+    19: 'Gyro',
+    20: 'Lid open',
+    21: 'Bumped',
+    22: 'Map version mismatch',
+    23: 'Tank low',
+    24: 'No pad',
+    25: 'Bumper offline',
+    26: 'Power offline',
+    27: 'New cleaning head',
+    28: 'Schedule no clock',
+    29: 'Battery auth error',
+    30: 'Mobility offline',
+    31: 'Invalid cal',
+    32: 'In dock halo',
+    33: 'Pad detection timeout',
+    34: 'Auto evacuation clogged',
+    35: 'SM bus permanent failure',
+    # 36 -- FIELD BEHAVIOUR DOES NOT OBVIOUSLY MATCH THIS NAME.
+    # @AlakazipLabs inventoried 65 occurrences of wire 39 over two weeks
+    # on an i3+: 44 on a docked, charging, healthy-battery robot, 17
+    # briefly after stop commands, 4 mid-evacuation. Always transient,
+    # always self-clearing, present from day one before any command was
+    # sent.
+    #
+    # The name comes from `RobotReadinessState` in the app and stays --
+    # a vendor enum outranks one robot's behaviour, and "charge timeout"
+    # may describe an internal condition that is benign in most
+    # contexts. Recorded so nobody reads the label as a fault and goes
+    # looking for a charging problem that is not there.
+    36: 'Charge timeout',
+    37: 'Saving map',
+    38: 'Dead camera',
+    39: 'Backup refused',
+    40: 'Safety fault confinement',
+    41: 'Safety fault tilt',
+    42: 'Safety fault rollover',
+    43: 'Safety fault lift',
+    44: 'Safety fault emergency stop',
+    45: 'Safety fault hardware',
+    46: 'Safety fault unknown',
+    47: 'Safety fault handle lift',
+    48: 'Localization failed',
+    49: 'Low beacon count',
+    50: 'Precheck refused',
+    51: 'Safety fault drive stall left',
+    52: 'Safety fault drive stall right',
+    53: 'Not docked',
+    54: 'Bridge not confined',
+    55: 'Bridge does not reach dock',
+    56: 'Bridge does not reach yard',
+    57: 'Wheel motor overtemp',
+    58: 'Wheel motor undertemp',
+    59: 'Blade motor overtemp',
+    60: 'Blade motor undertemp',
+    61: 'Fleet disabled',
+    62: 'Subscription expired',
+    63: 'Dead navigation board',
+    64: 'Downloading map',
+    65: 'Off dock',
+    66: 'Tank leaking',
+    67: 'Robot fluid level sensor broken',
+    68: 'Tank fluid level sensor broken',
+    69: 'Cleaning head hw mismatch',
+    70: 'Dead floor type sensor',
+    71: 'Unknown',
+    72: 'Ota update',
+}
+
+BIN_LABELS: Final[dict[bool, str]] = {True: "Full", False: "Not full"}
+
+YES_NO_LABELS: Final[dict[bool, str]] = {True: "Yes", False: "No"}
+
+
+JOB_INITIATOR_LABELS: Final[dict[str, str]] = {
+    # A SCHEDULED MISSION MAY NOT REPORT `schedule`. @chairstacker's
+    # scheduled run shows "Cloud" in the iRobot app's own timeline, so
+    # his robot sends `cloud` for it -- and `schedule` may be a value
+    # this account never produces.
+    #
+    # NOT RELABELLED. Renaming `cloud` to "Schedule" on one household's
+    # evidence is exactly the mistake `pwReturn`'s standard/medium/high
+    # labels were: a plausible reading of one observation, written down
+    # as fact, believed by a tester. `cloud` means the cloud started it,
+    # which is true whether or not a schedule was behind it.
+    #
+    # What would settle it: a robot that reports `schedule` for
+    # anything. Nobody has seen one.
+    "schedule": "iRobot schedule",
+    "rmtApp": "iRobot app",
+    "manual": "Robot",
+    "localApp": "Home Assistant",
+    "demand": "Demand clean",  # v3.4.3 — found while building demand_clean_alert
+    # blueprint: DirtThresholdManager/callbacks.py's MS1 override writes
+    # initiator="demand" (confirmed real, not hypothetical — see both
+    # sites), but this dict had no mapping for it, silently falling
+    # through to the "none" default below. A demand-triggered mission was
+    # therefore indistinguishable from "no initiator info at all" on this
+    # sensor — same value, "None", for two different real situations.
+    "none": "None",
+    # NINETEEN MORE FROM THE VENDOR'S OWN ENUM, and the comment above
+    # says exactly what their absence cost: an unmapped value falls
+    # through to "None", which is the same answer as "no initiator
+    # information at all". `demand` was found that way, one value at a
+    # time, by someone building a blueprint.
+    #
+    # `Initiator` (app 3.0.0) lists 25. This dict had six.
+    #
+    # THE VOICE ASSISTANTS ARE THE POINT. "Why did the robot start?" is
+    # a question people ask, and a household with a schedule AND an
+    # Alexa routine could not tell the two apart. `dockBtn` and `manual`
+    # are the other pair worth separating -- one is the button on the
+    # dock, the other the button on the robot.
+    "dockBtn": "Dock button",
+    "alexa": "Alexa",
+    "siri": "Siri",
+    # GOOGLE SINCE 4.3.4. App 3.0.0's `Initiator` carried this member's
+    # value as an unresolved constant, so roombapy-prime left it out
+    # until 0.6.0 resolved it from app 3.2.0 -- and this table, checked
+    # against the library's enum, followed.
+    "google": "Google",
+    "ifttt": "IFTTT",
+    "iftttc": "IFTTT",
+    "homey": "Homey",
+    "openHAB": "openHAB",
+    "yonomi": "Yonomi",
+    "bosch": "Bosch",
+    "swisscom": "Swisscom",
+    "alismart": "AliSmart",
+    "team": "Teamed robot",
+    # OBSERVED FOR A SCHEDULED MISSION (@chairstacker, app timeline).
+    # Whether every scheduled run reports this, and whether anything
+    # else does, is unestablished.
+    "cloud": "iRobot cloud",
+    "rmtAuto": "iRobot automation",
+    "loclAuto": "Local automation",
+    "simAuto": "Simulated automation",
+    "wifi": "Wi-Fi",
+    "shell": "Shell",
+    "internal": "Robot (internal)",
+    "unknown": "Unknown",
+}
+
+
+#: `detectedPad` wire values.
+#:
+#: TWO SPELLINGS FOR ONE VALUE, and it is the vendor's own inconsistency
+#: rather than a transcription slip: their sample robot states report
+#: `reusablewet` for the Braava jet m6 and `reusableWet` for another
+#: platform. Only the camelCase form was here, so a Braava showed
+#: "Unknown" for a fitted wet pad.
+#:
+#: Found by running these gates against iRobot's own simulator data.
+#: No tester could have found it -- it needs two robots that differ only
+#: in how a string was capitalised, and nobody owns both.
+#:
+#: `padPlate` and `noPad` come from the same source and were missing
+#: outright. They are the CARRIER PLATE, not a cloth: a bare plate
+#: clicked in reads `padPlate`, established by one robot reading `noPad`
+#: and then `padPlate` with nothing but the plastic plate refitted
+#: (@utkjmitch). The labels say plate for that reason.
+PAD_LABELS: Final[dict[str, str]] = {
+    "reusableDry": "Dry (reusable)",
+    "reusableWet": "Wet (reusable)",
+    "reusablewet": "Wet (reusable)",
+    "dispDry": "Dry (disposable)",
+    "dispWet": "Wet (disposable)",
+    "padPlate": "Plate fitted",
+    "noPad": "No plate",
+    "invalid": "No pad",
+}
+
+CARPET_BOOST_LABELS: Final[dict[str, str]] = {
+    "auto": "Auto",
+    "performance": "Performance",
+    "eco": "Eco",
+    "n-a": "Not available",
+}
+
+CLEAN_MODE_LABELS: Final[dict[str, str]] = {
+    "auto": "Auto",
+    "one": "One pass",
+    "two": "Two passes",
+    "n-a": "Not available",
+}
+
+#: `dock.state` of a Classic Clean Base. 304, 354, 355 and 365 added in
+#: 4.5.0 from the Classic app's dock states (`evac_dock_status_<N>`,
+#: iRobot Home 7.18.0): stopping, a problem with the base (its history
+#: says "Motor problem"), bag getting full, hardware issue. 364 is in no
+#: iRobot app and its source is not recorded; kept until shown wrong, as
+#: it harms nothing (decided 19.10.2026).
+CLEAN_BASE_STATUS_SLUGS: Final[dict[int, str]] = {
+    -2: "not_available",
+    -1: "unknown",
+    300: "ready",
+    301: "ready",
+    302: "empty",
+    303: "empty",
+    304: "stopping",
+    350: "bag_missing",
+    351: "clogged",
+    352: "sealing_problem",
+    353: "bag_full",
+    354: "motor_problem",
+    355: "bag_almost_full",
+    360: "ir_comms_problem",
+    364: "bin_full_sensors_not_cleared",
+    365: "hardware_issue",
+}
+
+JOB_INITIATOR_SLUGS: Final[dict[str, str]] = {
+    "schedule": "schedule",
+    "rmtApp": "remote_app",
+    "manual": "manual",
+    "localApp": "local_app",
+    "demand": "demand",
+    "none": "none",
+    "dockBtn": "dock_button",
+    "alexa": "alexa",
+    "siri": "siri",
+    "ifttt": "ifttt",
+    "iftttc": "ifttt",
+    "homey": "homey",
+    "openHAB": "openhab",
+    "yonomi": "yonomi",
+    "bosch": "bosch",
+    "swisscom": "swisscom",
+    "alismart": "alismart",
+    "team": "teamed_robot",
+    "cloud": "cloud",
+    "rmtAuto": "remote_automation",
+    "loclAuto": "local_automation",
+    "simAuto": "simulated_automation",
+    "wifi": "wifi",
+    "shell": "shell",
+    "internal": "internal",
+    "unknown": "unknown",
+}
+
+MOP_PAD_SLUGS: Final[dict[str, str]] = {
+    "reusableDry": "reusable_dry",
+    "reusableWet": "reusable_wet",
+    "reusablewet": "reusable_wet",
+    "dispDry": "disposable_dry",
+    "dispWet": "disposable_wet",
+    "padPlate": "plate_fitted",
+    "noPad": "no_plate",
+    "invalid": "no_pad",
+}
+
+MOP_BEHAVIOR_SLUGS: Final[dict[int, str]] = {
+    15: "no_mop",
+    25: "extended",
+    67: "standard",
+    85: "deep",
+}
+
+CARPET_BOOST_SLUGS: Final[dict[str, str]] = {
+    "auto": "auto",
+    "performance": "performance",
+    "eco": "eco",
+    "n-a": "not_available",
+}
+
+CLEAN_MODE_SLUGS: Final[dict[str, str]] = {
+    "auto": "auto",
+    "one": "one_pass",
+    "two": "two_passes",
+    "n-a": "not_available",
+}
+
+# ── Attributes ────────────────────────────────────────────────────────────────
+ATTR_STATUS: Final = "status"
+ATTR_CLEANING_TIME: Final = "cleaning_time"
+ATTR_CLEANED_AREA: Final = "cleaned_area"
+ATTR_ERROR: Final = "error"
+ATTR_ERROR_CODE: Final = "error_code"
+ATTR_POSITION: Final = "position"
+ATTR_SOFTWARE_VERSION: Final = "software_version"
+ATTR_BIN_FULL: Final = "bin_full"
+ATTR_BIN_PRESENT: Final = "bin_present"
+
+# Braava / mop attributes
+ATTR_DETECTED_PAD: Final = "detected_pad"
+ATTR_LID_CLOSED: Final = "lid_closed"
+ATTR_TANK_PRESENT: Final = "tank_present"
+ATTR_TANK_LEVEL: Final = "tank_level"
+ATTR_PAD_WETNESS: Final = "spray_amount"
+
+# Fan speed labels for carpet-boost models
+# v3.1.0 CARPET-BOOST-SLUG-FIX — lowercase slugs required by HA's select
+# translation_key convention (hassfest enforces [a-z0-9-_]+ on state keys).
+# Previously "Automatic"/"Eco"/"Performance" (Capital-Case) were both the
+# select's option/state value AND directly displayed — that's how the
+# select worked before translation_key was added, but it fails hassfest
+# validation. select.py's _select_carpet_boost() accepts the old Capital-Case
+# values too (case-insensitive match) so existing automations using
+# select.select_option with "Automatic" keep working — only the *displayed*
+# state value and the slugs in strings.json/translations changed.
+FAN_SPEED_AUTOMATIC: Final = "automatic"
+FAN_SPEED_ECO: Final = "eco"
+FAN_SPEED_PERFORMANCE: Final = "performance"
+FAN_SPEEDS: Final[list[str]] = [FAN_SPEED_AUTOMATIC, FAN_SPEED_ECO, FAN_SPEED_PERFORMANCE]
+
+# Braava mop overlap constants
+OVERLAP_STANDARD: Final = 67
+OVERLAP_DEEP: Final = 85
+OVERLAP_EXTENDED: Final = 25
+MOP_STANDARD: Final = "Standard"
+MOP_DEEP: Final = "Deep"
+MOP_EXTENDED: Final = "Extended"
+BRAAVA_MOP_BEHAVIORS: Final[list[str]] = [MOP_STANDARD, MOP_DEEP, MOP_EXTENDED]
+BRAAVA_SPRAY_AMOUNT: Final[list[int]] = [1, 2, 3]
+
+# ── Diagnostics ───────────────────────────────────────────────────────────────
+DIAG_REDACT_KEYS: Final[set[str]] = {
+    CONF_BLID,
+    # The robot's address (4.4.0): diagnostics carry no address, and the
+    # config entry's `host` went out as entered (@frnchfrgg's upload).
+    "host",
+    "password",
+    "blid",
+    "irobot_password",
+    "irobot_username",
+}
+
+# ── Capability detection ───────────────────────────────────────────────────────
+def has_carpet_boost(state: dict[str, Any]) -> bool:
+    """Return True if this robot supports carpet boost / fan speed control.
+
+    THE CAPABILITY BLOCK DECIDES, NOT THE KEYS (4.2.15). `carpetBoost`
+    and `vacHigh` are reported by robots that have no carpet boost and
+    ignore a write to them:
+
+      - @azrael-229's i7 (lewis 22.52.10): the select was offered, every
+        change snapped back to eco, nothing was logged
+      - @AlakazipLabs' i3 (daredevil 2.6.0): both keys "silently
+        dropped", measured on the wire (see switch.py)
+      - iRobot's own sample states (tests/fixtures): `carpetBoost` is
+        present on the i7, j7, j9 and even the Braava m6, and
+        `cap.carpetBoost` is 1 only on the s9
+
+    Until 4.2.14 the keys alone were enough whenever `cap` did not
+    mention carpet boost -- which is exactly the case on all of those.
+    Now a robot that reports a capability block needs
+    `cap.carpetBoost == 1`, as the 980 in our captures and the s9 have.
+    Only a robot with no capability block at all (firmware older than
+    capability reporting) still falls back to the keys: nothing says
+    those robots lack it.
+    """
+    cap = state.get("cap")
+    if isinstance(cap, dict) and cap:
+        return cap.get("carpetBoost") == 1
+    return "carpetBoost" in state and "vacHigh" in state
+
+
+def has_pose(state: dict[str, Any]) -> bool:
+    """Return True if this robot CLAIMS to report pose data.
+
+    NOT THE SAME AS REPORTING IT. `cap.pose` is a declaration, and on
+    two separate firmware families it is false:
+
+      - an i7 on **lewis** reports 2 and sends no position
+        (@pk-1966 — cost three weeks, because everything downstream
+        looked correctly gated)
+      - an S9+ on **soho** reports 2 with `position: null` and
+        `point_count: 0` after months of missions (@ScenicSystemsLLC)
+
+    Two families, so it is not a lewis quirk. Anything that needs an
+    actual position must check for one -- `state.get("pose") is not
+    None` -- rather than trusting this.
+
+    CONSTANT ON LEWIS. The firmware sets `cap.pose` to a fixed 2 there,
+    so it carries no information about whether that robot publishes a
+    position -- the perfect split observed across seven robots
+    (1 = reports, 2 = does not) is a correlation with model generation,
+    not a cause.
+
+    Where it is still used, it is standing in for "not a 600-series",
+    which it does correctly because the constant differs by generation.
+    Those call sites are commented as such.
+
+    For "does a position actually exist", use `reports_local_pose()`.
+    """
+    return bool((state.get("cap") or {}).get("pose", 0) >= 1)
+
+
+#: Mission initiators that mean the robot was started from its own
+#: buttons. Such a start names no rooms: the buttons cannot pick any.
+ROBOT_SIDE_INITIATORS: Final[frozenset[str]] = frozenset({"manual", "dockBtn"})
+
+
+#: Commands given inside a running mission (4.3.5). The robot reports
+#: each as its `lastCommand`, which then names none of the mission's
+#: rooms: an S9+ sent `skip` during a two-room mission showed no planned
+#: rooms and no destination for the rest of it. The command that started
+#: the mission still describes it (RoombaData.mission_command). `stop`
+#: and `dock` are not here: a dock from idle is a mission of its own.
+IN_MISSION_COMMANDS: Final[frozenset[str]] = frozenset({"pause", "resume", "skip"})
+
+
+def mission_command(last_command: Any, held: Any = None) -> Any:
+    """The command behind the running mission: `lastCommand`, or, when
+    that is one given inside the mission (IN_MISSION_COMMANDS), the
+    command before it, `held`. Without `held` (Home Assistant restarted
+    since the start), `lastCommand` as it is.
+    """
+    command = last_command if isinstance(last_command, dict) else {}
+    if command.get("command") in IN_MISSION_COMMANDS and isinstance(held, dict):
+        return held
+    return last_command
+
+
+def mission_command_regions(
+    mission: Any, last_command: Any, held: Any = None
+) -> list[Any]:
+    """The regions of the command behind the running mission, as far as
+    `lastCommand` can say -- empty for a start from the robot's buttons.
+
+    `lastCommand` IS THE ROBOT'S LAST COMMAND, NOT THE MISSION'S. A
+    mission started with the robot's CLEAN button names no rooms, yet
+    `lastCommand` can still hold the room or zone command that came
+    before it, either because the robot reports the running mission
+    before its new last command or because a button start is not a
+    command at all. @Hardy-196's 44-minute run from the button was
+    recorded as his zone "Couch", the zone command Roomba+ had sent
+    earlier (4.3.4).
+
+    The mission says who started it: `manual` and `dockBtn` are the
+    robot's own buttons (Roomba+ reports `localApp` on the same
+    firmware, the app `rmtApp`). Such a mission takes no regions from
+    `lastCommand`. Every other start is read as before.
+
+    A pause, resume or skip since the start is passed over for the
+    command before it, `held` (mission_command, 4.3.5).
+    """
+    mission = mission if isinstance(mission, dict) else {}
+    if mission.get("initiator") in ROBOT_SIDE_INITIATORS:
+        return []
+    command = mission_command(last_command, held)
+    command = command if isinstance(command, dict) else {}
+    regions = command.get("regions")
+    return list(regions) if isinstance(regions, list) else []
+
+
+#: What a mission was asked to clean (4.3.4): named rooms or zones, or
+#: everything. Recorded with each mission and shown on the vacuum, so a
+#: mission without rooms reads as the whole home rather than as a blank.
+MISSION_SCOPE_ROOMS: Final = "rooms"
+MISSION_SCOPE_WHOLE_HOME: Final = "whole_home"
+
+
+def mission_scope(
+    can_target_rooms: bool, mission: Any, last_command: Any, held: Any = None
+) -> str:
+    """`rooms` when the running mission was sent to rooms or zones,
+    `whole_home` otherwise.
+
+    A robot that cannot target rooms (900- and 600-series) always cleans
+    the whole home. A Smart Map robot's mission is a room mission when its
+    own `cmd` names regions, or `lastCommand` does and may belong to it
+    (mission_command_regions).
+    """
+    if not can_target_rooms:
+        return MISSION_SCOPE_WHOLE_HOME
+    mission = mission if isinstance(mission, dict) else {}
+    own = (mission.get("cmd") or {}) if isinstance(mission.get("cmd"), dict) else {}
+    if own.get("regions") or mission_command_regions(mission, last_command, held):
+        return MISSION_SCOPE_ROOMS
+    return MISSION_SCOPE_WHOLE_HOME
+
+
+def reports_local_pose(state: dict[str, Any]) -> bool:
+    """Return True if this robot is actually publishing a position.
+
+    THE ONE THAT ANSWERS THE QUESTION. `has_pose()` reads a declaration
+    that is a compile-time constant on lewis firmware; this reads what
+    arrived.
+
+    Local only, and deliberately: a Classic robot either publishes
+    `pose` into its own MQTT shadow or it does not. The cloud live-map
+    stream is a Prime path -- `/v1/p2maps/livemap` answers HTTP 400
+    "This robot doesn't support P2Maps" for Classic robots, measured on
+    three of them (@AlakazipLabs) -- and the cloud coverage fallback is
+    a last-mission render, not a live position.
+
+    AND IT IS NOT THE WHOLE PICTURE. Newer Classic generations do not
+    carry position in the shadow at all: they answer when asked (rrtp,
+    topic `req`, reply on `data`, metres and radians from the dock).
+    lewis answers (an i7+, two S9+), and a Braava jet m6 (sanmarino)
+    answers without a fix. daredevil does NOT, as far as anything on
+    record shows: an i3 on 2.6.0 (@AlakazipLabs) met silence on six topic
+    names, `req` among them, and later on `req` alone at 1 Hz through a
+    51-minute driving spell -- 2,875 requests, no reply, link held.
+
+    CORRECTED. This said roombapy 2.0 "later got positions from
+    daredevil". That traced to roombapy's rrtp module docstring, which
+    lists daredevil (i3) among the confirmed families -- with no capture,
+    fixture or tester behind it, and a robot count ("four") that only
+    adds up without it. `live_position.py` uses the request for the live
+    map and gives up after three unanswered requests per mission, which
+    is what it will do on this i3.
+
+    So a robot returning False here is behaving correctly and may still
+    have a position available on request. This function answers "is there
+    a pose in the shadow", which is the right gate for everything built
+    on the shadow -- it is not an answer to "does this robot know where
+    it is".
+    """
+    return state.get("pose") is not None
+
+
+#: How far a Prime robot's runtime may run ahead of its powered-on hours
+#: before it is not believed (prime_runtime_hours).
+RUNTIME_SLACK_HOURS: Final = 24
+#: Ten years without a break: the bound when no powered-on hours are known.
+RUNTIME_CEILING_HOURS: Final = 24 * 365 * 10
+
+
+def prime_runtime_hours(shadows: Any) -> tuple[int | None, str | None]:
+    """A Prime robot's runtime hours, and why they are not believed.
+
+    From `ro-currentstate.runtimeStats.hr`, the meter the *Lifetime
+    runtime* sensor shows. The Classic app reads it as runtime hours
+    with `min` the minutes left over (APK research, 21 Oct 2026); the
+    Prime app never shows it.
+
+    A ROBOT CANNOT HAVE CLEANED LONGER THAN IT WAS SWITCHED ON
+    (4.5.0b4, @jdmasuta: `hr` 497874 on a Roomba Plus 410 Combo beside
+    `bbsys.hr` 476). `ro-stats.bbsys.hr`, the powered-on hours, bounds
+    it with a day's slack, since the two come in different shadows; ten
+    years without `ro-stats`.
+
+    Returns (hours, None) for a value that holds, (hours, reason) for
+    one that does not, and (None, None) when there is none.
+    """
+    if not isinstance(shadows, Mapping):
+        return None, None
+    current = shadows.get("ro-currentstate")
+    runtime = current.get("runtimeStats") if isinstance(current, Mapping) else None
+    hours = runtime.get("hr") if isinstance(runtime, Mapping) else None
+    if isinstance(hours, bool) or not isinstance(hours, (int, float)):
+        return None, None
+    hours = int(hours)
+    if hours < 0:
+        return hours, "negative"
+    stats = shadows.get("ro-stats")
+    bbsys = stats.get("bbsys") if isinstance(stats, Mapping) else None
+    powered = bbsys.get("hr") if isinstance(bbsys, Mapping) else None
+    if (
+        isinstance(powered, (int, float)) and not isinstance(powered, bool)
+        and hours > int(powered) + RUNTIME_SLACK_HOURS
+    ):
+        return hours, "longer_than_powered_on"
+    if hours > RUNTIME_CEILING_HOURS:
+        return hours, "longer_than_ten_years"
+    return hours, None
+
+
+def lifetime_hours(state: Mapping[str, Any]) -> int:
+    """The robot's lifetime runtime hours, from whichever key carries them.
+
+    A 900-series reports them in `bbrun.hr`; an i/s/j-series in
+    `runtimeStats.hr`. `IRobotEntity.run_stats` merges the two with
+    `runtimeStats` winning, and the maintenance sensors compute with that.
+    Every reset, seed and due check must read the SAME number, or the
+    baseline and the reading are on different meters.
+
+    THEY WERE NOT. The reset buttons, the to-do list, the due check and
+    the cloud hydration read `bbrun.hr` alone. On a j7+ and a j9+
+    (@msva17) that is 0, so a filter reset recorded a baseline of 0 hours
+    and the sensor, reading the real lifetime, dropped from 46 to 0 the
+    moment the button was pressed -- and the due check, on its meter of
+    0, never found anything due at all.
+
+    Null-safe: `dict.get(key, default)` does not cover an explicit null.
+    """
+    for key in ("runtimeStats", "bbrun"):
+        block = state.get(key)
+        if not isinstance(block, Mapping):
+            continue
+        value = block.get("hr")
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            hours = int(value)
+        except (TypeError, ValueError):
+            continue
+        if hours > 0:
+            return hours
+    return 0
+
+
+def has_smart_map(state: dict[str, Any]) -> bool:
+    """Return True if this robot has persistent smart maps (pmaps)."""
+    return bool(state.get("pmaps"))
+
+
+def is_mop(state: dict[str, Any]) -> bool:
+    """True if this robot can mop -- it reports a pad field.
+
+    ANSWERS "CAN IT MOP", AND WAS BEING USED TO ASK "HAS IT NO BRUSHES".
+    On a Braava those coincide, which is why thirteen brush and bin gates
+    were written as `not is_mop(state)` and nobody noticed. On a Combo
+    they do not: it has a pad AND brushes, so it would have lost its
+    brush maintenance sensors and gained pad ones.
+
+    Use is_braava() for anything about vacuum hardware. This stays for
+    what its name says: pad-related entities.
+    """
+    return "detectedPad" in state
+
+
+def is_braava(state: dict[str, Any]) -> bool:
+    """True for a Braava -- a mop with no vacuum hardware at all.
+
+    DECIDED BY SKU PREFIX, not by a capability flag. Two candidates were
+    weighed:
+
+      cap.binFullDetect  absent on san_marino (Braava m6) and present on
+                         every other platform in iRobot's own sample
+                         responses -- but it can also be absent simply
+                         because a robot's firmware does not report the
+                         flag, and that would strip the brush sensors
+                         off a working i7.
+      SKU prefix "m"     cannot go missing on a robot that has a SKU, and
+                         this project already routes profiles through
+                         get_robot_profile() the same way. iRobot's own
+                         app resolves per-SKU overrides on a three-letter
+                         prefix.
+
+    The failure modes decided it: a wrong capability read costs a working
+    robot its sensors, a missing SKU falls back to the old behaviour and
+    costs nothing.
+
+    WHY NO TESTER FOUND THIS. Every field robot sits cleanly on one side
+    -- Braava m6, i-series, s9, 900-series. The confusion needs a Classic
+    Combo (SKU prefixes c3/c7, confirmed present in the app's own SKU
+    list), and nobody in the group owns one.
+    """
+    sku = state.get("sku")
+    if not isinstance(sku, str) or not sku:
+        # No SKU: fall back to the old reading rather than guess. On a
+        # Braava that is still correct, and on anything else it is no
+        # worse than before this function existed.
+        return is_mop(state)
+    return sku[0].lower() == "m"
+
+
+#: `dock.state` values of a Clean Base: the 300s, as in
+#: CLEAN_BASE_STATUS_SLUGS (ready 300/301, emptying, bag and sensor
+#: faults up to 365).
+_CLEAN_BASE_STATES: Final = range(300, 400)
+
+
+def has_clean_base(state: dict[str, Any]) -> bool:
+    """Return True if a Clean Base dock is present and communicating.
+
+    A PLAIN CHARGING DOCK ALSO SENDS AN INTEGER `dock.state` (#249): a
+    small charge state, no `fwVer`, and `clean_base_status` reading it
+    as unknown. Any integer counted as a Clean Base, so such a robot got
+    the Clean Base sensors and a bag reported due every ~29 hours of
+    runtime for a bag it does not have. A Clean Base reports its state
+    in the 300s, which is what the status sensor reads too; the two now
+    agree.
+    """
+    dock = state.get("dock") or {}
+    dock_state = dock.get("state")
+    return "fwVer" in dock or (
+        isinstance(dock_state, int)
+        and not isinstance(dock_state, bool)
+        and dock_state in _CLEAN_BASE_STATES
+    )
+
+
+def active_charge_cycles(bbchg3: dict[str, Any]) -> int | None:
+    """v2.9.0 DAILY-DIGEST — chemistry-aware lifetime charge-cycle count.
+
+    Extracted from sensor.py's _total_energy_consumed_kwh()/
+    _estimated_battery_eol() duplication (third call site — callbacks.py
+    needed the same logic at mission end — made this the moment to share
+    one implementation instead of adding a third copy).
+
+    Same heuristic as sensor.py: nNimhChrg > 0 means a NiMH aftermarket
+    battery is currently installed (even if nLithChrg > 0 from an earlier
+    OEM Li-ion period) — NiMH wins when present. Falls back to nLithChrg,
+    then nAvail for older firmware that predates the chemistry split.
+    Returns None when bbchg3 has none of these fields at all.
+    """
+    nimh_cycles = bbchg3.get("nNimhChrg") or 0
+    if nimh_cycles > 0:
+        return int(nimh_cycles)
+    cycles = bbchg3.get("nLithChrg") or bbchg3.get("nAvail")
+    return int(cycles) if cycles else None
+
+
+def estcap_to_mah(
+    raw_estcap: float | int | None,
+    estcap_scale_liion: float,
+    estcap_scale_nimh: float,
+    nimh_cycles: int | None,
+) -> float | None:
+    """v3.1.0 L9-BATTERY — chemistry-aware raw estCap → mAh conversion.
+
+    Extracted from sensor.py's _estcap_to_mah() (which is bound to an
+    IRobotEntity and reads robot_profile off it) so callbacks.py can record
+    estCap observations into RobotProfileStore's noise-floor baseline at
+    mission end without needing the full entity wrapper — same
+    extract-on-third-call-site reasoning as active_charge_cycles() above.
+
+    For i/s/j/e/6 series (both scales == 1.0): raw estCap == mAh directly.
+    For 9-series old firmware: raw estCap is BMS-scaled.
+      Li-ion (scale != 1.0, no NiMH cycles recorded): raw ÷ estcap_scale_liion
+      NiMH   (nimh_cycles > 0): raw ÷ estcap_scale_nimh
+    Returns None when raw_estcap is absent or zero.
+    """
+    if not raw_estcap:
+        return None
+    if estcap_scale_liion == 1.0 and estcap_scale_nimh == 1.0:
+        return float(raw_estcap)
+    scale = estcap_scale_nimh if (nimh_cycles or 0) > 0 else estcap_scale_liion
+    return round(float(raw_estcap) / scale)
+
+# ── F7g — Region type icons ───────────────────────────────────────────────────
+# Single source of truth for MDI icon names per iRobot region_type string.
+# Used by CloudSmartZoneSelect.icon and by the companion Lovelace card
+# (exposed via the region_icons extra_state_attribute).
+
+REGION_TYPE_ICONS: Final[dict[str, str]] = {
+    "bathroom":          "mdi:shower",
+    "bedroom":           "mdi:bed-king",
+    "breakfast_room":    "mdi:silverware-fork-knife",
+    "closet":            "mdi:hanger",
+    "den":               "mdi:sofa-single",
+    "dining_room":       "mdi:silverware-fork-knife",
+    "entryway":          "mdi:door-open",
+    "family_room":       "mdi:sofa-single",
+    "foyer":             "mdi:door-open",
+    "garage":            "mdi:garage",
+    "guest_bathroom":    "mdi:shower",
+    "guest_bedroom":     "mdi:bed-king",
+    "hallway":           "mdi:shoe-print",
+    "kitchen":           "mdi:fridge",
+    "kids_room":         "mdi:teddy-bear",
+    "laundry_room":      "mdi:washing-machine",
+    "living_room":       "mdi:sofa",
+    "lounge":            "mdi:sofa",
+    "media_room":        "mdi:television",
+    "mud_room":          "mdi:landslide",
+    "office":            "mdi:chair-rolling",
+    "pantry":            "mdi:archive",
+    "playroom":          "mdi:teddy-bear",
+    "primary_bathroom":  "mdi:shower",
+    "primary_bedroom":   "mdi:bed-king",
+    "recreation_room":   "mdi:sofa",
+    "storage_room":      "mdi:archive",
+    "study":             "mdi:bookshelf",
+    "sun_room":          "mdi:sun-angle",
+    "workshop":          "mdi:toolbox",
+    "outside":             "mdi:asterisk",
+    "basement":            "mdi:home-floor-b",
+    "unfinished_basement": "mdi:home-floor-b",
+    "default":             "mdi:map-marker",
+    "custom":              "mdi:map-marker",
+}
+
+ZONE_TYPE_ICONS: Final[dict[str, str]] = {
+    "default":   "mdi:map-marker",
+    "furniture": "mdi:sofa-single",
+}
+
+
+# ── Region ID extraction ───────────────────────────────────────────────────────
+
+def extract_region_id(item: object) -> str:
+    """Extract a region ID from an MQTT region entry or plan.upcoming item.
+
+    Handles two confirmed formats from both local MQTT and the iRobot app:
+    - String (some firmware):   "23"
+    - Object sent by Roomba+:   {"region_id": "23", "type": "rid"}
+    - Object sent by iRobot app: {"rid": "23", "type": "rid"}
+
+    Returns an empty string when neither format is recognisable.
+    """
+    if isinstance(item, dict):
+        return str(item.get("rid") or item.get("region_id") or "")
+    return str(item) if item is not None else ""
+
+
+# v3.3.0 ROOM-SCHED — per-room cleaning frequency configuration.
+# Options-flow keys (ASCII, locale-independent) → uniform interval in days.
+# "three_per_week" is deliberately a uniform 7/3 interval, NOT weekday
+# logic — real weekday schedules exist natively in iRobot cleanSchedule2.
+CONF_ROOM_SCHEDULE = "room_schedule"
+CONF_CORRELATION_ENTITIES = "correlation_entities"  # v3.3.0 CROSS-CORR (opt-in)
+ROOM_SCHEDULE_LEARNED = "learned"
+ROOM_SCHEDULE_INTERVALS: dict[str, float] = {
+    "daily": 1.0,
+    "every_2_days": 2.0,
+    "three_per_week": 7.0 / 3.0,
+    "weekly": 7.0,
+}
+
+
+def room_slug(value: str) -> str:
+    """ASCII slug for a room name: "Küche" -> "kuche".
+
+    ONE DEFINITION, because the two sides have to agree. The map entity
+    publishes room ids as slugs for the xiaomi-vacuum-map-card, and the
+    card sends them back to clean_room, which resolves them against room
+    names. Two rules that differ by a single character mean a room that
+    can be tapped and not cleaned.
+
+    They previously lived in image.py and room_cleaning.py separately,
+    and had already drifted: one collapsed repeated underscores and fell
+    back to "room" for a name with no letters, the other did neither.
+    The stricter behaviour is kept, because a room id must never be
+    empty -- the card rejects that outright.
+
+    Non-ASCII goes through NFD decomposition rather than being stripped:
+    the card validates ids and rejects umlauts and accents, and German
+    and Italian testers have both hit that.
+    """
+    import re as _re  # noqa: PLC0415
+    import unicodedata as _ud  # noqa: PLC0415
+
+    decomposed = _ud.normalize("NFD", value)
+    ascii_only = "".join(c for c in decomposed if not _ud.combining(c))
+    slug = _re.sub(r"[^a-zA-Z0-9]+", "_", ascii_only).strip("_").lower()
+    return _re.sub(r"_+", "_", slug) or "room"
+
+
+#: Severity and remaining capability per Prime error code, from the
+#: iRobot app's own `error_allowed_modes` config (res/raw). 171 codes.
+#:
+#: WHY THIS IS SAFE WHERE LABELS ARE NOT. PrimeErrorSensor deliberately
+#: shows a raw number, because iRobot gives Prime and Classic DIFFERENT
+#: help articles for the same code and no text of ours would be sourced.
+#: A severity bucket is not a label -- it is the vendor's own
+#: classification of the code, and it answers the question a bare number
+#: cannot: is this serious.
+#:
+#:   p2            13 codes, the urgent ones -- 68 camera fault, 114/115
+#:                 battery, 266 subscription expired
+#:   standard      10 codes the robot can work around, and every one of
+#:                 them carries allowed_modes != 0
+#:   p3            142 codes, the bulk
+#:   maintanance   2 codes -- vendor's own spelling, kept verbatim so a
+#:                 future diff against their data still matches
+#:   internal      3, contextual 1
+#:
+#: `allowed_modes` is a bitmask of what the robot can still do. Zero on
+#: 144 of 171 codes. Non-zero says "partially operable" -- 671 (pad wash
+#: blocked) reads 5, which fits the dock's own "switched to vacuum only".
+#:
+#: THE INDIVIDUAL BITS ARE NOT DECODED and deliberately so. Bin-full (36)
+#: reads 3 and pad-wash-blocked (671) reads 5, which rules out the
+#: obvious vacuum/mop reading, and guessing a bit layout to print a
+#: prettier attribute is how this project has been wrong before. The
+#: number is exposed as-is; whether it is zero is the part that means
+#: something today.
+#:
+#: A THIRD ARGUMENT, from app 3.0.0 and independent of the two above.
+#: The vendor's own texts pin down what 287 and 290 mean:
+#:
+#:   287  "Unable to vacuum: remove Pad Plate"   -> plate ON,  mop only
+#:   290  "Unable to start mopping: attach Pad Plate" -> plate OFF, vacuum only
+#:
+#: If `allowed_modes` were the `OperatingMode` bitmask (vacuuming=2,
+#: mopOnly=4, combo=6), then 287 — the code that says vacuuming is
+#: impossible — would have to be 4, and it reads 2. The two are exactly
+#: swapped against that reading.
+#:
+#: So the field is not the operating-mode bitmask. Three separate codes
+#: now say so, from three unrelated directions.
+#:
+#: THE SEVERITY VALUES ARE TWO VOCABULARIES MIXED, and the vendor names
+#: only one of them.
+#:
+#: `FaultLevel` (app 3.0.0) declares p0, p1, p2, p3 and a `none`
+#: sentinel. This table uses p2 and p3 -- 155 of its 171 entries -- and
+#: four values that are not levels at all: `standard`, `internal`,
+#: `contextual` and `maintanance` (the vendor's own spelling).
+#:
+#: So the p-values are a real severity scale with p0 and p1 unused here,
+#: and the other four are a different axis riding in the same field.
+#: Nothing sorts or compares these, which is the only reason the mix has
+#: been harmless.
+#:
+#: p0 AND p1 ARE MISSING RATHER THAN ABSENT. A scale whose top two
+#: levels never appear in 171 entries is more likely incompletely
+#: transcribed than genuinely unused; a code carrying p0 would be the
+#: most severe thing the robot can report and would currently fall
+#: through to no special handling.
+#:
+#: WHICH MODES EACH BLOCKING CODE STILL ALLOWS.
+#:
+#: `blockFault` (app 3.0.0) checks exactly four codes before letting a
+#: mission start, and the vendor's own texts say what each one means:
+#:
+#:   234  "Unable to start: no mop attached"           the CLOTH is missing
+#:   286  "Ready to clean? Make sure @val is on the floor"   robot lifted
+#:   287  "Unable to vacuum: remove Pad Plate"         plate ON  -> mop only
+#:   290  "Unable to start mopping: attach Pad Plate"  plate OFF -> vacuum only
+#:
+#: 234 AND 290 ARE DIFFERENT STATES, and that is the distinction worth
+#: keeping: the plate can be fitted with no cloth on it, which is
+#: exactly what `detectedPad: "padPlate"` reports on a real robot. A
+#: check that folded them together would tell a user to attach the plate
+#: they already have on.
+#:
+#: THE VALUE IS THE MODE SET, NOT THE MESSAGE. The catalogue already
+#: carries the text; what it cannot say is what the robot would still
+#: accept. 287 does not mean "broken", it means "mop and it will work".
+#:
+#: 286 BLOCKS EVERYTHING -- a robot off the floor cannot do either --
+#: and 234 blocks only mopping, since a plate with no cloth still
+#: vacuums.
+PRIME_BLOCKING_FAULTS: Final[dict[int, frozenset[str]]] = {
+    234: frozenset({"vacuum"}),
+    286: frozenset(),
+    287: frozenset({"mop"}),
+    290: frozenset({"vacuum"}),
+}
+
+
+def prime_blocking_faults(status: Any) -> dict[int, frozenset[str]]:
+    """The start-blocking faults currently reported, with what each still allows.
+
+    READS BOTH FIELDS. `error` carries a fault the robot hit; a readiness
+    REFUSAL leaves `error` at 0 and puts its reasons in `cond_not_ready`
+    instead. The four blocking codes can arrive either way, so checking
+    one of the two would miss the case the check exists for.
+
+    Returns an empty mapping when nothing blocks -- callers should treat
+    that as "no opinion", not as "everything is possible", because this
+    only knows about four codes out of a hundred and twelve.
+    """
+    if status is None:
+        return {}
+    codes: set[int] = set()
+    error = getattr(status, "error", None)
+    if isinstance(error, int) and error:
+        codes.add(error)
+    for reason in getattr(status, "cond_not_ready", None) or []:
+        if isinstance(reason, int):
+            codes.add(reason)
+        elif isinstance(reason, str) and reason.isdigit():
+            codes.add(int(reason))
+    return {c: PRIME_BLOCKING_FAULTS[c] for c in codes if c in PRIME_BLOCKING_FAULTS}
+
+
+#: What each operating mode needs of the robot, in the words of
+#: PRIME_BLOCKING_FAULTS (4.4.2). 256 is the app's other mop bit.
+_MODE_NEEDS: Final[dict[int, frozenset[str]]] = {
+    2: frozenset({"vacuum"}),
+    4: frozenset({"mop"}),
+    256: frozenset({"mop"}),
+    6: frozenset({"vacuum", "mop"}),
+    32: frozenset({"vacuum", "mop"}),
+    512: frozenset({"vacuum", "mop"}),
+}
+
+
+def prime_start_refusal(status: Any, modes: list[int | None]) -> list[int]:
+    """The faults that rule out starting in `modes`, or [] (4.4.2).
+
+    ONLY A START, AND ONLY WHAT THE FAULT ITSELF RULES OUT. The Prime
+    app refuses a mission start while one of the four codes is active
+    (`PadPlateMissionIntercept.blockFault`, 3.2.0). This is narrower:
+    mopping with the plate missing (290) is refused, vacuuming with it
+    missing is not. A mode of None -- a start that names none -- is
+    refused only where nothing is possible (286, the robot off the
+    floor).
+
+    NEVER FOR THE DOCK. The app greys out every dock control during a
+    task, so a drying cycle it started cannot be stopped; @chairstacker
+    called that the big drawback of its UI, and nothing here copies it.
+    """
+    blocking = prime_blocking_faults(status)
+    if not blocking:
+        return []
+    allowed = frozenset.intersection(*blocking.values())
+    for mode in modes or [None]:
+        need = _MODE_NEEDS.get(mode, frozenset()) if mode is not None else frozenset()
+        if (need and not need <= allowed) or (not need and not allowed):
+            return sorted(blocking)
+    return []
+
+
+#: FOUR CODES BLOCK A START, not three. `blockFault` (app 3.0.0) checks
+#: 234, 286, 287 and 290, and 234 is a DIFFERENT state from 290:
+#:
+#:   234  "Unable to start: no mop attached"     -> the CLOTH is missing
+#:   290  "Unable to start mopping: attach Pad Plate" -> the PLATE is missing
+#:
+#: A robot can have the plate fitted and no cloth on it, which is
+#: exactly what `detectedPad: "padPlate"` reports. The two codes are not
+#: interchangeable and a mop-readiness check needs both.
+#:
+#: THESE FOUR ARE ALSO THE ONLY FAULT CODES THE APP TREATS SPECIALLY.
+#: Of 115 `DeviceFault` values, seven are referenced directly in code
+#: and the rest are looked up in a table -- so 234/286/287/290 are where
+#: the app deviates from just displaying the message.
+PRIME_ERROR_SEVERITY: Final[dict[int, tuple[str, int]]] = {
+    1: ('p3', 0),
+    2: ('p3', 0),
+    4: ('p3', 0),
+    5: ('p3', 0),
+    6: ('p3', 0),
+    7: ('p3', 0),
+    9: ('p3', 0),
+    10: ('p3', 0),
+    12: ('p3', 0),
+    14: ('p3', 0),
+    16: ('p3', 0),
+    18: ('p3', 0),
+    19: ('p3', 0),
+    22: ('p3', 0),
+    24: ('p3', 0),
+    26: ('p3', 0),
+    29: ('p3', 0),
+    30: ('p3', 0),
+    32: ('p3', 0),
+    33: ('p3', 0),
+    35: ('standard', 5),
+    36: ('standard', 3),
+    42: ('p3', 0),
+    44: ('p3', 0),
+    46: ('p3', 0),
+    47: ('p3', 0),
+    48: ('p3', 0),
+    66: ('p2', 0),
+    68: ('p2', 0),
+    69: ('p3', 0),
+    101: ('p3', 0),
+    102: ('p3', 0),
+    103: ('p3', 0),
+    104: ('p3', 0),
+    105: ('p3', 0),
+    106: ('p3', 0),
+    107: ('p3', 0),
+    109: ('p3', 0),
+    110: ('p3', 0),
+    111: ('p3', 0),
+    114: ('p2', 0),
+    115: ('p2', 0),
+    117: ('p3', 0),
+    119: ('p3', 0),
+    120: ('p3', 0),
+    121: ('p3', 0),
+    201: ('p3', 0),
+    202: ('p3', 0),
+    207: ('p3', 0),
+    210: ('p3', 0),
+    215: ('p3', 0),
+    216: ('p3', 0),
+    218: ('p3', 0),
+    222: ('p3', 0),
+    224: ('p3', 0),
+    228: ('p3', 0),
+    231: ('standard', 5),
+    234: ('p3', 5),
+    237: ('p3', 0),
+    238: ('p3', 0),
+    239: ('p3', 0),
+    251: ('p2', 0),
+    266: ('p2', 0),
+    268: ('p3', 0),
+    283: ('p3', 0),
+    284: ('p2', 0),
+    285: ('p3', 0),
+    286: ('contextual', 0),
+    287: ('internal', 2),
+    290: ('internal', 5),
+    350: ('p3', 3),
+    353: ('p3', 3),
+    360: ('p3', 0),
+    365: ('p3', 0),
+    450: ('p3', 5),
+    451: ('standard', 5),
+    455: ('p3', 5),
+    457: ('p3', 0),
+    464: ('p3', 7),
+    510: ('p3', 3),
+    513: ('p3', 5),
+    517: ('p3', 5),
+    520: ('p3', 0),
+    653: ('standard', 5),
+    654: ('standard', 5),
+    660: ('p3', 0),
+    668: ('standard', 5),
+    669: ('p3', 5),
+    670: ('p3', 5),
+    671: ('standard', 5),
+    672: ('standard', 5),
+    751: ('p3', 5),
+    752: ('p3', 5),
+    756: ('standard', 5),
+    757: ('p3', 0),
+    1000: ('p3', 0),
+    1001: ('p3', 0),
+    1008: ('p3', 0),
+    1010: ('p3', 0),
+    1025: ('p3', 0),
+    1026: ('p3', 0),
+    1028: ('p2', 0),
+    1029: ('p2', 0),
+    1030: ('p2', 0),
+    1034: ('p3', 4),
+    3100: ('p3', 0),
+    3110: ('p3', 0),
+    3120: ('p3', 0),
+    3130: ('p3', 0),
+    3140: ('p3', 0),
+    3150: ('p3', 0),
+    3160: ('p3', 0),
+    3171: ('p3', 0),
+    3172: ('p3', 0),
+    3181: ('p3', 0),
+    3182: ('p3', 0),
+    3190: ('p3', 0),
+    3191: ('p3', 0),
+    3210: ('p2', 0),
+    3211: ('internal', 7),
+    3212: ('p2', 0),
+    3310: ('p2', 0),
+    3410: ('p3', 0),
+    3420: ('p3', 0),
+    3431: ('p3', 0),
+    3432: ('p3', 0),
+    3510: ('p3', 0),
+    3511: ('p3', 0),
+    3512: ('p3', 0),
+    3520: ('p3', 0),
+    3521: ('p3', 0),
+    3522: ('p3', 0),
+    3530: ('p3', 0),
+    3531: ('p3', 0),
+    3532: ('p3', 0),
+    3540: ('p3', 0),
+    3541: ('p3', 0),
+    3542: ('p3', 0),
+    3600: ('p3', 0),
+    3610: ('p3', 0),
+    3621: ('p3', 0),
+    3622: ('p3', 0),
+    3623: ('p3', 0),
+    3624: ('p3', 0),
+    3625: ('p3', 0),
+    3626: ('p3', 0),
+    3627: ('p3', 0),
+    3628: ('p3', 0),
+    3629: ('p3', 0),
+    3630: ('p3', 0),
+    3640: ('p3', 0),
+    3650: ('p3', 0),
+    3660: ('p3', 0),
+    3670: ('p3', 0),
+    3671: ('p3', 0),
+    3672: ('p3', 0),
+    3673: ('p3', 0),
+    3680: ('p3', 0),
+    3681: ('p3', 0),
+    3690: ('p3', 0),
+    3810: ('p3', 0),
+    3821: ('p3', 0),
+    3822: ('p3', 0),
+    3823: ('p3', 0),
+    3824: ('p3', 0),
+    3830: ('p3', 0),
+    3840: ('p3', 0),
+    4001: ('maintanance', 0),
+    4002: ('p3', 0),
+    4003: ('maintanance', 0),
+    4004: ('p3', 0),
+}
+
+
+# READINESS_STATE_LABELS and JOB_INITIATOR_LABELS above stay English:
+# test_const.py asserts their values directly, and sensor_core.py/
+# sensor_helpers.py read them as Classic display text. sensor_prime.py's
+# V4/Prime sensors (prime_dock_status, prime_pad_wash_status,
+# prime_pad_dry_status, readiness, job_initiator) need a stable
+# `[a-z0-9_]+` slug instead, for Home Assistant's translated-state
+# lookup (see PrimeDetectedPadSensor's own _PAD_STATE_SLUGS) -- derived
+# here rather than duplicated, so neither table can drift from the
+# other.
+def state_slug(value: str) -> str:
+    """An English label ("Wheel drop both") or a camelCase wire value
+    ("dockBtn") -> a stable `[a-z0-9_]+` Home Assistant state slug.
+
+    Splits camelCase boundaries before collapsing everything else --
+    spaces, punctuation, runs of either -- to single underscores, so one
+    function handles both kinds of input this project has: hand-written
+    English descriptions and the vendor's own bare identifiers. An empty
+    result falls back to "unknown" rather than "" -- Home Assistant's
+    state machine rejects an empty state outright.
+    """
+    import re as _re  # noqa: PLC0415
+
+    with_boundaries = _re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value)
+    slug = _re.sub(r"[^a-zA-Z0-9]+", "_", with_boundaries).strip("_").lower()
+    return slug or "unknown"
+
+
+def map_options_changed_signal(blid: str) -> str:
+    """Dispatcher signal: options were saved without a reload (4.4.1).
+
+    The cleaning map listens: a requested path drawn under one "Turn of
+    the live path" is turned again when the setting changes, and the
+    picture is drawn anew for options read at render time.
+    """
+    return f"{DOMAIN}_map_options_changed_{blid}"
+
+
+def maintenance_items_signal(blid: str) -> str:
+    """The maintenance model recomputed its entries (4.5.0)."""
+    return f"{DOMAIN}_maintenance_items_{blid}"
+
+
+def maintenance_event_signal(blid: str) -> str:
+    """A maintenance entry became due or overdue, or was done or
+    snoozed (4.5.0). Sent with the event type and the entry."""
+    return f"{DOMAIN}_maintenance_event_{blid}"
+
+
+def maintenance_changed_signal(blid: str) -> str:
+    """Dispatcher signal: this robot's maintenance data changed outside a
+    robot message -- a reset button or action wrote the store.
+
+    Until 4.2.11 the reset paths re-wrote each sensor's OLD state with a
+    new timestamp, or refreshed only the button itself, so the new value
+    appeared only when the robot next sent a message.
+    """
+    return f"{DOMAIN}_maintenance_changed_{blid}"
+
+
+def mission_store_changed_signal(blid: str) -> str:
+    """Dispatcher signal: this robot's mission records changed outside a
+    robot message -- the cloud's data was merged in after a mission.
+
+    Until 4.2.14 the room history and the last mission summary kept what
+    they showed at the dock until the robot next sent something, which a
+    docked robot may not do for hours (@FJSoninC: the closed bathroom
+    stayed "cleaned" until a manual refresh).
+    """
+    return f"{DOMAIN}_mission_store_changed_{blid}"
+
+
+def error_is_stale(status: dict[str, object]) -> bool:
+    """Whether `cleanMissionStatus.error` is left over from a mission
+    that has ended: no cycle, and the robot at rest.
+
+    The firmware does not reset the error when the robot docks after a
+    failure. The error sensor and the vacuum's error attributes both use
+    this, so they agree; the vacuum's attributes carried such an error
+    while the sensor hid it (pointed out by @charchess)."""
+    return status.get("cycle", "") == "none" and status.get("phase", "") in (
+        "charge", "stop", "idle", ""
+    )

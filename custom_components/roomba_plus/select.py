@@ -1,0 +1,1085 @@
+"""Select platform for Roomba+.
+
+Dropdown settings that map to set_preference() delta commands:
+
+  CleaningPassesSelect — Auto / One pass / Two passes
+                         via noAutoPasses + twoPass preferences
+
+Only created when the robot supports multi-pass (cap.multiPass present).
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from homeassistant.components.select import SelectEntity
+from homeassistant.const import EntityCategory
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+
+from . import roomba_reported_state
+from .const import (
+    CLEAN_MODE_LABELS,
+    DOMAIN,
+    FAN_SPEED_AUTOMATIC,
+    FAN_SPEED_ECO,
+    FAN_SPEED_PERFORMANCE,
+    FAN_SPEEDS,
+    has_carpet_boost,
+    has_smart_map,
+)
+from .entity import IRobotEntity
+from .entity_cleanup import async_remove_entities_by_suffix
+from .models import ConnectionType, RoombaConfigEntry
+from .zone_naming import collect_region_ids, resolve_zone_name, unlabelled_zone_ids
+
+
+
+
+_LOGGER = logging.getLogger(__name__)
+PARALLEL_UPDATES = 0
+
+# Option labels — must match CLEAN_MODE_LABELS values
+OPT_AUTO = CLEAN_MODE_LABELS["auto"]    # "Auto"
+OPT_ONE  = CLEAN_MODE_LABELS["one"]     # "One pass"
+OPT_TWO  = CLEAN_MODE_LABELS["two"]     # "Two passes"
+
+_PAD_WET_OPTIONS: list[str] = ["1", "2", "3"]  # Braava wetness levels (disposable + reusable)
+
+# Preference payloads per option
+# noAutoPasses=False → auto decide; True → manual control
+# twoPass=False → one pass; True → two passes
+_OPTION_TO_PREFS: dict[str, tuple[bool, bool]] = {
+    OPT_AUTO: (False, False),
+    OPT_ONE:  (True,  False),
+    OPT_TWO:  (True,  True),
+}
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: RoombaConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up select entities."""
+    data = config_entry.runtime_data
+
+    # BOTH BRANCHES USE THIS, so it cannot live inside one of them.
+    #
+    # @utkjmitch (#79): importing it inside the CLOUD_ONLY branch binds
+    # the name as local to the WHOLE function. On a Classic entry that
+    # branch never runs, so the name is local-but-unbound and the
+    # mopping append below raises UnboundLocalError -- taking every
+    # select on that robot with it, including the cleaning-mode select
+    # the append was adding.
+    #
+    # It needed a Classic robot that reports `padWetness` to surface:
+    # cloud-only households never reach the append, and a vac-only
+    # Classic robot never passes the gate. He had one of each on the
+    # same install.
+    #
+    # Still function-scoped, so the no-top-level-Prime-imports rule
+    # holds. His diagnosis and his fix, verbatim.
+    from .select_prime import PrimeCleaningModeSelect  # noqa: PLC0415
+
+    # PRIME BRANCH. Everything below reads roomba_reported_state(), which
+    # a Prime robot has no equivalent for -- the Classic descriptions
+    # would all evaluate against an empty dict and either all appear or
+    # none would.
+    if data.connection_type is ConnectionType.CLOUD_ONLY:
+        from .prime_coordinator import get_prime_capability_flags  # noqa: PLC0415
+        from .select_prime import (  # noqa: PLC0415
+            PRIME_SELECTS,
+            PrimeMapSelect,
+            PrimeSettingSelect,
+            PrimeZoneSelect,
+        )
+
+        from .select_prime import (  # noqa: PLC0415
+            _autoevac_options,
+            _pad_wash_heat_options,
+            _reported_wetness,
+            _wetness_options,
+            _robot_sku,
+            _settings_keys,
+            _sku_narrowed,
+        )
+
+        cap, dock_cap = get_prime_capability_flags(config_entry)
+        # WHICH SETTINGS THIS ROBOT ACTUALLY HAS, read from its own
+        # rw-settings key list rather than inferred from a table.
+        #
+        # @utkjmitch's Y351020 has auto-evac hardware and NO
+        # `autoevacFreq` key, and the iRobot app offers him no
+        # frequency control either. His reading is the one that fits:
+        # the key set tracks what is USER-CONFIGURABLE on the SKU, not
+        # what is installed. A capability flag cannot answer this.
+        #
+        # None means the shadow has not arrived -- offer everything, the
+        # same fail-open contract used for capabilities. An empty set
+        # would hide every control on a slow first connection.
+        present = _settings_keys(config_entry)
+        sku = _robot_sku(config_entry)
+
+        selects = []
+        for description in PRIME_SELECTS:
+            # Same "None means unknown, only an explicit 0 means absent"
+            # contract the switches use: a robot that has not reported
+            # its capabilities yet should get the entity, not lose it.
+            if not (
+                description.cap_attr is None
+                or cap is None
+                or getattr(cap, description.cap_attr, None) != 0
+            ):
+                continue
+            if present is not None and description.wire_key not in present:
+                continue
+            # TWO CONTROLS HAVE DOCK- OR ROBOT-DEPENDENT OPTION SETS.
+            # Everything else offers its full map.
+            if description.wire_key == "autoevacFreq":
+                values: dict[int, str] | None = _autoevac_options(cap)
+            elif description.wire_key == "pwHeat":
+                values = _pad_wash_heat_options(dock_cap)
+            elif description.wire_key == "padWetness.padPlate":
+                # WIDENED BY WHAT THE ROBOT REPORTS, because the ceiling
+                # here is a guess and a guess must not hide a real
+                # setting. Four is the highest anyone has seen.
+                values = _wetness_options(_reported_wetness(config_entry))
+            else:
+                # THREE CONTROLS ARE NARROWED BY PRODUCT MODE. Five SKUs
+                # see shorter interval and duration lists than the enums
+                # declare, and two of those five -- V1 and Z1 -- only
+                # became recognisable as Prime in the same session these
+                # controls were built.
+                narrowed = _sku_narrowed(
+                    description.wire_key, sku, description.values
+                )
+                values = (
+                    narrowed if narrowed != description.values else None
+                )
+            # A capability level can narrow the set to nothing --
+            # `taskEndOnly` offers no choice at all. A select with no
+            # options is worse than no select.
+            if values is not None and not values:
+                continue
+            selects.append(
+                PrimeSettingSelect(data.blid, config_entry, description, values)
+            )
+        async_add_entities(selects)
+        # Always, even on a single-map account: an entity that appears
+        # and disappears as maps come and go is worse than a select with
+        # one option, because an automation pointing at a vanished entity
+        # fails for a reason unrelated to automations.
+        async_add_entities([
+            PrimeMapSelect(data.blid, config_entry),
+            # Rooms and zones in one list, with the companion clean
+            # button -- the pair Classic has and Prime did not.
+            PrimeZoneSelect(data.blid, config_entry),
+            # Asked for by a user: the app offers vacuum / mop / both
+            # when starting a clean, and this had a suction control and
+            # nothing for the mode.
+            PrimeCleaningModeSelect(data.blid, config_entry),
+        ])
+        return
+
+    roomba = config_entry.runtime_data.roomba
+    blid = config_entry.runtime_data.blid
+    state = roomba_reported_state(roomba)
+    data = config_entry.runtime_data
+
+    entities: list[Any] = []
+
+    # Cleaning passes: present when noAutoPasses is in state
+    if "noAutoPasses" in state:
+        entities.append(CleaningPassesSelect(roomba, blid))
+
+    # v2.2.0 — Carpet boost select (card fix P2)
+    if has_carpet_boost(state):
+        entities.append(CarpetBoostSelect(roomba, blid))
+    elif isinstance(state.get("cap"), dict) and state["cap"]:
+        # 4.2.15: until 4.2.14 this select and the carpet boost sensor
+        # were also created on robots whose capability block has no
+        # carpet boost (why: has_carpet_boost). Their registry rows would
+        # stay as "unavailable" forever. Removed only when the robot's
+        # capability block is actually here to say so.
+        async_remove_entities_by_suffix(
+            hass,
+            config_entry,
+            {"select": "carpet_boost_select", "sensor": "carpet_boost_mode"},
+            "this robot has no carpet boost (cap.carpetBoost is not 1)",
+        )
+
+    # v3.2.1 REMOVED — ZoneSelect used to be created for EPHEMERAL
+    # (900-series) robots too. Confirmed dead weight, not just
+    # incomplete: its only consumer anywhere in this codebase was
+    # ZoneCleanButton, which read the selection purely to log it, then
+    # sent the exact same plain "start" command regardless of what was
+    # selected (the 900-series MQTT API has no coordinate/region
+    # targeting at all — confirmed independently via rest980's docs,
+    # via this project's own mission_archive data showing pmap_id=None
+    # on every EPHEMERAL mission ever recorded, and via ZoneCleanButton's
+    # own implementation). No automation, template sensor, or other
+    # entity in this integration reads zone_select's state either. A
+    # selector with zero functional consumers and a button that ignores
+    # it is worse than no control at all — it suggests targeted-room
+    # cleaning is possible on hardware that architecturally cannot do
+    # it. See ZoneCleanButton's removal below for the matching half of
+    # this fix.
+    #
+    # SMART-tier robots (i/s/j/m with pmaps) are unaffected — see
+    # SmartZoneSelect / CloudSmartZoneSelect below, which DO have a real
+    # region-targeting command path.
+
+    # Smart Zone select: for Smart Map robots (i/s/j/m) with pmaps.
+    # When cloud is active, cloud-sourced selects replace the repair-flow
+    # based SmartZoneSelect — the repair issue is suppressed in that case.
+    if has_smart_map(state):
+        if data.has_cloud:
+            cc = data.cloud_coordinator
+            active_pmap_id = cc.active_pmap_id  # type: ignore[union-attr]
+            for pmap in cc.data.get("pmaps", []):  # type: ignore[union-attr]
+                details = pmap.get("active_pmapv_details") or {}
+                pmap_id = (details.get("active_pmapv") or {}).get("pmap_id", "")
+                map_name = (details.get("map_header") or {}).get("name", "Map")
+                regions = details.get("regions", [])
+                zones = details.get("zones", [])
+                is_active = (pmap_id == active_pmap_id)
+                if regions or zones:
+                    entities.append(
+                        CloudSmartZoneSelect(
+                            roomba, blid, config_entry,
+                            pmap_id=pmap_id,
+                            map_name=map_name,
+                            regions=regions,
+                            zones=zones,
+                            is_active_map=is_active,
+                        )
+                    )
+        else:
+            smart_zone_select = SmartZoneSelect(roomba, blid, config_entry)
+            entities.append(smart_zone_select)
+
+    # v1.9.0 — Braava Pad Wetness selects
+    if "padWetness" in state:
+        entities.append(DisposablePadWetnessSelect(roomba, blid))
+        entities.append(ReusablePadWetnessSelect(roomba, blid))
+
+        # AND THE CLEANING MODE, which Classic never had.
+        #
+        # A user asked how to start mopping a Classic robot and could
+        # not find a way.
+        # The send path was already there -- ClassicRoomCleaning puts
+        # `operatingMode` in a region command's params when a caller
+        # names one -- but the select that names one sat in the
+        # CLOUD_ONLY branch, so a Classic user had nowhere to say it.
+        # The wire was connected at one end.
+        #
+        # Gated on the same signal as the wetness selects above: a
+        # robot that reports `padWetness` is a robot that mops. Better
+        # than a capability flag we would have to guess at, and it is
+        # the gate this file already trusts for exactly this question.
+        #
+        # His own capture is what makes the values safe: the iRobot app
+        # sends `operatingMode: 6` with `padWetness` for vacuum-and-mop
+        # on a Classic robot -- not the 32 that is field-verified on
+        # Prime. `cleaning_modes_for()` keeps the two apart.
+        entities.append(PrimeCleaningModeSelect(blid, config_entry))
+
+    async_add_entities(entities)
+
+
+# ── F-RB-6 (v3.0.0) — Descriptor pattern for simple MQTT-backed selects ──────
+#
+# Replaces CleaningPassesSelect, DisposablePadWetnessSelect,
+# ReusablePadWetnessSelect, CarpetBoostSelect with a single generic class
+# + four frozen dataclass descriptors.
+
+from dataclasses import dataclass
+from typing import Callable, Coroutine
+from homeassistant.components.select import SelectEntityDescription
+
+
+@dataclass(frozen=True, kw_only=True)
+class RoombaPlusSelectDescription(SelectEntityDescription):
+    """Descriptor for a simple MQTT-backed select entity (F-RB-6)."""
+    unique_id_suffix: str
+    options: list[str]
+    current_option_fn: Callable[[dict[str, Any]], str | None]
+    select_fn: Callable[["SimpleRoombaSelect", str], Coroutine[Any, Any, Any]]
+    state_filter_keys: tuple[str, ...]
+
+
+class SimpleRoombaSelect(IRobotEntity, SelectEntity):
+    """Generic MQTT-backed select — driven by RoombaPlusSelectDescription.
+
+    Replaces the four separate simple select classes (F-RB-6, v3.0.0):
+    CleaningPassesSelect, DisposablePadWetnessSelect,
+    ReusablePadWetnessSelect, CarpetBoostSelect.
+    """
+    _live_state = True   # shows a setting the robot reports; stale when unreachable
+
+    entity_description: RoombaPlusSelectDescription
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, roomba: Any, blid: str, description: RoombaPlusSelectDescription) -> None:
+        super().__init__(roomba, blid)
+        self.entity_description = description
+        self._attr_options = list(description.options)
+        self._attr_unique_id = f"{self.robot_unique_id}_{description.unique_id_suffix}"
+
+    @property
+    def current_option(self) -> str | None:
+        return self.entity_description.current_option_fn(self.vacuum_state)
+
+    async def async_select_option(self, option: str) -> None:
+        await self.entity_description.select_fn(self, option)
+
+    def new_state_filter(self, new_state: dict[str, Any]) -> bool:
+        return any(k in new_state for k in self.entity_description.state_filter_keys)
+
+
+# ── select_fn helpers (named coroutines — can't be lambdas) ──────────────────
+
+async def _select_cleaning_passes(entity: SimpleRoombaSelect, option: str) -> None:
+    prefs = _OPTION_TO_PREFS.get(option)
+    if prefs is None:
+        _LOGGER.error("CleaningPasses: unknown option %r", option)
+        return
+    no_auto, two_pass = prefs
+    _LOGGER.debug(
+        "CleaningPasses: option=%r → noAutoPasses=%s twoPass=%s", option, no_auto, two_pass
+    )
+    # ONE MESSAGE, BOTH KEYS. The firmware reads this pair in a single
+    # handler that looks up both members and takes an early exit if
+    # either is missing -- so two separate writes were accepted with a
+    # 200 and did nothing at all. Confirmed in two firmware families
+    # (lewis `ctv_common_get_num_passes_flags`, ruby
+    # `ctv_common_get_pass_preference`), measured on the wire on an i3,
+    # and matched by dorita980, which has never sent these any other
+    # way.
+    #
+    # `set_preferences()` is roombapy 2.0.2 and later; this project
+    # contributed it for exactly this reason.
+    await entity.vacuum.set_preferences(
+        {"noAutoPasses": no_auto, "twoPass": two_pass}
+    )
+
+
+async def _select_disposable_wetness(entity: SimpleRoombaSelect, option: str) -> None:
+    level = int(option)
+    current = entity.vacuum_state.get("padWetness", {})
+    await entity.vacuum.set_preference("padWetness", {"disposable": level, "reusable": current.get("reusable", level)})
+
+
+async def _select_reusable_wetness(entity: SimpleRoombaSelect, option: str) -> None:
+    level = int(option)
+    current = entity.vacuum_state.get("padWetness", {})
+    await entity.vacuum.set_preference("padWetness", {"disposable": current.get("disposable", level), "reusable": level})
+
+
+async def _select_carpet_boost(entity: SimpleRoombaSelect, option: str) -> None:
+    """Writes the Classic suction pair, the way cleaning passes does.
+
+    THIS USED TO CALL `vacuum.set_fan_speed`, and two things were wrong
+    with that at once.
+
+    It looked the vacuum entity up by the bare blid, while the vacuum
+    registers as `roomba_plus_<blid>` -- so the lookup missed on every
+    robot and logged an error nobody was reading. And had it found the
+    entity, `async_set_fan_speed()` writes `suctionLevel` through the
+    PRIME robot object and returns silently when there is none. This
+    select only exists on CLASSIC robots -- it is filtered on
+    `carpetBoost`/`vacHigh`, which Prime does not report -- so the call
+    could never have done anything.
+
+    @ScenicSystemsLLC reproduced it three times on an S9+: the dropdown
+    flashed the chosen value and snapped back to "automatic".
+
+    The pair is written directly, exactly as `_select_cleaning_passes`
+    does, and mirrors this descriptor's own read function above:
+
+        automatic    carpetBoost True,  vacHigh False
+        performance  carpetBoost False, vacHigh True
+        eco          carpetBoost False, vacHigh False
+
+    Both halves in one call, because the firmware reads them as a pair
+    and drops both when they arrive separately -- the same fault that
+    kept cleaning passes from working on i/s robots until roombapy
+    2.0.2.
+    """
+    canonical = option.strip().lower()
+    if canonical not in FAN_SPEEDS:
+        _LOGGER.error("CarpetBoostSelect: %r is not a suction level", option)
+        return
+
+    carpet_boost = canonical == FAN_SPEED_AUTOMATIC
+    vac_high = canonical == FAN_SPEED_PERFORMANCE
+    _LOGGER.debug(
+        "CarpetBoostSelect: option=%r → carpetBoost=%s vacHigh=%s",
+        option, carpet_boost, vac_high,
+    )
+    await entity.vacuum.set_preferences(
+        {"carpetBoost": carpet_boost, "vacHigh": vac_high}
+    )
+
+
+# ── Descriptor instances ──────────────────────────────────────────────────────
+
+_CLEANING_PASSES_DESC = RoombaPlusSelectDescription(
+    key="cleaning_passes",
+    translation_key="cleaning_passes",
+    name="Setting – Cleaning passes",
+    unique_id_suffix="cleaning_passes",
+    options=[OPT_AUTO, OPT_ONE, OPT_TWO],
+    current_option_fn=lambda state: (
+        OPT_TWO   if (state.get("noAutoPasses") and state.get("twoPass"))  else
+        OPT_ONE   if (state.get("noAutoPasses") and not state.get("twoPass")) else
+        OPT_AUTO  if (state.get("noAutoPasses") is not None) else None
+    ),
+    select_fn=_select_cleaning_passes,
+    state_filter_keys=("noAutoPasses", "twoPass"),
+)
+
+_DISPOSABLE_PAD_DESC = RoombaPlusSelectDescription(
+    key="disposable_pad_wetness",
+    translation_key="disposable_pad_wetness",
+    name="Disposable pad wetness",
+    unique_id_suffix="disposable_pad_wetness",
+    options=_PAD_WET_OPTIONS,
+    current_option_fn=lambda state: (
+        str(v) if (v := (state.get("padWetness") or {}).get("disposable")) is not None else None
+    ),
+    select_fn=_select_disposable_wetness,
+    state_filter_keys=("padWetness",),
+)
+
+_REUSABLE_PAD_DESC = RoombaPlusSelectDescription(
+    key="reusable_pad_wetness",
+    translation_key="reusable_pad_wetness",
+    name="Reusable pad wetness",
+    unique_id_suffix="reusable_pad_wetness",
+    options=_PAD_WET_OPTIONS,
+    current_option_fn=lambda state: (
+        str(v) if (v := (state.get("padWetness") or {}).get("reusable")) is not None else None
+    ),
+    select_fn=_select_reusable_wetness,
+    state_filter_keys=("padWetness",),
+)
+
+_CARPET_BOOST_DESC = RoombaPlusSelectDescription(
+    key="carpet_boost_select",
+    translation_key="carpet_boost_select",
+    name="Carpet boost",
+    unique_id_suffix="carpet_boost_select",
+    options=list(FAN_SPEEDS),
+    current_option_fn=lambda state: (
+        FAN_SPEED_AUTOMATIC if state.get("carpetBoost")
+        else FAN_SPEED_PERFORMANCE if state.get("vacHigh")
+        else FAN_SPEED_ECO if state.get("carpetBoost") is not None
+        else None
+    ),
+    select_fn=_select_carpet_boost,
+    state_filter_keys=("carpetBoost", "vacHigh"),
+)
+
+
+# ── Compatibility subclasses ──────────────────────────────────────────────────
+# Thin subclasses keep the original class names so that async_setup_entry
+# and existing tests continue to work without changes.
+
+class CleaningPassesSelect(SimpleRoombaSelect):
+    """Descriptor-backed CleaningPassesSelect (F-RB-6)."""
+    def __init__(self, roomba: Any, blid: str) -> None:
+        super().__init__(roomba, blid, _CLEANING_PASSES_DESC)
+
+
+class DisposablePadWetnessSelect(SimpleRoombaSelect):
+    """Descriptor-backed DisposablePadWetnessSelect (F-RB-6)."""
+    def __init__(self, roomba: Any, blid: str) -> None:
+        super().__init__(roomba, blid, _DISPOSABLE_PAD_DESC)
+
+
+class ReusablePadWetnessSelect(SimpleRoombaSelect):
+    """Descriptor-backed ReusablePadWetnessSelect (F-RB-6)."""
+    def __init__(self, roomba: Any, blid: str) -> None:
+        super().__init__(roomba, blid, _REUSABLE_PAD_DESC)
+
+
+class CarpetBoostSelect(SimpleRoombaSelect):
+    """Descriptor-backed CarpetBoostSelect (F-RB-6)."""
+    def __init__(self, roomba: Any, blid: str) -> None:
+        super().__init__(roomba, blid, _CARPET_BOOST_DESC)
+
+
+
+
+
+class SmartZoneSelect(IRobotEntity, SelectEntity):
+    """Zone selector for Smart Map robots (i/s/j/m-series).
+
+    Collects known region_ids from two local sources:
+      1. cleanSchedule2 — regions used in scheduled missions
+      2. lastCommand    — region used in the last mission
+
+    Region names are not available locally (they live in cloud pmaps).
+    User-assigned names are stored in the config entry options under
+    'smart_zone_labels' (dict mapping region_id → label).
+
+    When new region_ids are discovered that have no user label yet, a
+    HA Repair Issue ('smart_zones_need_naming') is raised. The fix flow
+    opens the Options Flow async_step_smart_zones step where the user
+    can assign names. The issue is automatically dismissed once all
+    known region_ids have labels.
+
+    Selecting a zone and pressing the companion SmartZoneCleanButton
+    (button.py) starts a targeted clean of that region.
+    """
+
+    _attr_translation_key = "smart_zone_select"
+    _attr_entity_category = None   # primary control → Steuerelemente
+
+    def __init__(
+        self,
+        roomba: Any,
+        blid: str,
+        config_entry: RoombaConfigEntry,
+    ) -> None:
+        super().__init__(roomba, blid, config_entry)
+        self._attr_unique_id = f"{self.robot_unique_id}_smart_zone_select"
+        self._selected: str | None = None
+        # Track which region_ids we have already raised an issue for so we
+        # don't fire async_create_issue on every subsequent MQTT message.
+        self._known_unlabelled: set[str] = set()
+
+    async def async_added_to_hass(self) -> None:
+        """Run initial unlabelled check once the entity is registered.
+
+        on_message() only fires on MQTT delta updates, never for the
+        initial state loaded at startup. Region IDs already in
+        cleanSchedule2 at startup would not trigger the Repair Issue
+        until the robot sends a cleanSchedule2 delta. This check
+        ensures the issue fires on every HA startup when needed.
+        """
+        await super().async_added_to_hass()
+        if self._config_entry.runtime_data.cloud_coordinator is not None:
+            # A notice from an earlier start, when the cloud had not
+            # answered yet (see _async_raise_naming_issue). Home Assistant
+            # keeps it across restarts.
+            await self._async_dismiss_naming_issue()
+        unlabelled = set(self._unlabelled_region_ids())
+        if unlabelled:
+            self._known_unlabelled = unlabelled
+            _LOGGER.info(
+                "SmartZoneSelect: %d unlabelled region_id(s) at startup: %s",
+                len(unlabelled),
+                sorted(unlabelled),
+            )
+            await self._async_raise_naming_issue(sorted(unlabelled))
+
+    # ── Region ID collection ──────────────────────────────────────────────────
+
+    def _collect_region_ids(self) -> list[str]:
+        """Back-compat wrapper (v3.4.0 TODO extraction) — see
+        zone_naming.py::collect_region_ids() for the actual logic,
+        shared with the new todo.py platform."""
+        return collect_region_ids(self.vacuum_state, self._config_entry.options)
+
+    def _unlabelled_region_ids(self) -> list[str]:
+        """Back-compat wrapper — see zone_naming.py::unlabelled_zone_ids()."""
+        return unlabelled_zone_ids(self.vacuum_state, self._config_entry.options)
+
+    def _region_label(self, region_id: str) -> str:
+        """Return display name using 5-level priority chain (v1.7.0 L7).
+
+        1. User alias (CONF_SMART_ZONE_ALIASES)
+        2. Cloud name (not available in SmartZoneSelect — cloud path uses CloudSmartZoneSelect)
+        3. smart_zone_data name (manual entry)
+        4. smart_zone_labels (legacy fallback)
+        5. Auto-generated "Zone {id}"
+        """
+        from .const import CONF_SMART_ZONE_ALIASES
+        options = self._config_entry.options
+        aliases: dict[str, Any] = options.get(CONF_SMART_ZONE_ALIASES, {})
+        zone_data: dict[str, Any] = options.get("smart_zone_data", {})
+        labels: dict[str, Any] = options.get("smart_zone_labels", {})
+        local_name = zone_data.get(region_id, {}).get("name") if region_id in zone_data else None
+        return resolve_zone_name(region_id, aliases, None, local_name, labels)
+
+    # ── SelectEntity interface ────────────────────────────────────────────────
+
+    @property
+    def options(self) -> list[str]:
+        """Return labelled options list, excluding hidden zones."""
+        from .const import CONF_SMART_ZONE_HIDDEN
+        hidden_ids: list[Any] = self._config_entry.options.get(CONF_SMART_ZONE_HIDDEN, [])
+        return [
+            self._region_label(rid)
+            for rid in self._collect_region_ids()
+            if rid not in hidden_ids
+        ]
+
+    @property
+    def current_option(self) -> str | None:
+        if not self.options:
+            return None
+        if self._selected not in self.options:
+            self._selected = self.options[0]
+        return self._selected
+
+    @property
+    def region_ids(self) -> list[str]:
+        """Return raw region_ids in same order as options."""
+        return self._collect_region_ids()
+
+    @property
+    def selected_region_id(self) -> str | None:
+        """Return the region_id for the currently selected option."""
+        ids = self._collect_region_ids()
+        labels = [self._region_label(rid) for rid in ids]
+        if self._selected in labels:
+            idx = labels.index(self._selected)
+            return ids[idx]
+        return ids[0] if ids else None
+
+    @property
+    def selected_pmap_info(self) -> dict[str, Any]:
+        """Return pmap_id and user_pmapv_id from the most recent known source."""
+        # Try lastCommand first (most recent)
+        last = self.vacuum_state.get("lastCommand", {})
+        if last.get("pmap_id"):
+            return {
+                "pmap_id": last["pmap_id"],
+                "user_pmapv_id": last.get("user_pmapv_id", ""),
+            }
+        # Fall back to cleanSchedule2
+        for entry in self.vacuum_state.get("cleanSchedule2", []):
+            cmd = entry.get("cmd", {})
+            if cmd.get("pmap_id"):
+                return {
+                    "pmap_id": cmd["pmap_id"],
+                    "user_pmapv_id": cmd.get("user_pmapv_id", ""),
+                }
+        return {}
+
+    async def async_select_option(self, option: str) -> None:
+        self._selected = option
+        self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        return bool(self._collect_region_ids())
+
+    # ── Push update wiring ────────────────────────────────────────────────────
+
+    def new_state_filter(self, new_state: dict[str, Any]) -> bool:
+        return "cleanSchedule2" in new_state or "lastCommand" in new_state
+
+    def on_message(self, json_data: dict[str, Any]) -> None:
+        """Handle MQTT update — check for newly discovered region_ids.
+
+        When new region_ids appear that have no user label yet, a HA Repair
+        Issue is raised to prompt the user to name them. The issue is only
+        created when the set of unlabelled IDs actually grows, so it fires
+        at most once per newly discovered region rather than on every message.
+        """
+        state = json_data.get("state", {}).get("reported", {})
+        if not self.new_state_filter(state):
+            return
+
+        self.vacuum_state = roomba_reported_state(self.vacuum)
+        self.schedule_update_ha_state()
+
+        # Check for newly unlabelled region_ids
+        unlabelled = set(self._unlabelled_region_ids())
+        new_unlabelled = unlabelled - self._known_unlabelled
+        if new_unlabelled:
+            self._known_unlabelled = unlabelled
+            _LOGGER.info(
+                "SmartZoneSelect: %d new unlabelled region_id(s) discovered: %s",
+                len(new_unlabelled),
+                sorted(new_unlabelled),
+            )
+            # Capture the IDs NOW while vacuum_state is fresh — by the time
+            # the async task runs the MQTT connection may have dropped and
+            # vacuum_state may no longer contain the regions.
+            captured = sorted(new_unlabelled)
+            # Straight to the config entry: this runs on the event loop
+            # (roombapy 2.x dispatches callbacks there), so the old
+            # call_soon_threadsafe wrapper around hass.async_create_task
+            # was working around a thread that no longer exists. Going
+            # through the entry also means the task is cancelled on
+            # unload and its exceptions are logged.
+            self._config_entry.async_create_task(
+                self.hass, self._async_raise_naming_issue(captured)
+            )
+
+        # Dismiss issue when all region_ids have been labelled
+        elif self._known_unlabelled and not unlabelled:
+            self._known_unlabelled = set()
+            self._config_entry.async_create_task(
+                self.hass, self._async_dismiss_naming_issue()
+            )
+
+    async def _async_raise_naming_issue(self, region_ids: list[str]) -> None:
+        """Create (or update) the smart_zones_need_naming Repair Issue.
+
+        Suppressed when the cloud coordinator is active — the cloud provides
+        authoritative region names so the manual naming flow is not needed.
+        """
+        from homeassistant.helpers import issue_registry as ir
+
+        if not region_ids:
+            return
+
+        # WITH AN ACCOUNT, THE NAMES COME FROM IT -- even before it has
+        # answered. This asked whether cloud data had arrived, so a start
+        # whose first cloud fetch failed (a network not up yet at boot)
+        # asked @liblit to name seven zones his account had named long
+        # ago, and the notice stayed after the data came (4.3.3).
+        if self._config_entry.runtime_data.cloud_coordinator is not None:
+            _LOGGER.debug(
+                "SmartZoneSelect: iRobot account configured — suppressing "
+                "naming repair issue"
+            )
+            return
+
+        # Persist discovered IDs to options so the repair fix flow can
+        # read them even when live MQTT state no longer has regions.
+        new_options = dict(self._config_entry.options)
+        existing_ids = set(new_options.get("discovered_zone_ids", []))
+        new_options["discovered_zone_ids"] = sorted(existing_ids | set(region_ids))
+        self.hass.config_entries.async_update_entry(
+            self._config_entry, options=new_options
+        )
+        # Exclude hidden zone IDs from the repair issue — users have explicitly
+        # chosen to hide these zones and should not be prompted to name them.
+        from .const import CONF_SMART_ZONE_HIDDEN
+        hidden_ids: set[Any] = set(new_options.get(CONF_SMART_ZONE_HIDDEN, []))
+        unlabelled = [
+            rid for rid in new_options["discovered_zone_ids"]
+            if rid not in hidden_ids
+        ]
+        if not unlabelled:
+            return  # All remaining zones are hidden — no issue needed
+
+        # Issue ID includes entry_id so multi-robot setups open the correct fix flow.
+        issue_id = f"smart_zones_need_naming_{self._config_entry.entry_id}"
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            issue_id,
+            is_fixable=True,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="smart_zones_need_naming",
+            translation_placeholders={
+                "zone_count": str(len(unlabelled)),
+                "zone_ids": ", ".join(unlabelled),
+                # THE CARD HAS TO NAME THE ROBOT TOO.
+                #
+                # With two robots the repairs list showed two cards with
+                # the same generic title, and the only way to tell them
+                # apart was to open one. A tester: "Nothing tells me
+                # which of my two Roomba devices this repair relates
+                # to." The form was fixed first and the card left
+                # generic, which is half an answer.
+                "robot": (
+                    getattr(self._config_entry, "title", None)
+                    or "this robot"
+                ),
+            },
+        )
+        _LOGGER.debug(
+            "SmartZoneSelect: repair issue raised for %d region_id(s)",
+            len(unlabelled),
+        )
+
+    async def _async_dismiss_naming_issue(self) -> None:
+        """Dismiss the smart_zones_need_naming issue once all IDs are labelled."""
+        from homeassistant.helpers import issue_registry as ir
+
+        issue_id = f"smart_zones_need_naming_{self._config_entry.entry_id}"
+        ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+        _LOGGER.debug("SmartZoneSelect: repair issue dismissed — all zones labelled")
+
+
+class CloudSmartZoneSelect(IRobotEntity, SelectEntity):
+    """Zone selector for Smart Map robots populated from the iRobot cloud.
+
+    Replaces SmartZoneSelect when cloud credentials are configured.
+    Regions and zones come from the /pmaps UMF endpoint — names, types, and
+    pmap_id are authoritative and require no manual naming by the user.
+
+    One entity is created per pmap (floor). On robots with a single map this
+    means one entity named "Select zone — <MapName>". Multi-floor robots get
+    one per floor with the map name disambiguating them.
+
+    Because this entity's data comes from the cloud coordinator (not MQTT
+    push), it updates when the coordinator refreshes (map retrain detection
+    or the daily background poll), not on every MQTT message.
+
+    The companion SmartZoneButton reads selected_region_id / selected_pmap_id
+    from this entity — the interface is identical to SmartZoneSelect so the
+    button requires no changes.
+    """
+
+    _attr_entity_category = None   # primary control — visible by default
+
+    def __init__(
+        self,
+        roomba: Any,
+        blid: str,
+        config_entry: RoombaConfigEntry,
+        *,
+        pmap_id: str,
+        map_name: str,
+        regions: list[dict[str, Any]],
+        zones: list[dict[str, Any]],
+        is_active_map: bool = True,
+    ) -> None:
+        super().__init__(roomba, blid, config_entry)
+        self._pmap_id = pmap_id
+        self._regions = regions   # list of {id, name, region_type}
+        self._zones = zones       # list of {id, name, zone_type}
+        self._is_active_map = is_active_map
+        self._selected: str | None = None
+
+        self._attr_unique_id = f"{self.robot_unique_id}_cloud_zone_{pmap_id}"
+        self._attr_translation_key = "cloud_smart_zone_select"
+
+        # Inactive maps: disabled by default, name suffixed so users know why.
+        # Active map: enabled by default, name unchanged.
+        self._map_name = map_name if is_active_map else f"{map_name} (inactive)"
+        self._attr_entity_registry_enabled_default = is_active_map
+
+    # ── Option list ───────────────────────────────────────────────────────────
+
+    def _all_items(self) -> list[dict[str, Any]]:
+        """Return combined regions + zones with alias and hidden-filter applied (v1.7.0 L7).
+
+        Name resolution uses 5-level priority: alias > cloud > local > labels > auto.
+        Hidden region IDs are excluded entirely.
+        """
+        from .const import CONF_SMART_ZONE_ALIASES, CONF_SMART_ZONE_HIDDEN
+        options = self._config_entry.options
+        aliases: dict[str, Any] = options.get(CONF_SMART_ZONE_ALIASES, {})
+        hidden_ids: list[Any] = options.get(CONF_SMART_ZONE_HIDDEN, [])
+        labels: dict[str, Any] = options.get("smart_zone_labels", {})
+        zone_data: dict[str, Any] = options.get("smart_zone_data", {})
+
+        # THE ID UNDER EITHER KEY, AND THE KIND. The account's map data
+        # names a room `region_id` or `id` and a zone `zone_id` or `id`,
+        # depending on the account -- the cloud coordinator reads both,
+        # this read `id` alone. A zone listed under `zone_id` then had
+        # no id here, and the zone button sent something else. And a
+        # zone has to go out as a zone: every selection went out as a
+        # room (@Hardy-196, i7+: "Esstisch" selected, nothing cleaned).
+        items = []
+        for r in self._regions:
+            rid = str(r.get("id") or r.get("region_id") or "")
+            if not rid or rid in hidden_ids:
+                continue
+            cloud_name = r.get("name")
+            local_name = zone_data.get(rid, {}).get("name") if rid in zone_data else None
+            name = resolve_zone_name(rid, aliases, cloud_name, local_name, labels)
+            items.append({"id": rid, "name": name, "pmap_id": self._pmap_id, "type": "rid"})
+        for z in self._zones:
+            zid = str(z.get("zone_id") or z.get("id") or "")
+            if not zid or zid in hidden_ids:
+                continue
+            cloud_name = z.get("name")
+            local_name = zone_data.get(zid, {}).get("name") if zid in zone_data else None
+            name = resolve_zone_name(zid, aliases, cloud_name, local_name, labels)
+            items.append({"id": zid, "name": name, "pmap_id": self._pmap_id, "type": "zid"})
+        return items
+
+    @property
+    def options(self) -> list[str]:
+        return [item["name"] for item in self._all_items()]
+
+    @property
+    def current_option(self) -> str | None:
+        opts = self.options
+        if not opts:
+            return None
+        if self._selected not in opts:
+            self._selected = opts[0]
+        return self._selected
+
+    async def async_select_option(self, option: str) -> None:
+        self._selected = option
+        self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        return bool(self.options)
+
+    # ── Data used by SmartZoneButton ──────────────────────────────────────────
+
+    @property
+    def selected_region_id(self) -> str | None:
+        """Return the region/zone id for the currently selected option."""
+        item = self._selected_item()
+        return str(item["id"]) if item else None
+
+    @property
+    def selected_region_type(self) -> str:
+        """`rid` for a room, `zid` for a clean zone -- what the robot needs."""
+        item = self._selected_item()
+        return str(item.get("type", "rid")) if item else "rid"
+
+    def _selected_item(self) -> dict[str, Any] | None:
+        items = self._all_items()
+        for item in items:
+            if item["name"] == self._selected:
+                return item
+        return items[0] if items else None
+
+    @property
+    def selected_pmap_info(self) -> dict[str, str]:
+        """Return {pmap_id, user_pmapv_id} — compatible with SmartZoneSelect."""
+        # user_pmapv_id is intentionally left empty here: SmartZoneButton
+        # sends no version at all (see its async_press docstring).
+        return {"pmap_id": self._pmap_id, "user_pmapv_id": ""}
+
+    # ── Extra attributes ──────────────────────────────────────────────────────
+
+    @property
+    def icon(self) -> str:
+        # Kept in code, not icons.json: the icon follows the region TYPE
+        # of the selected room (kitchen, bathroom, ...), and the options are
+        # the household's own room names, which icons.json cannot list.
+        """F7g -- dynamic icon based on selected zone region_type."""
+        from .const import REGION_TYPE_ICONS
+        current = self._selected
+        for r in self._regions:
+            if r.get("name") == current or str(r.get("id")) == current:
+                region_type = r.get("region_type", "default")
+                return REGION_TYPE_ICONS.get(region_type, REGION_TYPE_ICONS["default"])
+        return REGION_TYPE_ICONS["default"]
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        from .const import REGION_TYPE_ICONS
+        items = self._all_items()
+        selected = next(
+            (i for i in items if i["name"] == self._selected), items[0] if items else {}
+        )
+
+        # F7g -- region_icons: maps each zone display name to its MDI icon
+        region_icons: dict[str, str] = {}
+        for r in self._regions:
+            region_type = r.get("region_type", "default")
+            icon = REGION_TYPE_ICONS.get(region_type, REGION_TYPE_ICONS["default"])
+            name = next(
+                (i["name"] for i in items if str(i.get("id")) == str(r.get("id"))),
+                r.get("name", ""),
+            )
+            if name:
+                region_icons[name] = icon
+
+        # F7g -- learning_percentage from map_header
+        learning_pct = None
+        try:
+            cc = self._config_entry.runtime_data.cloud_coordinator
+            if cc and cc.data:
+                for pmap in cc.data.get("pmaps", []):
+                    details = pmap.get("active_pmapv_details") or {}
+                    if (details.get("active_pmapv") or {}).get("pmap_id") == self._pmap_id:
+                        learning_pct = (details.get("map_header") or {}).get("learning_percentage")
+                        break
+        except Exception:  # noqa: BLE001
+            pass
+
+        # ROOM-SIZE (v2.9.1) -- region_areas_m2: maps each zone display name
+        # to its floor area in m^2, from UmfAligner.room_areas_m2. Only
+        # populated for whichever pmap UmfAligner was actually built for
+        # (the active map at config-entry setup, see __init__.py) -- other
+        # floors' CloudSmartZoneSelect instances simply get an empty dict,
+        # same graceful-degradation pattern as region_icons/learning_pct.
+        region_areas_m2: dict[str, float] = {}
+        try:
+            aligner = self._config_entry.runtime_data.umf_aligner
+            if aligner is not None:
+                areas_by_rid = aligner.room_areas_m2
+                for r in self._regions:
+                    rid = str(r.get("id", ""))
+                    if rid not in areas_by_rid:
+                        continue
+                    name = next(
+                        (i["name"] for i in items if str(i.get("id")) == rid),
+                        r.get("name", ""),
+                    )
+                    if name:
+                        region_areas_m2[name] = areas_by_rid[rid]
+        except Exception:  # noqa: BLE001
+            pass
+
+        # ROOM OR ZONE, and each zone's room (#256). The options hold both;
+        # the card lists zones apart from rooms and under the room they
+        # lie in. The rooms come from the zones' outlines in the cloud map,
+        # for the map the aligner was built for; other maps' zones and a
+        # zone in no room are simply not listed.
+        segment_type = {
+            i["name"]: "zone" if i.get("type") == "zid" else "room" for i in items
+        }
+        zone_room: dict[str, str] = {}
+        try:
+            aligner = self._config_entry.runtime_data.umf_aligner
+            if aligner is not None and getattr(aligner, "pmap_id", self._pmap_id) in (
+                "", self._pmap_id,
+            ):
+                room_name_by_id = {
+                    str(i["id"]): i["name"] for i in items if i.get("type") == "rid"
+                }
+                zone_rid = aligner.zone_region_ids()
+                for i in items:
+                    if i.get("type") != "zid":
+                        continue
+                    rid = zone_rid.get(str(i["id"])) or zone_rid.get(
+                        f"name:{str(i['name']).casefold()}", ""
+                    )
+                    room = room_name_by_id.get(rid)
+                    if room:
+                        zone_room[i["name"]] = room
+        except Exception:  # noqa: BLE001
+            pass
+
+        attrs = {
+            "map_name": self._map_name,
+            "pmap_id": self._pmap_id,
+            "region_id": selected.get("id"),
+            "region_count": len(self._regions),
+            "zone_count": len(self._zones),
+            "source": "cloud",
+            "is_active_map": self._is_active_map,
+            "region_icons": region_icons,
+            "segment_type": segment_type,
+        }
+        if zone_room:
+            attrs["zone_room"] = zone_room
+        if learning_pct is not None:
+            attrs["learning_percentage"] = learning_pct
+        if region_areas_m2:
+            attrs["region_areas_m2"] = region_areas_m2
+
+        # v2.3.0 Gap A (Amendment 4 v2.2 backfill) — keepout zone visibility
+        try:
+            cc = self._config_entry.runtime_data.cloud_coordinator
+            if cc:
+                keepout = cc.keepout_zones
+                attrs["keepout_zone_count"] = len(keepout)
+                names = [z.get("name") for z in keepout if z.get("name")]
+                if names:
+                    attrs["keepout_zone_names"] = names
+        except Exception:  # noqa: BLE001
+            pass
+
+        return attrs
+
+    # ── Push update wiring ────────────────────────────────────────────────────
+
+    def new_state_filter(self, new_state: dict[str, Any]) -> bool:
+        # Cloud entity doesn't update from MQTT — coordinator handles refresh.
+        return False
+
+
