@@ -1,0 +1,863 @@
+# Office Assist: Waveshare ESP32-S3-Touch-LCD-1.85C(-BOX) V2 as a Home Assistant
+# Assist voice satellite with on-device wake word (micro_wake_word), a full HA media player,
+# and Pip's animated face (dogbelly-pocket puppet rig) as the screen.
+#
+# STATUS: DRAFT. Validated with `esphome config` + `esphome compile` (ESPHome 2026.11.0),
+# NOT yet flashed. See the notes at the bottom for what still needs checking on the board.
+#
+# Hardware facts come from the owner's ESP-IDF bring-up of this exact unit
+# (~/Projects/dogbelly/dogbelly-pocket/hardware):
+#   pins      firmware/main/board.h, research/boards.md (V2 schematic + Waveshare demo)
+#   display   firmware/main/board.c lcd_init(), firmware/main/lcd_init_factory.h
+#   audio     firmware/main/audio.c, STATUS.md "M3 audio bring-up"
+#   face      firmware/components/puppet (copied into components/pip/)
+#
+# Secrets (never inline; this repo is public):
+#   office_assist_api_key, office_assist_ota_password, wifi_ssid, wifi_password
+#
+# Flashing: this board's USB-Serial/JTAG link corrupts long transfers. Do the first
+# flash in 256 KB pieces with verify (office-assist/flash-usb.sh), then OTA.
+
+substitutions:
+  name: office-assist
+  friendly_name: Office Assist
+
+  # Voice assistant phases (same ids as the official BOX-3 / Voice PE configs)
+  phase_idle: "1"
+  phase_listening: "2"
+  phase_thinking: "3"
+  phase_replying: "4"
+  phase_not_ready: "10"
+  phase_error: "11"
+  phase_muted: "12"
+  phase_timer_finished: "20"
+
+  timer_finished_sound: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/timer_finished.flac
+  wake_sound: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/wake_word_triggered.flac
+
+# Pip's face lives in the PRIVATE dogbelly-pocket repo (it is Matt's Pocket code; this repo is
+# public), so it is referenced by a local path. Builds therefore need that checkout next to
+# this one: ~/Projects/dogbelly/dogbelly-pocket (they do not build on the CM4 dashboard).
+external_components:
+  - source:
+      type: local
+      path: ../../dogbelly/dogbelly-pocket/esphome/components
+    components: [pip]
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  area: Office
+  min_version: 2026.4.0
+  on_boot:
+    - priority: 600
+      then:
+        # CST816: turn auto-sleep off (reg 0xFE = 1). Asleep it NACKs reads and taps get lost
+        # (board.c touch_init). ESPHome's cst816 driver does not do this itself.
+        - lambda: |-
+            uint8_t on = 0x01;
+            id(touch).write_register(0xFE, &on, 1);
+        - script.execute: draw_display
+    - priority: -100
+      then:
+        - delay: 30s
+        - if:
+            condition:
+              lambda: return id(init_in_progress);
+            then:
+              - lambda: id(init_in_progress) = false;
+              - script.execute: draw_display
+
+esp32:
+  variant: esp32s3
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+
+# ESP32-S3R8: 8 MB octal PSRAM (research/boards.md "Chip")
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+  id: api_id
+  encryption:
+    key: !secret office_assist_api_key
+  on_client_connected:
+    - script.execute: draw_display
+  on_client_disconnected:
+    - script.execute: draw_display
+
+ota:
+  - platform: esphome
+    id: ota_esphome
+    password: !secret office_assist_ota_password
+
+wifi:
+  id: wifi_id
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  on_connect:
+    - script.execute: draw_display
+  on_disconnect:
+    - script.execute: draw_display
+
+# ---------------------------------------------------------------------------
+# Buses and IO expander
+# ---------------------------------------------------------------------------
+i2c:
+  - id: i2c_bus
+    sda: GPIO11   # board.h BOARD_I2C_SDA
+    scl: GPIO10   # board.h BOARD_I2C_SCL
+    frequency: 400kHz
+
+# TCA9554 @0x20 (register-compatible with PCA9554). ESPHome pin N = schematic EXIO(N+1):
+#   pin 0 = EXIO1 touch reset, pin 1 = EXIO2 LCD reset, pin 2 = EXIO3 SD D3, pin 3 = EXIO4 RTC INT
+#   (board.h EXIO_* defines). The speaker amp is NOT on the expander: it is GPIO15.
+pca9554:
+  - id: exio
+    i2c_id: i2c_bus
+    address: 0x20
+
+i2s_audio:
+  - id: i2s_bus
+    i2s_mclk_pin: GPIO2    # board.h BOARD_I2S_MCLK
+    i2s_bclk_pin: GPIO48   # BOARD_I2S_BCLK
+    i2s_lrclk_pin: GPIO38  # BOARD_I2S_LRCK
+    # One I2S port carries both codecs (like the IDF firmware). Full duplex keeps the mic
+    # (and so the wake/stop word) running while TTS plays. Mic and speaker must then share
+    # sample rate and bit depth: 16 kHz / 16 bit.
+    full_duplex: true
+
+# ---------------------------------------------------------------------------
+# Audio
+# ---------------------------------------------------------------------------
+audio_adc:
+  - platform: es7210
+    id: es7210_adc
+    i2c_id: i2c_bus
+    address: 0x40
+    bits_per_sample: 16bit
+    sample_rate: 16000
+    # 24 dB: 30 dB clipped mic1 at -2 dBFS during playback (STATUS.md M3).
+    mic_gain: 24dB
+
+audio_dac:
+  - platform: es8311
+    id: es8311_dac
+    i2c_id: i2c_bus
+    address: 0x18
+    bits_per_sample: 16bit
+    sample_rate: 16000
+    # MCLK on GPIO2 (i2s_mclk_pin). The IDF firmware ran the ES8311 from SCLK, but ESPHome's driver
+    # then needs a 512 kHz / 16 kHz coefficient that its table lacks ("Failed to initialize").
+    # With MCLK (256 x 16 kHz = 4.096 MHz) the table has an entry. Fixed 2026-11-21.
+    use_mclk: true
+
+microphone:
+  - platform: i2s_audio
+    id: i2s_mics
+    i2s_audio_id: i2s_bus
+    i2s_din_pin: GPIO39      # BOARD_I2S_DIN, ES7210 SDOUT
+    adc_type: external
+    pdm: false
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    # Non-TDM ES7210: MIC1 = left slot (0), MIC2 = right slot (1). MIC3 (the speaker
+    # loopback / AEC reference on the schematic) goes to SDOUT2 and is not captured.
+    channel: stereo
+
+speaker:
+  - platform: i2s_audio
+    id: i2s_speaker
+    i2s_audio_id: i2s_bus
+    i2s_dout_pin: GPIO47     # BOARD_I2S_DOUT, to ES8311 DSDIN
+    dac_type: external
+    audio_dac: es8311_dac
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    channel: stereo
+    timeout: never
+    buffer_duration: 100ms
+
+  # Announcement (TTS, timer) and media streams mixed into the one output
+  - platform: mixer
+    id: mixing_speaker
+    output_speaker: i2s_speaker
+    num_channels: 2
+    task_stack_in_psram: true
+    source_speakers:
+      - id: announcement_mixing_input
+        timeout: never
+      - id: media_mixing_input
+        timeout: never
+
+  - platform: resampler
+    id: announcement_resampling_speaker
+    output_speaker: announcement_mixing_input
+    sample_rate: 16000
+    bits_per_sample: 16
+  - platform: resampler
+    id: media_resampling_speaker
+    output_speaker: media_mixing_input
+    sample_rate: 16000
+    bits_per_sample: 16
+
+audio_file:
+  - id: timer_finished_sound
+    file: ${timer_finished_sound}
+  - id: wake_word_triggered_sound
+    file: ${wake_sound}
+
+media_source:
+  - platform: audio_file
+    id: audio_file_announcement_source
+  - platform: audio_http
+    id: http_announcement_source
+    buffer_size: 250000
+  - platform: audio_http
+    id: http_media_source
+    buffer_size: 500000
+
+media_player:
+  - platform: speaker_source
+    id: assist_media_player
+    name: Media Player
+    announcement_pipeline:
+      format: FLAC
+      num_channels: 1
+      sample_rate: 16000
+      speaker: announcement_resampling_speaker
+      sources:
+        - audio_file_announcement_source
+        - http_announcement_source
+    media_pipeline:
+      format: FLAC
+      num_channels: 1
+      sample_rate: 16000
+      speaker: media_resampling_speaker
+      sources:
+        - http_media_source
+    volume_increment: 0.05
+    volume_min: 0.3
+    volume_max: 0.9
+    on_announcement:
+      - mixer_speaker.apply_ducking:
+          id: media_mixing_input
+          decibel_reduction: 20
+          duration: 0.0s
+    on_state:
+      - if:
+          condition:
+            and:
+              - switch.is_off: timer_ringing
+              - not:
+                  voice_assistant.is_running:
+              - not:
+                  media_player.is_announcing: assist_media_player
+          then:
+            - mixer_speaker.apply_ducking:
+                id: media_mixing_input
+                decibel_reduction: 0
+                duration: 1.0s
+            # music playing <-> idle on the face
+            - script.execute: set_idle_or_mute_phase
+            - script.execute: draw_display
+
+# ---------------------------------------------------------------------------
+# Wake word + Assist
+# ---------------------------------------------------------------------------
+micro_wake_word:
+  id: mww
+  microphone:
+    microphone: i2s_mics
+    channels: 0          # MIC1
+    gain_factor: 4       # VPE value; tune on the board
+  stop_after_detection: false
+  # Wake word models. Each entry needs an `id`; the "Wake word" select below switches
+  # between them at runtime (enable_model/disable_model). To add one:
+  #   1. add a list entry here,
+  #   2. add its display name to the select's `options`,
+  #   3. add a line to the select's lambda map and to wake_word_sensitivity if wanted.
+  # Official models by name: okay_nabu, hey_jarvis, hey_mycroft, alexa.
+  # Custom models: a URL or local path to a trained microWakeWord v2 JSON manifest
+  # (the .tflite sits next to it), e.g.
+  #   - model: https://example.com/models/hey_office/hey_office.json
+  #     id: hey_office
+  #   - model: pocket-assist/models/hey_office.json   # local file under esphome/
+  #     id: hey_office
+  # Each extra model costs RAM and CPU (all enabled models run on every audio frame).
+  models:
+    - model: okay_nabu
+      id: okay_nabu
+    # - model: hey_jarvis
+    #   id: hey_jarvis
+    - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
+      id: stop
+      internal: true
+  vad:
+  on_wake_word_detected:
+    - if:
+        condition:
+          switch.is_off: mute
+        then:
+          - if:
+              condition:
+                switch.is_on: timer_ringing
+              then:
+                - switch.turn_off: timer_ringing
+              else:
+                - if:
+                    condition:
+                      voice_assistant.is_running:
+                    then:
+                      - voice_assistant.stop:
+                    else:
+                      - if:
+                          condition:
+                            media_player.is_announcing: assist_media_player
+                          then:
+                            - media_player.stop:
+                                id: assist_media_player
+                                announcement: true
+                          else:
+                            - script.execute:
+                                id: play_sound
+                                priority: true
+                                sound_file: "wake_word_triggered_sound"
+                            - delay: 300ms
+                            - voice_assistant.start:
+                                wake_word: !lambda return wake_word;
+
+voice_assistant:
+  id: va
+  microphone:
+    microphone: i2s_mics
+    channels: 0
+  media_player: assist_media_player
+  micro_wake_word: mww
+  use_wake_word: false
+  noise_suppression_level: 2
+  auto_gain: 31dBFS
+  volume_multiplier: 2.0
+  on_client_connected:
+    - lambda: id(init_in_progress) = false;
+    - micro_wake_word.start:
+    - script.execute: set_idle_or_mute_phase
+    - script.execute: draw_display
+  on_client_disconnected:
+    - voice_assistant.stop:
+    - lambda: id(voice_assistant_phase) = ${phase_not_ready};
+    - script.execute: draw_display
+  on_start:
+    - script.stop: clear_text_later
+    - mixer_speaker.apply_ducking:
+        id: media_mixing_input
+        decibel_reduction: 20
+        duration: 0.0s
+  on_listening:
+    - lambda: id(voice_assistant_phase) = ${phase_listening};
+    - pip.clear_text: face
+    - script.execute: draw_display
+  on_stt_vad_end:
+    - lambda: id(voice_assistant_phase) = ${phase_thinking};
+    - script.execute: draw_display
+  # What was heard: the eyes shrink to the upper third and the text fills the bottom.
+  on_stt_end:
+    - pip.show_text:
+        text: !lambda return x;
+        kind: heard
+  # NOTE: the satellite only gets the STT text and the reply text. HA's matched intent
+  # name is not sent to voice_assistant triggers (on_intent_end carries no intent data
+  # usable here), so there is no "intent" line.
+  on_intent_progress:
+    - if:
+        condition:
+          lambda: return !x.empty();   # streaming TTS started
+        then:
+          - lambda: id(voice_assistant_phase) = ${phase_replying};
+          - script.execute: draw_display
+          - script.execute: activate_stop_word_once
+  on_tts_start:
+    - pip.show_text:
+        text: !lambda return x;
+        kind: reply
+    - if:
+        condition:
+          lambda: return id(voice_assistant_phase) != ${phase_replying};
+        then:
+          - lambda: id(voice_assistant_phase) = ${phase_replying};
+          - script.execute: activate_stop_word_once
+    - script.execute: draw_display
+  on_end:
+    - wait_until:
+        not:
+          voice_assistant.is_running:
+    - mixer_speaker.apply_ducking:
+        id: media_mixing_input
+        decibel_reduction: 0
+        duration: 1.0s
+    - if:
+        condition:
+          lambda: return id(voice_assistant_phase) == ${phase_error};
+        then:
+          - delay: 2s
+    # Talk while the reply plays, then settle; the text stays ~3 s after the reply ends.
+    - wait_until:
+        condition:
+          not:
+            media_player.is_announcing: assist_media_player
+        timeout: 60s
+    - script.execute: set_idle_or_mute_phase
+    - script.execute: draw_display
+    - script.execute: clear_text_later
+  on_error:
+    - if:
+        condition:
+          and:
+            - lambda: return !id(init_in_progress);
+            - lambda: return code != "duplicate_wake_up_detected";
+            - lambda: return code != "stt-no-text-recognized";
+        then:
+          - lambda: id(voice_assistant_phase) = ${phase_error};
+          - pip.show_text:
+              text: !lambda return message;
+              kind: reply
+          - script.execute: draw_display
+  on_timer_finished:
+    - switch.turn_on: timer_ringing
+  on_timer_started:
+    - pip.show_text:
+        text: !lambda |-
+          char buf[40];
+          uint32_t s = timer.total_seconds;
+          if (s >= 3600) snprintf(buf, sizeof(buf), "Timer set: %u:%02u:%02u", (unsigned)(s / 3600), (unsigned)((s % 3600) / 60), (unsigned)(s % 60));
+          else snprintf(buf, sizeof(buf), "Timer set: %u:%02u", (unsigned)(s / 60), (unsigned)(s % 60));
+          return std::string(buf);
+        kind: heard
+    - script.execute: clear_text_later
+
+# ---------------------------------------------------------------------------
+# Controls: mute, timer ring, speaker amp, wake word sensitivity
+# ---------------------------------------------------------------------------
+switch:
+  # NS4150B speaker amp enable, GPIO15 high = on (board.h BOARD_PA_EN, research/boards.md)
+  - platform: gpio
+    id: speaker_amp
+    name: Speaker Amp
+    pin: GPIO15
+    restore_mode: ALWAYS_ON
+    entity_category: config
+    disabled_by_default: true
+
+  - platform: template
+    id: mute
+    name: Mute
+    icon: mdi:microphone-off
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    on_turn_on:
+      - voice_assistant.stop:
+      - micro_wake_word.stop:
+      - lambda: id(voice_assistant_phase) = ${phase_muted};
+      - script.execute: draw_display
+    on_turn_off:
+      - if:
+          condition:
+            api.connected:
+          then:
+            - micro_wake_word.start:
+            - lambda: id(voice_assistant_phase) = ${phase_idle};
+      - script.execute: draw_display
+
+  - platform: template
+    id: timer_ringing
+    optimistic: true
+    internal: true
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - mixer_speaker.apply_ducking:
+          id: media_mixing_input
+          decibel_reduction: 20
+          duration: 0.0s
+      - micro_wake_word.enable_model: stop
+      - media_player.repeat_one:
+          id: assist_media_player
+          announcement: true
+      - speaker_source.set_playlist_delay:
+          id: assist_media_player
+          pipeline: announcement
+          delay: 500ms
+      - script.execute:
+          id: play_sound
+          priority: true
+          sound_file: "timer_finished_sound"
+      - lambda: id(voice_assistant_phase) = ${phase_timer_finished};
+      - script.execute: draw_display
+      - delay: 15min
+      - switch.turn_off: timer_ringing
+    on_turn_off:
+      - micro_wake_word.disable_model: stop
+      - media_player.repeat_off:
+          id: assist_media_player
+          announcement: true
+      - speaker_source.set_playlist_delay:
+          id: assist_media_player
+          pipeline: announcement
+          delay: 0ms
+      - if:
+          condition:
+            media_player.is_announcing: assist_media_player
+          then:
+            - media_player.stop:
+                id: assist_media_player
+                announcement: true
+      - mixer_speaker.apply_ducking:
+          id: media_mixing_input
+          decibel_reduction: 0
+          duration: 1.0s
+      - script.execute: set_idle_or_mute_phase
+      - script.execute: draw_display
+
+select:
+  - platform: template
+    id: wake_word_sensitivity
+    name: Wake word sensitivity
+    optimistic: true
+    initial_option: Slightly sensitive
+    restore_value: true
+    entity_category: config
+    options:
+      - Slightly sensitive
+      - Moderately sensitive
+      - Very sensitive
+    on_value:
+      # Cutoffs from the Voice PE config (okay_nabu@20241226.3). For hey_jarvis@v2 use
+      # 247 / 235 / 212. Custom models: start from the manifest's default cutoff.
+      - lambda: |-
+          if (x == "Slightly sensitive") {
+            id(okay_nabu).set_probability_cutoff(217);
+          } else if (x == "Moderately sensitive") {
+            id(okay_nabu).set_probability_cutoff(176);
+          } else {
+            id(okay_nabu).set_probability_cutoff(143);
+          }
+
+  # Active wake word, switchable from Home Assistant. Only the chosen model runs.
+  - platform: template
+    id: wake_word_select
+    name: Wake word
+    icon: mdi:account-voice
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_option: Okay Nabu
+    options:
+      - Okay Nabu
+      # - Hey Jarvis
+      # - Hey Office
+    on_value:
+      - lambda: |-
+          // display name -> model; keep in sync with micro_wake_word.models
+          const std::vector<std::pair<std::string, micro_wake_word::WakeWordModel *>> models = {
+            {"Okay Nabu", id(okay_nabu)},
+            // {"Hey Jarvis", id(hey_jarvis)},
+            // {"Hey Office", id(hey_office)},
+          };
+          for (auto &m : models) {
+            if (m.first == x) m.second->enable(); else m.second->disable();
+          }
+
+binary_sensor:
+  # BOOT key (GPIO0, research/boards.md "Key1 = BOOT"): same as a screen tap.
+  - platform: gpio
+    id: boot_key
+    internal: true
+    pin:
+      number: GPIO0
+      mode: INPUT_PULLUP
+      inverted: true
+      ignore_strapping_warning: true
+    on_multi_click:
+      - timing:
+          - ON for at most 1s
+          - OFF for at least 0.3s
+        then:
+          - script.execute: tap_action
+      - timing:
+          - ON for at least 1s
+        then:
+          - switch.toggle: mute
+
+# ---------------------------------------------------------------------------
+# Battery + backlight
+# ---------------------------------------------------------------------------
+sensor:
+  # Battery: GPIO8 = ADC1_CH7, 200K/100K divider -> x3 (board.c board_battery_volts).
+  # Reads 0 V with the side power switch off (STATUS.md M1).
+  - platform: adc
+    id: battery_voltage
+    name: Battery voltage
+    pin: GPIO8
+    attenuation: 12db
+    filters:
+      - multiply: 3.0
+      - sliding_window_moving_average:
+          window_size: 6
+          send_every: 1
+    update_interval: 30s
+    accuracy_decimals: 2
+    entity_category: diagnostic
+  - platform: template
+    id: battery_level
+    name: Battery level
+    unit_of_measurement: "%"
+    device_class: battery
+    accuracy_decimals: 0
+    update_interval: 60s
+    # Rough linear LiPo estimate, 3.3 V = 0 %, 4.15 V = 100 %. Replace with a real curve.
+    lambda: |-
+      float v = id(battery_voltage).state;
+      if (isnan(v) || v < 1.0f) return NAN;
+      float p = (v - 3.3f) / (4.15f - 3.3f) * 100.0f;
+      return std::max(0.0f, std::min(100.0f, p));
+  - platform: wifi_signal
+    name: WiFi signal
+    update_interval: 60s
+    entity_category: diagnostic
+
+output:
+  - platform: ledc
+    id: backlight_pwm
+    pin: GPIO5            # board.h BOARD_LCD_BL, LEDC through a FET
+    frequency: 5000Hz
+
+light:
+  - platform: monochromatic
+    id: backlight
+    name: Screen
+    icon: mdi:television
+    entity_category: config
+    output: backlight_pwm
+    restore_mode: RESTORE_DEFAULT_ON
+    default_transition_length: 250ms
+
+# ---------------------------------------------------------------------------
+# Screen: Pip's face (external component components/pip)
+# ---------------------------------------------------------------------------
+# The pip component owns the ST77916 panel itself (esp_lcd + espressif/esp_lcd_st77916, this
+# unit's 185-command factory init table, max_transfer_sz 2048, 80 MHz QSPI: the same path as the
+# working IDF firmware) and draws the puppet rig in a low-priority task on core 0. It is a
+# `display` only so the touchscreen can attach to it; no LVGL or display lambdas.
+#
+# State -> face (pip.set_state):
+#   idle      calm, blinking, idle glances           listening  wake look, then attentive
+#   thinking  thinking look (gaze up/aside)          speaking   talking rhythm while TTS plays
+#   error     "call failed" look + confusion/sadness  muted      eyes closed, breathing
+#   timer     surprise                                starting   waiting look (no HA yet)
+#   music     calm + a little joy, slow bob (music_dance: true uses the beat dance instead)
+# Text mode (pip.show_text): eyes shrink to text_scale and move to the upper third; the text is
+# word-wrapped to the circle in the lower part and pages on at reading pace.
+display:
+  - platform: pip
+    id: face
+    cs_pin: 21                  # board.h BOARD_LCD_CS
+    clk_pin: 40                 # BOARD_LCD_SCK
+    data_pins: [46, 45, 42, 41] # D0..D3
+    reset_pin:
+      pca9554: exio
+      number: 1                 # EXIO2 = LCD reset (board.h EXIO_LCD_RST)
+    data_rate: 80MHz
+    style: Soft Robot           # Pip's look
+    fps_idle: 15                # CPU budget: see the report; lower if audio ever stutters
+    fps_active: 10              # listening / thinking / speaking / music
+    fps_asleep: 5               # muted
+    core: 0
+    text_scale: 0.5
+    text_color: 0xFFFFFF
+    heard_color: 0x9AA0A6
+    music_dance: false
+    update_interval: never
+
+touchscreen:
+  - platform: cst816
+    id: touch
+    i2c_id: i2c_bus
+    address: 0x15
+    display: face
+    interrupt_pin: GPIO4   # board.h BOARD_TP_INT; the driver latches the falling edge
+    reset_pin:
+      pca9554: exio
+      number: 0            # EXIO1 = touch reset (board.h EXIO_TP_RST)
+    # Raw coordinates match the panel 1:1 on this unit (board.c board_touch_read, user-verified)
+    # Tap = start/stop listening (also stops a timer ring or a reply); hold 0.8 s = mute toggle.
+    on_touch:
+      - script.execute: long_press_watch
+    on_release:
+      - if:
+          condition:
+            script.is_running: long_press_watch
+          then:
+            - script.stop: long_press_watch
+            - script.execute: tap_action
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+globals:
+  - id: init_in_progress
+    type: bool
+    restore_value: false
+    initial_value: "true"
+  - id: voice_assistant_phase
+    type: int
+    restore_value: false
+    initial_value: ${phase_not_ready}
+
+script:
+  - id: long_press_watch
+    mode: restart
+    then:
+      - delay: 800ms
+      - switch.toggle: mute
+
+  # Tap / BOOT short press
+  - id: tap_action
+    then:
+      - if:
+          condition:
+            switch.is_on: timer_ringing
+          then:
+            - switch.turn_off: timer_ringing
+          else:
+            - if:
+                condition:
+                  switch.is_on: mute
+                then:
+                  - script.execute: draw_display   # muted: tap does nothing; hold unmutes
+                else:
+                  - if:
+                      condition:
+                        voice_assistant.is_running:
+                      then:
+                        - voice_assistant.stop:
+                      else:
+                        - if:
+                            condition:
+                              media_player.is_announcing: assist_media_player
+                            then:
+                              - media_player.stop:
+                                  id: assist_media_player
+                                  announcement: true
+                            else:
+                              - if:
+                                  condition:
+                                    api.connected:
+                                  then:
+                                    - script.execute:
+                                        id: play_sound
+                                        priority: true
+                                        sound_file: "wake_word_triggered_sound"
+                                    - delay: 300ms
+                                    - voice_assistant.start:
+
+  - id: clear_text_later
+    mode: restart
+    then:
+      - delay: 3s
+      - pip.clear_text: face
+
+  - id: set_idle_or_mute_phase
+    then:
+      - lambda: |-
+          id(voice_assistant_phase) = id(mute).state ? ${phase_muted} : ${phase_idle};
+
+  - id: play_sound
+    parameters:
+      priority: bool
+      sound_file: string
+    then:
+      - if:
+          condition:
+            lambda: return priority;
+          then:
+            - media_player.stop:
+                id: assist_media_player
+                announcement: true
+      - lambda: |-
+          if (id(assist_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING || priority) {
+            id(assist_media_player)
+              ->make_call()
+              .set_media_url("audio-file://" + sound_file)
+              .set_announcement(true)
+              .perform();
+          }
+
+  # Enable the "stop" model while a long TTS reply plays (Voice PE pattern)
+  - id: activate_stop_word_once
+    then:
+      - wait_until:
+          condition:
+            media_player.is_announcing: assist_media_player
+          timeout: 5s
+      - delay: 1s
+      - if:
+          condition:
+            switch.is_off: timer_ringing
+          then:
+            - micro_wake_word.enable_model: stop
+            - wait_until:
+                not:
+                  media_player.is_announcing: assist_media_player
+            - if:
+                condition:
+                  switch.is_off: timer_ringing
+                then:
+                  - micro_wake_word.disable_model: stop
+
+  # Phase -> face state. Idle becomes "music" while the media pipeline plays.
+  - id: draw_display
+    then:
+      - if:
+          condition:
+            lambda: return id(init_in_progress) || !id(wifi_id).is_connected() || !id(api_id).is_connected();
+          then:
+            - pip.set_state: starting
+          else:
+            - lambda: |-
+                using namespace esphome::pip;
+                PipState s;
+                switch (id(voice_assistant_phase)) {
+                  case ${phase_listening}: s = PIP_LISTENING; break;
+                  case ${phase_thinking}: s = PIP_THINKING; break;
+                  case ${phase_replying}: s = PIP_SPEAKING; break;
+                  case ${phase_error}: s = PIP_ERROR; break;
+                  case ${phase_muted}: s = PIP_MUTED; break;
+                  case ${phase_timer_finished}: s = PIP_TIMER; break;
+                  case ${phase_not_ready}: s = PIP_STARTING; break;
+                  default:
+                    s = id(assist_media_player).state == media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING
+                        ? PIP_MUSIC : PIP_IDLE;
+                }
+                id(face).set_state(s);
+
+# ---------------------------------------------------------------------------
+# To verify on the board before trusting this config (not testable by compile):
+#  1. Face: panel init + pixel pushes via the pip component (same driver path as the IDF
+#     firmware); frame rate and CPU with wake word + music (logger level DEBUG shows
+#     "pip: N fps, render X ms/frame" every 10 s).
+#  2. Touch: tap / hold; auto-sleep write (0xFE) takes effect.
+#  3. Audio: MIC1 on the left slot in non-TDM mode; ES8311 with use_mclk false at 16 kHz;
+#     speaker volume range. No AEC: MIC3 loopback is not used, so wake/stop word during
+#     loud TTS or music may be weaker than on the Voice PE.
+#  4. Battery: ADC x3 scale vs a multimeter.
+# ---------------------------------------------------------------------------
