@@ -403,73 +403,37 @@ template:
             } %}
             {{ m.get(s, []) }}
 
-  # The SwitchBot as everything else should see it.
-  # Sync OFF: behaves like switch.bat_bot (assumed state, always presses).
-  # Sync ON:  state is the measured light; it only presses when the measured
-  #           state differs from what is asked. Out-of-sync cannot invert it.
+  # The SwitchBot as everything else should see it: see light.bathroom_light below for the
+  # state and press logic (last command = state, light sensor confirms each press).
   - switch:
+      # Kept for the bathroom automations, which drive switch.bathroom_fan_and_lights. It now
+      # simply follows light.bathroom_light (one source of truth, one press path), 2026-11-21.
       - name: Bathroom fan and lights
         unique_id: bathroom_fan_and_lights
-        state: >
-          {% if is_state('input_boolean.bathroom_switchbot_lux_sync', 'on')
-                and has_value('binary_sensor.bathroom_switchbot_lights_measured') %}
-            {{ is_state('binary_sensor.bathroom_switchbot_lights_measured', 'on') }}
-          {% else %}
-            {{ is_state('input_boolean.bathroom_switchbot_target', 'on') }}
-          {% endif %}
+        state: "{{ is_state('light.bathroom_light', 'on') }}"
         turn_on:
-          - action: input_boolean.turn_on
+          - action: light.turn_on
             target:
-              entity_id: input_boolean.bathroom_switchbot_target
-          - if: >
-              {{ not (is_state('input_boolean.bathroom_switchbot_lux_sync', 'on')
-                      and has_value('binary_sensor.bathroom_switchbot_lights_measured'))
-                 or is_state('binary_sensor.bathroom_switchbot_lights_measured', 'off') }}
-            then:
-              # Press over Bluetooth (local, via the BT proxies) when it is reachable; the
-              # SwitchBot Cloud copy is the backup (it was offline on 2026-11-21).
-              - action: switch.toggle
-                target:
-                  entity_id: >-
-                    {{ 'switch.bat_bot_bt' if has_value('switch.bat_bot_bt') else 'switch.bat_bot' }}
+              entity_id: light.bathroom_light
         turn_off:
-          - action: input_boolean.turn_off
+          - action: light.turn_off
             target:
-              entity_id: input_boolean.bathroom_switchbot_target
-          - if: >
-              {{ not (is_state('input_boolean.bathroom_switchbot_lux_sync', 'on')
-                      and has_value('binary_sensor.bathroom_switchbot_lights_measured'))
-                 or is_state('binary_sensor.bathroom_switchbot_lights_measured', 'on') }}
-            then:
-              - action: switch.toggle
-                target:
-                  entity_id: >-
-                    {{ 'switch.bat_bot_bt' if has_value('switch.bat_bot_bt') else 'switch.bat_bot' }}
+              entity_id: light.bathroom_light
 
   # The bathroom wall-switch light (fan + lights) as an ordinary light, for people and voice
   # (Matt, 2026-11-21). The SwitchBot presses the wall switch; Bluetooth first (local), the
   # SwitchBot Cloud copy as backup.
-  # State: what the light sensor measures (Hue bulb's own light subtracted). The sensor reports
-  # slowly (a change can take minutes to show, seen 2026-11-21), so after a press the light
-  # trusts its last command until the measured state has changed since that press, for at most
-  # 5 minutes. If the light sensor is unavailable, it falls back to the last command.
+  # State: the last command (input_boolean.bathroom_switchbot_target), assumed correct (Matt,
+  # 2026-11-21). The light sensor CONFIRMS it: after every press, "Bathroom SwitchBot confirm
+  # press" waits for the sensor (it can take minutes to report) and corrects the state if the
+  # press did not land; "Bathroom SwitchBot sync from light sensor" catches hand presses.
   # On/off only press when the light is not already in the asked state, so it never inverts.
   # The bot is in press mode in practice: every command is one full press of the push button.
   - light:
       - name: Bathroom light
         unique_id: ham_bathroom_wall_light
         icon: mdi:ceiling-light
-        state: >
-          {% set pressed = as_datetime(states('input_datetime.bathroom_switchbot_last_press')) %}
-          {% set m = states.binary_sensor.bathroom_switchbot_lights_measured %}
-          {% set settling = pressed is not none and m is not none
-             and as_local(pressed) > m.last_changed
-             and (now() - as_local(pressed)).total_seconds() < 300 %}
-          {% if settling or not has_value('binary_sensor.bathroom_switchbot_lights_measured') %}
-            {{ is_state('input_boolean.bathroom_switchbot_target', 'on') }}
-          {% else %}
-            {{ is_state('binary_sensor.bathroom_switchbot_lights_measured', 'on') }}
-          {% endif %}
+        state: "{{ is_state('input_boolean.bathroom_switchbot_target', 'on') }}"
         turn_on:
           - if: "{{ not is_state(this.entity_id, 'on') }}"
             then:
@@ -1068,6 +1032,12 @@ automation:
       - condition: state
         entity_id: input_boolean.bathroom_switchbot_lux_sync
         state: "on"
+      # Within 5 min of a bot press the slow light sensor may simply not have reported yet;
+      # "Bathroom SwitchBot confirm press" owns that window. This one catches hand presses.
+      - condition: template
+        value_template: >
+          {% set p = as_datetime(states('input_datetime.bathroom_switchbot_last_press')) %}
+          {{ p is none or (now() - as_local(p)).total_seconds() > 300 }}
     actions:
       - action: "input_boolean.turn_{{ 'on' if is_state('binary_sensor.bathroom_switchbot_lights_measured', 'on') else 'off' }}"
         target:
@@ -1080,3 +1050,60 @@ automation:
             Measured light says the SwitchBot circuit is
             {{ states('binary_sensor.bathroom_switchbot_lights_measured') }}, which is not what was last commanded.
             Adopted the measured state (wall switch used by hand, or a press failed).
+
+  # After every SwitchBot press: wait for the (slow) light sensor to report, then confirm the
+  # press landed. If it did not, adopt what the sensor sees, so the light shows the truth.
+  # Never presses again, so a bad reading cannot start a press loop. (Matt, 2026-11-21)
+  - id: bathroom_switchbot_confirm_press
+    alias: Bathroom SwitchBot confirm press
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: input_datetime.bathroom_switchbot_last_press
+    conditions:
+      - condition: state
+        entity_id: input_boolean.bathroom_switchbot_lux_sync
+        state: "on"
+    actions:
+      - variables:
+          asked: "{{ states('input_boolean.bathroom_switchbot_target') }}"
+      # Already showing the asked state (e.g. the sensor reported before we got here): done.
+      - if: "{{ not is_state('binary_sensor.bathroom_switchbot_lights_measured', asked) }}"
+        then:
+          - wait_for_trigger:
+              - trigger: state
+                entity_id: binary_sensor.bathroom_switchbot_lights_measured
+                to:
+                  - "on"
+                  - "off"
+            timeout: "00:05:00"
+            continue_on_timeout: true
+      - variables:
+          seen: "{{ states('binary_sensor.bathroom_switchbot_lights_measured') }}"
+      - choose:
+          - conditions: "{{ seen == asked }}"
+            sequence:
+              - action: logbook.log
+                data:
+                  name: Bathroom SwitchBot
+                  entity_id: light.bathroom_light
+                  message: "Press confirmed by the light sensor: light is {{ seen }}."
+          - conditions: "{{ seen in ['on', 'off'] and is_state('input_boolean.bathroom_switchbot_target', asked) }}"
+            sequence:
+              - action: "input_boolean.turn_{{ seen }}"
+                target:
+                  entity_id: input_boolean.bathroom_switchbot_target
+              - action: logbook.log
+                data:
+                  name: Bathroom SwitchBot
+                  entity_id: light.bathroom_light
+                  message: >
+                    Press NOT confirmed: asked {{ asked }}, the light sensor still sees {{ seen }}
+                    after {{ 'the sensor reported' if (wait is defined and wait.trigger) else 'waiting 5 minutes' }}.
+                    Showing {{ seen }}; nothing pressed again.
+        default:
+          - action: logbook.log
+            data:
+              name: Bathroom SwitchBot
+              entity_id: light.bathroom_light
+              message: "Could not confirm the press: the light sensor is {{ seen }}. Kept {{ asked }}."
