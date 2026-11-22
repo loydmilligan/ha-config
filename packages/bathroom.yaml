@@ -150,6 +150,14 @@ timer:
     name: Bathroom presence hold
     restore: true
 
+# When the SwitchBot last pressed the wall switch. The light sensor confirms a change only
+# after ~20 s (debounce), so light.bathroom_light trusts its last command for 45 s after a press.
+input_datetime:
+  bathroom_switchbot_last_press:
+    name: "Bathroom: SwitchBot last press"
+    has_date: true
+    has_time: true
+
 input_text:
   bathroom_last_rule:
     name: Bathroom last rule
@@ -433,6 +441,57 @@ template:
                       and has_value('binary_sensor.bathroom_switchbot_lights_measured'))
                  or is_state('binary_sensor.bathroom_switchbot_lights_measured', 'on') }}
             then:
+              - action: switch.toggle
+                target:
+                  entity_id: >-
+                    {{ 'switch.bat_bot_bt' if has_value('switch.bat_bot_bt') else 'switch.bat_bot' }}
+
+  # The bathroom wall-switch light (fan + lights) as an ordinary light, for people and voice
+  # (Matt, 2026-11-21). The SwitchBot presses the wall switch; Bluetooth first (local), the
+  # SwitchBot Cloud copy as backup.
+  # State: what the light sensor measures (Hue bulb's own light subtracted). For 45 s after a
+  # press the sensor has not caught up yet (20 s debounce), so the light trusts its last
+  # command. If the light sensor is unavailable, it falls back to the last command.
+  # On/off only press when the light is not already in the asked state, so it never inverts.
+  - light:
+      - name: Bathroom light
+        unique_id: ham_bathroom_wall_light
+        icon: mdi:ceiling-light
+        state: >
+          {% set pressed = as_datetime(states('input_datetime.bathroom_switchbot_last_press')) %}
+          {% set settling = pressed is not none
+             and (now() - as_local(pressed)).total_seconds() < 45 %}
+          {% if settling or not has_value('binary_sensor.bathroom_switchbot_lights_measured') %}
+            {{ is_state('input_boolean.bathroom_switchbot_target', 'on') }}
+          {% else %}
+            {{ is_state('binary_sensor.bathroom_switchbot_lights_measured', 'on') }}
+          {% endif %}
+        turn_on:
+          - if: "{{ not is_state(this.entity_id, 'on') }}"
+            then:
+              - action: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.bathroom_switchbot_target
+              - action: input_datetime.set_datetime
+                target:
+                  entity_id: input_datetime.bathroom_switchbot_last_press
+                data:
+                  timestamp: "{{ now().timestamp() }}"
+              - action: switch.toggle
+                target:
+                  entity_id: >-
+                    {{ 'switch.bat_bot_bt' if has_value('switch.bat_bot_bt') else 'switch.bat_bot' }}
+        turn_off:
+          - if: "{{ not is_state(this.entity_id, 'off') }}"
+            then:
+              - action: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.bathroom_switchbot_target
+              - action: input_datetime.set_datetime
+                target:
+                  entity_id: input_datetime.bathroom_switchbot_last_press
+                data:
+                  timestamp: "{{ now().timestamp() }}"
               - action: switch.toggle
                 target:
                   entity_id: >-
