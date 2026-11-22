@@ -449,18 +449,22 @@ template:
   # The bathroom wall-switch light (fan + lights) as an ordinary light, for people and voice
   # (Matt, 2026-11-21). The SwitchBot presses the wall switch; Bluetooth first (local), the
   # SwitchBot Cloud copy as backup.
-  # State: what the light sensor measures (Hue bulb's own light subtracted). For 45 s after a
-  # press the sensor has not caught up yet (20 s debounce), so the light trusts its last
-  # command. If the light sensor is unavailable, it falls back to the last command.
+  # State: what the light sensor measures (Hue bulb's own light subtracted). The sensor reports
+  # slowly (a change can take minutes to show, seen 2026-11-21), so after a press the light
+  # trusts its last command until the measured state has changed since that press, for at most
+  # 5 minutes. If the light sensor is unavailable, it falls back to the last command.
   # On/off only press when the light is not already in the asked state, so it never inverts.
+  # The bot is in press mode in practice: every command is one full press of the push button.
   - light:
       - name: Bathroom light
         unique_id: ham_bathroom_wall_light
         icon: mdi:ceiling-light
         state: >
           {% set pressed = as_datetime(states('input_datetime.bathroom_switchbot_last_press')) %}
-          {% set settling = pressed is not none
-             and (now() - as_local(pressed)).total_seconds() < 45 %}
+          {% set m = states.binary_sensor.bathroom_switchbot_lights_measured %}
+          {% set settling = pressed is not none and m is not none
+             and as_local(pressed) > m.last_changed
+             and (now() - as_local(pressed)).total_seconds() < 300 %}
           {% if settling or not has_value('binary_sensor.bathroom_switchbot_lights_measured') %}
             {{ is_state('input_boolean.bathroom_switchbot_target', 'on') }}
           {% else %}
