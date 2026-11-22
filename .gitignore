@@ -61,5 +61,6 @@ daily-theme/
 fluentpet/presses.jsonl
 fluentpet/presses.jsonl.tmp
 fluentpet/.presses.lock
-fluentpet/clips/
+fluentpet/clips/*
+!fluentpet/clips/.keep
 fluentpet/__pycache__/
