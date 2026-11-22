@@ -1,0 +1,270 @@
+# Billy's FluentPet press tracking (ha-manager, approved by Matt 2026-11-22).
+#
+# Every press of a FluentPet word is logged to /config/fluentpet/presses.jsonl by
+# /config/fluentpet/fluentpet.py (the file is the record; HA history keeps ~10 days).
+# Learner presses get a context check, then an ntfy push (topic billy-buttons) asking whether
+# the press was meant. Labels: meant / unclear / accidental / me (Matt teaching; never scored).
+# Until the tap route is decided, labels are set from the FluentPet dashboard
+# (script.fluentpet_label_latest). Scores: sensor.fluentpet_scores.
+#
+# Context checks
+#   Outside: did the BACK door (laundry) open within 10 min?
+#   Frisbee: 2-min clip from the office camera, plus a snapshot attached to the push.
+#   Water:   the long smart button by Billy's water, pressed within 5 min, confirms he drank.
+#
+# Word mapping: edit `words` in "FluentPet press" when a word moves to a new button. A new
+# FluentPet button also needs its event entity added to that trigger list; the roster check
+# below raises a notification when the number of FluentPet buttons changes.
+#
+# Clips live in /config/fluentpet/clips (persistent, gitignored); /media is not a mounted volume
+# in this container, so /media/fluentpet is only a link to that folder for the media browser.
+
+shell_command:
+  # cmd: log | drink | context | clip | notify | label | label_latest | backfill | stats | prune
+  # JSON arguments are base64-encoded by the caller.
+  fluentpet: "python3 /config/fluentpet/fluentpet.py {{ cmd }} {{ arg | default('-') }} {{ arg2 | default('-') }} {{ arg3 | default('-') }}"
+
+command_line:
+  - sensor:
+      name: FluentPet scores
+      unique_id: fluentpet_scores
+      icon: mdi:dog
+      command: "python3 /config/fluentpet/fluentpet.py stats"
+      command_timeout: 20
+      scan_interval: 300
+      unit_of_measurement: presses
+      value_template: "{{ value_json.today_total }}"
+      json_attributes:
+        - updated
+        - words
+        - pending
+        - pending_count
+        - drink_buttons_today
+
+script:
+  fluentpet_label_latest:
+    alias: FluentPet label latest press
+    icon: mdi:tag-check
+    mode: queued
+    fields:
+      label:
+        description: meant | unclear | accidental | me
+        required: true
+        selector:
+          select:
+            options: [meant, unclear, accidental, me]
+    sequence:
+      - action: shell_command.fluentpet
+        data:
+          cmd: label_latest
+          arg: "{{ label }}"
+        response_variable: res
+      - action: homeassistant.update_entity
+        target:
+          entity_id: sensor.fluentpet_scores
+      - action: logbook.log
+        data:
+          name: FluentPet
+          entity_id: sensor.fluentpet_scores
+          message: "Label {{ label }}: {{ res.stdout }}"
+
+automation:
+  - id: fluentpet_press
+    alias: FluentPet press
+    description: Log every FluentPet press, check context, ask Matt via ntfy whether it was meant.
+    mode: parallel
+    max: 20
+    triggers:
+      - trigger: state
+        entity_id:
+          - event.all_done_press
+          - event.billy_press
+          - event.chew_press
+          - event.frisbee_press
+          - event.later_press
+          - event.marsh_press
+          - event.mash_press
+          - event.scratches_press
+          - event.snarf_it_press
+          - event.treat_press
+          - event.walk_press
+          - event.want_press
+          - event.water_press
+    conditions:
+      # A new press changes the event's timestamp. Coming back from unavailable (restart,
+      # reload) is not a press; the script also de-duplicates by word + time.
+      - condition: template
+        value_template: >
+          {{ trigger.from_state is not none
+             and trigger.from_state.state != 'unavailable'
+             and trigger.to_state.state not in ['unavailable', 'unknown']
+             and trigger.to_state.attributes.event_type == 'press' }}
+    variables:
+      # ── Word mapping: context check → the button's CURRENT word (edit here) ──
+      words:
+        outside: Outside
+        frisbee: Frisbee
+        water: Water
+      a: "{{ trigger.to_state.attributes }}"
+      word: "{{ a.button.name if a.button is mapping else '' }}"
+      kind: >
+        {% set ns = namespace(k='other') %}
+        {% for k, v in words.items() %}{% if v | lower == word | lower %}{% set ns.k = k %}{% endif %}{% endfor %}
+        {{ ns.k }}
+      press: >
+        {{ {'word': word,
+            'normalized': a.button.normalized_word if a.button is mapping else word | lower,
+            'kind': kind,
+            'by_name': a.pressed_by.name if a.pressed_by is mapping else '',
+            'by_type': a.pressed_by.type if a.pressed_by is mapping else '',
+            'occurred_at': a.occurred_at,
+            'interaction_id': a.interaction_id,
+            'press_order': a.press_order,
+            'replayed': a.replayed,
+            'entity': trigger.entity_id} }}
+    actions:
+      - action: shell_command.fluentpet
+        data:
+          cmd: log
+          arg: "{{ press | to_json | base64_encode }}"
+        response_variable: logged
+      - variables:
+          r: "{{ logged.stdout | from_json if (logged.stdout | default('')).startswith('{') else {} }}"
+      - if: "{{ r.get('duplicate', true) or not r.get('id') }}"
+        then:
+          - stop: "Duplicate or not logged."
+      - action: homeassistant.update_entity
+        target:
+          entity_id: sensor.fluentpet_scores
+      - if: "{{ press.by_type == 'teacher' }}"
+        then:
+          - stop: "Teacher press: logged as Me, not scored, no question."
+      - choose:
+          - conditions: "{{ kind == 'frisbee' }}"
+            sequence:
+              - action: camera.record
+                target:
+                  entity_id: camera.office_camera
+                data:
+                  filename: "/config/fluentpet/clips/{{ r.id }}.mp4"
+                  duration: 120
+                continue_on_error: true
+              - delay: "00:02:05"
+              - action: shell_command.fluentpet
+                data:
+                  cmd: clip
+                  arg: "{{ r.id }}"
+          - conditions: "{{ kind == 'water' }}"
+            sequence:
+              - wait_for_trigger:
+                  - trigger: state
+                    entity_id: event.long_smart_button_action
+                    not_from: [unavailable, unknown]
+                timeout: "00:05:00"
+                continue_on_timeout: true
+              - action: shell_command.fluentpet
+                data:
+                  cmd: context
+                  arg: "{{ r.id }}"
+                  arg2: >
+                    {{ {'drink_confirmed': wait.trigger is not none,
+                        'drink_at': wait.trigger.to_state.state if wait.trigger else none} | to_json | base64_encode }}
+          - conditions: "{{ kind == 'outside' }}"
+            sequence:
+              - if: "{{ not has_value('binary_sensor.lau_back_dr_contact') }}"
+                then:
+                  - action: shell_command.fluentpet
+                    data:
+                      cmd: context
+                      arg: "{{ r.id }}"
+                      arg2: "{{ {'back_door': 'sensor unavailable'} | to_json | base64_encode }}"
+                else:
+                  - wait_for_trigger:
+                      - trigger: state
+                        entity_id: binary_sensor.lau_back_dr_contact
+                        to: "on"
+                    timeout: "00:10:00"
+                    continue_on_timeout: true
+                  - action: shell_command.fluentpet
+                    data:
+                      cmd: context
+                      arg: "{{ r.id }}"
+                      arg2: >
+                        {% set opened = wait.trigger is not none %}
+                        {{ {'back_door_opened': opened,
+                            'minutes': (((as_timestamp(wait.trigger.to_state.last_changed) - as_timestamp(press.occurred_at)) / 60) | round(1)) if opened else none}
+                           | to_json | base64_encode }}
+        default:
+          - action: shell_command.fluentpet
+            data:
+              cmd: context
+              arg: "{{ r.id }}"
+              arg2: "{{ {'check': 'none for this word'} | to_json | base64_encode }}"
+      - action: shell_command.fluentpet
+        data:
+          cmd: notify
+          arg: "{{ r.id }}"
+        response_variable: sent
+      - action: homeassistant.update_entity
+        target:
+          entity_id: sensor.fluentpet_scores
+      - if: "{{ not ((sent.stdout | default('')) is search('\"ok\": true')) }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              title: FluentPet push failed
+              notification_id: fluentpet_push_failed
+              message: "{{ word }} press {{ r.id }}: {{ sent.stdout | default('') }} {{ sent.stderr | default('') }}"
+
+  # The long smart button by Billy's water: every press is logged (Matt presses it when Billy
+  # actually drinks after a Water press). It confirms drinks; it never decides who pressed Water.
+  - id: fluentpet_drink_button
+    alias: FluentPet drink button
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: event.long_smart_button_action
+    conditions:
+      - condition: template
+        value_template: >
+          {{ trigger.from_state is not none and trigger.from_state.state != 'unavailable'
+             and trigger.to_state.state not in ['unavailable', 'unknown'] }}
+    actions:
+      - action: shell_command.fluentpet
+        data:
+          cmd: drink
+          arg: >
+            {{ {'ts': trigger.to_state.state,
+                'event_type': trigger.to_state.attributes.event_type} | to_json | base64_encode }}
+
+  # A new FluentPet button means a new event entity the press automation does not listen to.
+  - id: fluentpet_roster_check
+    alias: FluentPet button roster check
+    triggers:
+      - trigger: homeassistant
+        event: start
+      - trigger: time_pattern
+        hours: "/6"
+    conditions:
+      - condition: template
+        value_template: "{{ integration_entities('fluentpet') | select('match', 'event\\.') | list | count != 13 }}"
+    actions:
+      - action: persistent_notification.create
+        data:
+          notification_id: fluentpet_roster
+          title: FluentPet buttons changed
+          message: >
+            FluentPet now has {{ integration_entities('fluentpet') | select('match', 'event\.') | list | count }}
+            button event entities (the press automation listens to 13). Add new ones to
+            "FluentPet press" in packages/fluentpet.yaml.
+
+  - id: fluentpet_prune_clips
+    alias: FluentPet prune old clips
+    triggers:
+      - trigger: time
+        at: "04:10:00"
+    actions:
+      - action: shell_command.fluentpet
+        data:
+          cmd: prune
+          arg: "30"

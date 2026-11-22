@@ -56,3 +56,10 @@ __pycache__/
 
 # Daily theme pulled from Supabase by a cron job on the CM4 (ha-manager docs/contracts/daily-theme.md)
 daily-theme/
+
+# FluentPet press log and camera clips (Billy). The data stays on the CM4: this repo is public.
+fluentpet/presses.jsonl
+fluentpet/presses.jsonl.tmp
+fluentpet/.presses.lock
+fluentpet/clips/
+fluentpet/__pycache__/
