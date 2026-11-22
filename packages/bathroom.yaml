@@ -1136,6 +1136,40 @@ automation:
                     Someone switched the ceiling light on at the wall, so someone is in the bathroom
                     ({{ 'door closed' if is_state('binary_sensor.bat_dr_contact', 'off') else 'door open' }}).
 
+  # R8 confirmation (Matt, 2026-11-21): after the ceiling light is switched off at the wall
+  # (bulb was on), hallway motion going clear → detected confirms the person walked out.
+  # Logs only: R8 already set vacant, and motion inside the bathroom re-occupies it through
+  # the normal rules if someone stayed. Separate from R8 so its wait never delays R8.
+  - id: bathroom_hue_exit_confirm
+    alias: Bathroom exit confirmed by hallway motion
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: light.bat_lt
+        from: "on"
+        to: unavailable
+        for: "00:00:03"
+    conditions:
+      - condition: template
+        value_template: "{{ has_value('light.hal_lt') }}"
+    actions:
+      - wait_for_trigger:
+          - trigger: state
+            entity_id: binary_sensor.hal_mo_occupancy
+            from: "off"
+            to: "on"
+        timeout: "00:01:00"
+        continue_on_timeout: true
+      - action: logbook.log
+        data:
+          name: Bathroom occupancy
+          entity_id: binary_sensor.bathroom_occupied
+          message: >
+            {% if wait.trigger %}R8 confirmed: hallway motion right after the ceiling light was
+            switched off, so the person left the bathroom.
+            {% else %}R8 not confirmed: no hallway motion within 60 s of the ceiling light being
+            switched off. Still marked vacant; motion inside would re-occupy it.{% endif %}
+
   # After every SwitchBot press: wait for the (slow) light sensor to report, then confirm the
   # press landed. If it did not, adopt what the sensor sees, so the light shows the truth.
   # Never presses again, so a bad reading cannot start a press loop. (Matt, 2026-11-21)
