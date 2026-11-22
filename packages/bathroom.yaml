@@ -418,9 +418,12 @@ template:
                       and has_value('binary_sensor.bathroom_switchbot_lights_measured'))
                  or is_state('binary_sensor.bathroom_switchbot_lights_measured', 'off') }}
             then:
+              # Press over Bluetooth (local, via the BT proxies) when it is reachable; the
+              # SwitchBot Cloud copy is the backup (it was offline on 2026-11-21).
               - action: switch.toggle
                 target:
-                  entity_id: switch.bat_bot
+                  entity_id: >-
+                    {{ 'switch.bat_bot_bt' if has_value('switch.bat_bot_bt') else 'switch.bat_bot' }}
         turn_off:
           - action: input_boolean.turn_off
             target:
@@ -432,7 +435,8 @@ template:
             then:
               - action: switch.toggle
                 target:
-                  entity_id: switch.bat_bot
+                  entity_id: >-
+                    {{ 'switch.bat_bot_bt' if has_value('switch.bat_bot_bt') else 'switch.bat_bot' }}
 
 # ───────────────────────── Automations ─────────────────────────
 

@@ -1073,7 +1073,7 @@
   actions:
   - variables:
       button: "{{ trigger.to_state.attributes.event_type }}"
-      any_on: "{{ is_state('light.bat_lt', 'on') or is_state('switch.bat_bot', 'on') }}"
+      any_on: "{{ is_state('light.bat_lt', 'on') or is_state('switch.bathroom_fan_and_lights', 'on') }}"
   - choose:
     - conditions: "{{ button == 'press_1' and any_on }}"
       sequence:
@@ -1082,7 +1082,7 @@
           entity_id: light.bat_lt
       - action: switch.turn_off
         target:
-          entity_id: switch.bat_bot
+          entity_id: switch.bathroom_fan_and_lights
     - conditions: "{{ button == 'press_1' }}"
       sequence:
       - action: light.turn_on
@@ -1092,7 +1092,7 @@
           brightness_pct: "{{ states('sensor.house_light_level') | int(30) }}"
       - action: switch.turn_on
         target:
-          entity_id: switch.bat_bot
+          entity_id: switch.bathroom_fan_and_lights
     - conditions: "{{ button == 'press_2' and is_state('light.bat_lt', 'on') }}"
       sequence:
       - action: light.turn_off
@@ -1109,7 +1109,7 @@
       sequence:
       - action: switch.toggle
         target:
-          entity_id: switch.bat_bot
+          entity_id: switch.bathroom_fan_and_lights
     - conditions: "{{ button == 'press_4' }}"
       sequence:
       - action: light.turn_off
@@ -1117,7 +1117,7 @@
           entity_id: light.bat_lt
       - action: switch.turn_off
         target:
-          entity_id: switch.bat_bot
+          entity_id: switch.bathroom_fan_and_lights
   mode: queued
 - id: 'pocket-sign-square-button-1'
   alias: Pocket Sign square button
