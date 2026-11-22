@@ -153,9 +153,14 @@ timer:
   bathroom_presence_hold:
     name: Bathroom presence hold
     restore: true
+  # 60 s after the ceiling light is switched off at the wall (R8): the person is walking out,
+  # so their door and motion signals must not count as someone entering (decision table N1/N2).
+  bathroom_exit_window:
+    name: Bathroom exit window
+    restore: true
 
-# When the SwitchBot last pressed the wall switch. The light sensor confirms a change only
-# after ~20 s (debounce), so light.bathroom_light trusts its last command for 45 s after a press.
+# When the SwitchBot last pressed the wall switch. "Bathroom SwitchBot confirm press" uses it to
+# check each press against the (slow) light sensor; the sync automation skips the 5 min after it.
 input_datetime:
   bathroom_switchbot_last_press:
     name: "Bathroom: SwitchBot last press"
@@ -563,6 +568,15 @@ automation:
             {% set cap = states('input_number.bathroom_shower_max_hold') | float(120) * 60 %}
             {{ is_state('binary_sensor.bathroom_shower', 'on')
                and (now() - states.binary_sensor.bathroom_shower.last_changed).total_seconds() < cap }}
+      # Exit window (N1/N2): right after the light was switched off at the wall, the leaving
+      # person opens/closes the door and trips the motion sensor. While the room is vacant and
+      # the window runs, those signals are theirs, not a new arrival. Someone really coming back
+      # switches the Hue on at the wall (R8 back), which is not blocked.
+      - if: >
+          {{ is_state('timer.bathroom_exit_window', 'active') and occ == 'vacant'
+             and trigger.id in ['door_opened', 'door_closed', 'motion_on', 'motion_off'] }}
+        then:
+          - stop: "Exit window after R8: ignoring the leaving person's door/motion."
       - choose:
           # ── Door opened ──
           - conditions:
@@ -906,10 +920,12 @@ automation:
                   # Hue bulb unreachable (its wall switch is off, or it dropped
                   # out): use the SwitchBot lights, but only through the
                   # sync-corrected switch so the press cannot invert.
+                  # Not in sleep mode: no bright lights + fan noise at night (Matt, 2026-11-21, N9).
                   - conditions: >
                       {{ not has_value('light.bat_lt')
                          and is_state('input_boolean.bathroom_switchbot_fallback', 'on')
-                         and is_state('input_boolean.bathroom_switchbot_lux_sync', 'on') }}
+                         and is_state('input_boolean.bathroom_switchbot_lux_sync', 'on')
+                         and is_state('input_boolean.sleep_mode', 'off') }}
                     sequence:
                       - action: input_boolean.turn_on
                         target:
@@ -1045,6 +1061,12 @@ automation:
         value_template: >
           {% set p = as_datetime(states('input_datetime.bathroom_switchbot_last_press')) %}
           {{ p is none or (now() - as_local(p)).total_seconds() > 300 }}
+      # N7: for 5 min after the Hue changes (on/off, brightness, wall switch), the slow light
+      # sensor still reports light that included (or lacked) the Hue: don't trust it.
+      - condition: template
+        value_template: >
+          {% set h = states.light.bat_lt %}
+          {{ h is none or (now() - ([h.last_changed, h.last_updated] | max)).total_seconds() > 300 }}
     actions:
       - action: "input_boolean.turn_{{ 'on' if is_state('binary_sensor.bathroom_switchbot_lights_measured', 'on') else 'off' }}"
         target:
@@ -1096,6 +1118,11 @@ automation:
                   # Light switched off at the wall on the way out: vacant now. (The SwitchBot
                   # cannot be standing in while the Hue was on, so the normal vacant path
                   # in "Bathroom lights by occupancy" does any cleanup.)
+                  - action: timer.start
+                    target:
+                      entity_id: timer.bathroom_exit_window
+                    data:
+                      duration: "00:01:00"
                   - action: script.bathroom_set_occupancy
                     data:
                       new_state: vacant
@@ -1120,6 +1147,9 @@ automation:
               - action: input_boolean.turn_off
                 target:
                   entity_id: input_boolean.bathroom_hue_power_cut
+              - action: timer.cancel
+                target:
+                  entity_id: timer.bathroom_exit_window
               # Hand back from the stand-in, unless the shower needs the fan.
               - if: >
                   {{ is_state('input_boolean.bathroom_fallback_active', 'on')
@@ -1202,6 +1232,10 @@ automation:
             continue_on_timeout: true
       - variables:
           seen: "{{ states('binary_sensor.bathroom_switchbot_lights_measured') }}"
+          # N7: a Hue change in the last 5 min makes the light sensor's reading unreliable.
+          hue_quiet: >
+            {% set h = states.light.bat_lt %}
+            {{ h is none or (now() - ([h.last_changed, h.last_updated] | max)).total_seconds() > 300 }}
       - choose:
           - conditions: "{{ seen == asked }}"
             sequence:
@@ -1210,6 +1244,15 @@ automation:
                   name: Bathroom SwitchBot
                   entity_id: light.bathroom_light
                   message: "Press confirmed by the light sensor: light is {{ seen }}."
+          - conditions: "{{ seen in ['on', 'off'] and not hue_quiet }}"
+            sequence:
+              - action: logbook.log
+                data:
+                  name: Bathroom SwitchBot
+                  entity_id: light.bathroom_light
+                  message: >
+                    Could not confirm the press: the Hue changed in the last 5 minutes, so the light
+                    sensor's reading ({{ seen }}) may be stale. Kept {{ asked }}.
           - conditions: "{{ seen in ['on', 'off'] and is_state('input_boolean.bathroom_switchbot_target', asked) }}"
             sequence:
               - action: "input_boolean.turn_{{ seen }}"
