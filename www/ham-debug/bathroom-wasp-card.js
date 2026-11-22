@@ -56,8 +56,8 @@
     temp: { name: 'Temperature (meter)', entity: E.temp, role: 'temperatures', about: 'Same sensor as humidity. Data only: no rule reads it yet.', rules: 'none' },
     temp2: { name: 'Temperature (PIR)', entity: E.temp2, role: 'temperatures', about: 'Hue motion sensor. Data only: the near-minus-far difference is logged as a possible shower signal.', rules: 'none' },
     tap: { name: 'Hue Tap', entity: E.tap, role: 'tap', about: '1: everything on/off, 2: Hue bulb, 3: SwitchBot, 4: all off. Manual off sticks until the room is vacant.', rules: 'manual' },
-    sb: { name: 'SwitchBot: fan + lights', entity: E.sb, about: 'One press flips the exhaust fan, the second ceiling light and the vanity light together. Blind unless sync reads the light sensor.', rules: 'fan R6' },
-    bulb: { name: 'Hue bulb', entity: E.bulb, about: 'The automatic light. On the instant occupancy leaves vacant; off after the delay once nothing holds it.', rules: 'R1 R6' },
+    sb: { name: 'Bathroom light (SwitchBot): fan + lights', entity: E.sb, about: 'One press of the push-button wall switch flips the exhaust fan, the second ceiling light and the vanity light together. Pressed over Bluetooth first, SwitchBot Cloud as backup. Its state is the last command; the light sensor confirms each press within 5 min (not for 5 min after a Hue change). Stands in for the Hue when its wall switch is off (not in sleep mode).', rules: 'fan R6 confirm sync' },
+    bulb: { name: 'Hue bulb', entity: E.bulb, about: 'The automatic light, on its own wall switch inside the bathroom. On the instant occupancy leaves vacant; off after the delay once nothing holds it. Switched off at the wall (shows unavailable) = the person left (R8, then a 60 s exit window); switched back on = someone is inside.', rules: 'R1 R6 R8' },
   };
   const INPUTS = ['door', 'pir', 'delay', 'hum', 'base', 'lux', 'temp', 'temp2', 'tap'];
   const OUTPUTS = ['sb', 'bulb'];
