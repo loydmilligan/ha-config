@@ -788,7 +788,10 @@ automation:
               - choose:
                   - conditions: "{{ pir_on }}"
                     sequence: []
-                  - conditions: "{{ occ == 'locked' and is_state('input_text.bathroom_last_rule', 'R3') }}"
+                  # A lock confirmed by a person survives the shower ending: R3 = motion with the
+                  # door closed; R8 = the Hue switched on at its wall switch, which is inside the
+                  # bathroom (Matt, 2026-11-21; decision table rows H5/S4).
+                  - conditions: "{{ occ == 'locked' and states('input_text.bathroom_last_rule') in ['R3', 'R8'] }}"
                     sequence: []
                   - conditions: "{{ occ == 'presence' }}"
                     sequence:
