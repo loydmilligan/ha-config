@@ -141,6 +141,10 @@ input_boolean:
     name: "Bathroom: SwitchBot last commanded state"
   bathroom_fallback_active:
     name: "Bathroom: SwitchBot is standing in for the Hue bulb"
+  # Set when the Hue bulb loses power on its own (its wall switch was flipped off) while
+  # other Zigbee lights stay up; cleared when it comes back. Survives restarts.
+  bathroom_hue_power_cut:
+    name: "Bathroom: Hue bulb's wall switch is off"
 
 timer:
   bathroom_untrusted_window:
@@ -1050,6 +1054,87 @@ automation:
             Measured light says the SwitchBot circuit is
             {{ states('binary_sensor.bathroom_switchbot_lights_measured') }}, which is not what was last commanded.
             Adopted the measured state (wall switch used by hand, or a press failed).
+
+  # R8: the Hue bulb's own wall switch (Matt, 2026-11-21). People flip it often.
+  #  - Bulb drops out while the hallway Zigbee light stays up (so not a Zigbee/HA restart):
+  #    its wall switch was flipped off. If the bulb was ON, the person switched the light off
+  #    as they left: the room is vacant. If it was already off, it says nothing about who is in.
+  #    While it is off, the existing fallback uses the SwitchBot light whenever the room is occupied.
+  #  - Switch flipped back ON (bulb returns): someone is in the bathroom. Mark it occupied
+  #    (door closed → locked, door open → presence) and hand back from the SwitchBot stand-in.
+  - id: bathroom_hue_wall_switch
+    alias: Bathroom Hue wall switch
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: light.bat_lt
+        from: ["on", "off"]
+        to: unavailable
+        for: "00:00:03"
+        id: cut
+      - trigger: state
+        entity_id: light.bat_lt
+        from: unavailable
+        to: ["on", "off"]
+        id: back
+    actions:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: cut
+              - condition: template
+                value_template: "{{ has_value('light.hal_lt') }}"
+            sequence:
+              - action: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.bathroom_hue_power_cut
+              - if: "{{ trigger.from_state.state == 'on' }}"
+                then:
+                  # Light switched off at the wall on the way out: vacant now. (The SwitchBot
+                  # cannot be standing in while the Hue was on, so the normal vacant path
+                  # in "Bathroom lights by occupancy" does any cleanup.)
+                  - action: script.bathroom_set_occupancy
+                    data:
+                      new_state: vacant
+                      rule: R8
+                      reason: >
+                        Someone switched the ceiling light off at the wall, so they have left the bathroom.
+                else:
+                  - action: logbook.log
+                    data:
+                      name: Bathroom occupancy
+                      entity_id: light.bat_lt
+                      message: >
+                        R8: the Hue bulb's wall switch was turned off while the bulb was already off.
+                        Occupancy unchanged; the SwitchBot light stands in until it is back.
+          - conditions:
+              - condition: trigger
+                id: back
+              - condition: state
+                entity_id: input_boolean.bathroom_hue_power_cut
+                state: "on"
+            sequence:
+              - action: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.bathroom_hue_power_cut
+              # Hand back from the stand-in, unless the shower needs the fan.
+              - if: >
+                  {{ is_state('input_boolean.bathroom_fallback_active', 'on')
+                     and is_state('binary_sensor.bathroom_shower', 'off') }}
+                then:
+                  - action: input_boolean.turn_off
+                    target:
+                      entity_id: input_boolean.bathroom_fallback_active
+                  - action: switch.turn_off
+                    target:
+                      entity_id: switch.bathroom_fan_and_lights
+              - action: script.bathroom_set_occupancy
+                data:
+                  new_state: "{{ 'locked' if is_state('binary_sensor.bat_dr_contact', 'off') else 'presence' }}"
+                  rule: R8
+                  reason: >
+                    Someone switched the ceiling light on at the wall, so someone is in the bathroom
+                    ({{ 'door closed' if is_state('binary_sensor.bat_dr_contact', 'off') else 'door open' }}).
 
   # After every SwitchBot press: wait for the (slow) light sensor to report, then confirm the
   # press landed. If it did not, adopt what the sensor sees, so the light shows the truth.
