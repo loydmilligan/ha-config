@@ -7,11 +7,27 @@
 # diagnostics and the map images. device_tracker.roomba is excluded because it
 # reports position about once a second while cleaning (~5,000 rows per run);
 # the live state still works and Roomba+ keeps its own path/coverage maps.
+#
+# Office radar and vision (weekly review 2026-11-22, approved by Matt): the
+# Everything Presence Lite target_N_{x,y,speed,angle,distance,resolution} sensors
+# were 82% of all history rows. The glob matches target_<digit>_<thing> only, so
+# zone_N_target_count, illuminance, CO2 and every binary_sensor stay recorded.
+# The office vision poll runs every ~10 s, so its automation and last-poll helper
+# are excluded; their live states still work. Amcrest camera events (half of all
+# event rows) aren't used by anything; motion is a binary_sensor and is kept.
+# The Marsh desk plug (power/current, ~14% each after this) is left in on purpose
+# until the power dashboard is designed.
 # Rollback: delete this file, restart HA.
 
 recorder:
   exclude:
+    entity_globs:
+      - sensor.everything_presence_lite_*_target_?_*
+    event_types:
+      - amcrest
     entities:
+      - automation.office_vision_poll
+      - input_datetime.office_vision_last_poll
       - device_tracker.roomba
       - image.roomba_map
       - image.roomba_coverage_map
@@ -65,3 +81,26 @@ recorder:
       - sensor.roomba_total_cleaning_time
       - sensor.roomba_total_energy_consumed
       - sensor.roomba_total_missions
+
+# ONE-TIME (remove on 2026-11-23 after the morning check): repack the database once,
+# at night, after the 2026-11-22 purge of the office radar history. The DB is locked
+# for a few minutes while it runs; history and logbook pause.
+automation:
+  - id: recorder_one_time_repack_20261123
+    alias: Recorder one-time repack (2026-11-23 02:30, remove after)
+    mode: single
+    triggers:
+      - trigger: time
+        at: "02:30:00"
+    conditions:
+      - condition: template
+        value_template: "{{ now().date() | string == '2026-11-23' }}"
+    actions:
+      - action: recorder.purge
+        data:
+          keep_days: 10
+          repack: true
+      - action: logbook.log
+        data:
+          name: Recorder
+          message: "One-time repack requested (keep_days 10, repack true)."
