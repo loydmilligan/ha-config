@@ -37,6 +37,8 @@ import urllib.request
 BASE = os.environ.get("FP_BASE", "/config/fluentpet")
 LOG = os.path.join(BASE, "presses.jsonl")
 LOCK = os.path.join(BASE, ".presses.lock")
+RECORDING = os.path.join(BASE, ".recording.json")  # which Frisbee press is recording, and until when
+RECORD_SECS = 120  # must match camera.record duration in packages/fluentpet.yaml
 CLIPS = os.path.join(BASE, "clips")
 MEDIA_LINK = os.environ.get("FP_MEDIA_LINK", "/media/fluentpet")
 SECRETS = os.environ.get("FP_SECRETS", "/config/secrets.yaml")
@@ -192,8 +194,25 @@ def cmd_log(arg):
             "label_by": "fluentpet teacher" if teacher else None,
             "token": pysecrets.token_urlsafe(9),
         }
+        # Frisbee: the camera can record only one clip at a time. A press while a clip is
+        # still recording shares that clip instead of starting (and failing) a second one.
+        record = False
+        if row["kind"] == "frisbee" and not teacher:
+            busy = None
+            try:
+                with open(RECORDING) as f:
+                    busy = json.load(f)
+            except (OSError, ValueError):
+                pass
+            if busy and busy.get("until", 0) > time.time():
+                row["context"]["clip_shared_with"] = busy.get("id")
+            else:
+                record = True
+                with open(RECORDING, "w") as f:
+                    json.dump({"id": row["id"], "until": time.time() + RECORD_SECS + 10}, f)
         append_line(row)
-    out({"duplicate": False, "id": row["id"], "token": row["token"], "kind": row["kind"]})
+    out({"duplicate": False, "id": row["id"], "token": row["token"], "kind": row["kind"],
+         "record": record})
 
 
 def cmd_drink(arg):
@@ -223,9 +242,28 @@ def cmd_context(pid, arg):
     out({"ok": True, "context": c})
 
 
+def cmd_clip_bg(pid):
+    """Start clip + notify in a detached process and return at once (shell_command has a 60 s limit;
+    waiting for the clip and making the snapshot takes about 2 min on the CM4)."""
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "clip_notify", pid],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True, close_fds=True)
+    out({"ok": True, "started": "clip_notify", "id": pid})
+
+
+def cmd_clip_notify(pid):
+    try:
+        cmd_clip(pid)
+    finally:
+        cmd_notify(pid)  # always ask, with or without a clip
+
+
 def cmd_clip(pid):
     ensure_dirs()
     clip = os.path.join(CLIPS, pid + ".mp4")
+    shared = ((find(read_lines(), pid) or {}).get("context") or {}).get("clip_shared_with")
+    if shared and not os.path.exists(clip):
+        clip = os.path.join(CLIPS, shared + ".mp4")  # the press that started the recording
     # camera.record finishes writing after its duration; wait for the size to settle.
     last, stable = -1, 0
     for _ in range(45):
@@ -240,8 +278,10 @@ def cmd_clip(pid):
         time.sleep(2)
     ctx = {}
     if os.path.exists(clip) and os.path.getsize(clip) > 0:
-        ctx["clip"] = "/media/fluentpet/%s.mp4" % pid
+        ctx["clip"] = "/media/fluentpet/" + os.path.basename(clip)
         ctx["clip_mb"] = round(os.path.getsize(clip) / 1e6, 1)
+        if shared and os.path.basename(clip) != pid + ".mp4":
+            ctx["clip_shared"] = True
     else:
         # Another Frisbee press may already be recording (one recording per camera at a time):
         # use the newest clip that started within the last 3 minutes.
@@ -291,11 +331,12 @@ def describe_context(r):
     return ""
 
 
-def cmd_notify(pid):
+def _notify(pid):
+    """Send the ntfy push for one press; returns the result dict."""
     rows = read_lines()
     r = find(rows, pid)
     if not r:
-        return out({"ok": False, "error": "no such press"})
+        return ({"ok": False, "error": "no such press"})
     title = "Billy pressed %s" % r.get("word")
     lines = ["%s at %s." % (r.get("word"), local_hm(r.get("ts")))]
     ctx = describe_context(r)
@@ -309,7 +350,7 @@ def cmd_notify(pid):
     message = " ".join(lines)
     token = read_secret("ntfy_billy_token")
     if not token and not NTFY_DRY:
-        return out({"ok": False, "error": "ntfy_billy_token missing from secrets"})
+        return ({"ok": False, "error": "ntfy_billy_token missing from secrets"})
     headers = {"Authorization": "Bearer %s" % token, "Title": title, "Tags": "dog"}
     if label_url:
         # Tap route (on hold as of 2026-11-22). ntfy allows at most 3 actions per message.
@@ -333,7 +374,7 @@ def cmd_notify(pid):
     else:
         body, method = message.encode("utf-8"), "POST"
     if NTFY_DRY:
-        return out({"ok": True, "dry_run": True, "method": method, "url": url,
+        return ({"ok": True, "dry_run": True, "method": method, "url": url,
                     "headers": {k: v for k, v in headers.items() if k != "Authorization"},
                     "message": message, "attachment": os.path.basename(snap) if snap else None})
     req = urllib.request.Request(url, data=body, method=method, headers=headers)
@@ -341,10 +382,23 @@ def cmd_notify(pid):
         with urllib.request.urlopen(req, timeout=30) as resp:
             status = resp.status
     except urllib.error.HTTPError as e:
-        return out({"ok": False, "status": e.code, "error": e.read().decode(errors="replace")[:200]})
+        return ({"ok": False, "status": e.code, "error": e.read().decode(errors="replace")[:200]})
     except (urllib.error.URLError, OSError) as e:
-        return out({"ok": False, "error": str(e)[:200]})
-    out({"ok": status == 200, "status": status, "attachment": os.path.basename(snap) if snap else None})
+        return ({"ok": False, "error": str(e)[:200]})
+    return {"ok": status == 200, "status": status, "attachment": os.path.basename(snap) if snap else None}
+
+
+def cmd_notify(pid):
+    res = _notify(pid)
+    # Keep the push result on the press's line (the weekly review counts failed pushes).
+    with Locked():
+        rows = read_lines()
+        r = find(rows, pid)
+        if r:
+            r["notify"] = {"at": now_utc().isoformat(), "ok": bool(res.get("ok")),
+                           "status": res.get("status"), "error": res.get("error")}
+            write_lines(rows)
+    out(res)
 
 
 def _set_label(r, label, by):
@@ -498,6 +552,8 @@ def main(argv):
         "context": lambda: cmd_context(args[0], args[1]),
         "clip": lambda: cmd_clip(args[0]),
         "notify": lambda: cmd_notify(args[0]),
+        "clip_bg": lambda: cmd_clip_bg(args[0]),
+        "clip_notify": lambda: cmd_clip_notify(args[0]),
         "label": lambda: cmd_label(args[0], args[1], args[2] if len(args) > 2 else None),
         "label_latest": lambda: cmd_label_latest(args[0]),
         "backfill": lambda: cmd_backfill(args[0]),

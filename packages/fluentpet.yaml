@@ -140,20 +140,28 @@ automation:
         then:
           - stop: "Teacher press: logged as Me, not scored, no question."
       - choose:
+          # Frisbee: one clip at a time per camera. log returns record=false when another
+          # Frisbee clip is still recording; this press then shares that clip. The clip wait,
+          # snapshot and push take ~2 min, longer than shell_command's 60 s limit, so clip_bg
+          # runs them in a detached process and the push is sent from there (not below).
           - conditions: "{{ kind == 'frisbee' }}"
             sequence:
-              - action: camera.record
-                target:
-                  entity_id: camera.office_camera
-                data:
-                  filename: "/config/fluentpet/clips/{{ r.id }}.mp4"
-                  duration: 120
-                continue_on_error: true
+              - if: "{{ r.get('record', false) }}"
+                then:
+                  - action: camera.record
+                    target:
+                      entity_id: camera.office_camera
+                    data:
+                      filename: "/config/fluentpet/clips/{{ r.id }}.mp4"
+                      duration: 120
+                    continue_on_error: true
               - delay: "00:02:05"
               - action: shell_command.fluentpet
                 data:
-                  cmd: clip
+                  cmd: clip_bg
                   arg: "{{ r.id }}"
+                continue_on_error: true
+              - stop: "Frisbee: clip and push handed to clip_bg."
           - conditions: "{{ kind == 'water' }}"
             sequence:
               - wait_for_trigger:
