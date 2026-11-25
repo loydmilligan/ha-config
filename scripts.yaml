@@ -240,10 +240,6 @@ office_vision_check:
     - action: counter.increment
       target:
         entity_id: "{{ 'counter.office_ai_checks_error' if failed else ('counter.office_ai_checks_person' if present else 'counter.office_ai_checks_empty') }}"
-  - action: homeassistant.update_entity
-    continue_on_error: true
-    target:
-      entity_id: sensor.office_vision_cost
   - variables:
       out:
         person_present: "{{ vision.get('person_present') }}"

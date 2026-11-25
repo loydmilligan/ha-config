@@ -732,17 +732,21 @@
   max_exceeded: silent
 - id: office_vision_poll
   alias: Office Vision Poll
-  description: While the lights are on and motion has stopped, checks the room at the configured interval. Only valid empty answers count toward turning the lights off; a failed check never does.
+  description: While the lights are on, camera motion has stopped and the radar sees nobody, checks the room at the configured interval (30-second ticks). While the radar sees someone the lights cannot turn off, so no check is made; the empty-check count restarts when the radar comes on. Only valid empty answers count toward turning the lights off; a failed check never does.
   trace:
     stored_traces: 20
   triggers:
   - trigger: time_pattern
-    seconds: /10
+    seconds: /30
     id: tick
   - trigger: state
     entity_id: binary_sensor.office_camera_motion_detected
     to: 'on'
     id: motion
+  - trigger: state
+    entity_id: binary_sensor.office_presence_radar
+    to: 'on'
+    id: radar
   conditions:
   - condition: state
     entity_id: input_boolean.office_vision_enabled
@@ -763,9 +767,19 @@
           option: motion
     - conditions:
       - condition: trigger
+        id: radar
+      sequence:
+      - action: counter.reset
+        target:
+          entity_id: counter.office_vision_absent_streak
+    - conditions:
+      - condition: trigger
         id: tick
       - condition: state
         entity_id: binary_sensor.office_camera_motion_detected
+        state: 'off'
+      - condition: state
+        entity_id: binary_sensor.office_presence_radar
         state: 'off'
       - condition: state
         entity_id:
