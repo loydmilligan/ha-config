@@ -210,7 +210,10 @@ automation:
         sleep_behavior: skip
         reason: input_text.bedroom_lights_reason
 
-  # ── Laundry room: the old SmartThings PIR (needs a battery as of 2026-11-14) + both lights.
+  # ── Laundry room: SONOFF motion sensor (front) plus the SwitchBot back door sensor
+  # (2026-11-24): its motion, and the door itself, which counts while it is open.
+  # Its bright/dim light sensor is NOT an input: it reads "bright" whenever the
+  # laundry lights are on, so it would hold the room occupied forever.
   - id: ham_laundry_room_occupancy
     alias: "[Laundry room] Activity → occupied"
     use_blueprint:
@@ -219,6 +222,8 @@ automation:
         occupied: input_boolean.laundry_room_occupied
         activity_entities:
           - binary_sensor.lau_mo_occupancy
+          - binary_sensor.lau_back_dr_motion
+          - binary_sensor.lau_back_dr_contact
         vacancy_hold: input_number.laundry_room_vacancy_hold
         reason: input_text.laundry_room_occupancy_reason
   - id: ham_laundry_room_lights
@@ -236,7 +241,9 @@ automation:
         sleep_behavior: dim
         reason: input_text.laundry_room_lights_reason
 
-  # ── Laundry button (SONOFF): single press toggles all four laundry lights.
+  # ── Laundry buttons: the SONOFF button (single press) and the button on the
+  # SwitchBot back door sensor across the room (2026-11-24) both toggle all four
+  # laundry lights.
   # The kitchen button already toggles the kitchen downlights in the UI
   # automation "Kitchen button controls", so it is not repeated here.
   - id: ham_laundry_button
@@ -248,6 +255,12 @@ automation:
         device_id: 61078f03347fbe18de5026656f87bb2f
         type: action
         subtype: single
+      # Event entity: its state is the time of the last press. Coming back from
+      # unavailable is not a press.
+      - trigger: state
+        entity_id: event.lau_back_dr_button
+        not_from: [unavailable]
+        not_to: [unavailable, unknown]
     actions:
       # All four on or all four off, never a mix: decide from "is any on".
       # West fixture: lau_n_lt / lau_s_lt (Zigbee). East fixture: NE / SE Matter bulbs (2026-11-18).

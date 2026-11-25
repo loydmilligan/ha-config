@@ -1,0 +1,39 @@
+# Plugs that must never be off (ha-manager, 2026-11-24).
+#
+# The washer and dryer plugs exist only to measure power (laundry-done alerts in
+# packages/notify_light.yaml). If one is ever switched off, by a tap in the app,
+# a voice command or an "all off", this turns it straight back on. It also checks
+# when Home Assistant starts and when a plug comes back from being unreachable.
+# The plugs themselves are also set to power on after a power cut (Zigbee2MQTT
+# "Power-on behavior" = on), which covers the case where HA is down.
+#
+# To add a plug, add it to both lists.
+
+automation:
+  - id: ham_always_on_plugs
+    alias: "[Laundry room] Washer and dryer plugs stay on"
+    mode: queued
+    max: 4
+    triggers:
+      - trigger: state
+        entity_id:
+          - switch.lau_wash_pl
+          - switch.lau_dry_pl
+        to: "off"
+        for: "00:00:03"
+      - trigger: homeassistant
+        event: start
+    variables:
+      plugs: [switch.lau_wash_pl, switch.lau_dry_pl]
+      off_now: "{{ plugs | select('is_state', 'off') | list }}"
+    conditions:
+      - condition: template
+        value_template: "{{ off_now | count > 0 }}"
+    actions:
+      - action: switch.turn_on
+        target:
+          entity_id: "{{ off_now }}"
+      - action: logbook.log
+        data:
+          name: Always-on plugs
+          message: "turned back on: {{ off_now | map('state_attr', 'friendly_name') | join(', ') }}"

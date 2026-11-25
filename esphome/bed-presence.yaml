@@ -67,7 +67,7 @@ esp32:
   board: adafruit_feather_esp32_v2
   flash_size: 8MB
   framework:
-    type: arduino
+    type: esp-idf
 
 logger:
 
@@ -83,6 +83,17 @@ wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
   power_save_mode: none
+
+# Bluetooth proxy (added 2026-11-24): relays nearby Bluetooth devices to Home
+# Assistant, first of all the laundry back door SwitchBot contact sensor.
+# The proxy moves with this board, so it leaves the laundry room when the
+# board goes under the bed.
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+
+bluetooth_proxy:
+  active: true
 
 globals:
   # 0 Active, 1 Test, 2 Edit. Not restored, so a reboot stays dark.
