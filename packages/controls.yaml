@@ -103,10 +103,11 @@ input_number:
     icon: mdi:fan-clock
 
 # ───────────────────────── Read-only occupancy for the office ─────────────────────────
-# The office keeps its own camera-based lights logic ("Office Lights by AI Camera", "Office Vision
-# Poll"). This sensor only READS that state so other automations (the fans, Phase 5) have one
-# entity to consume. It writes nothing, so the one-writer rule is unaffected.
-# Occupied = radar on OR presence state motion / vision_present; vision_absent forces empty.
+# The office lights follow the two radar sensors ("Office Lights by Radar"). This sensor only
+# READS the radar so other automations (the fans, Phase 5) have one entity to consume. It
+# writes nothing, so the one-writer rule is unaffected.
+# 2026-11-25 (Matt): the camera/AI poll was retired, so occupied = radar only. Before that,
+# the camera's presence state could override the radar.
 
 template:
   - binary_sensor:
@@ -114,12 +115,7 @@ template:
         unique_id: office_occupied
         device_class: occupancy
         icon: mdi:account-check
-        # Matt, 2026-11-17: the camera's "absent" answer wins, even if the radar still says on.
-        state: >-
-          {% set p = states('input_select.office_presence_state') %}
-          {% if p == 'vision_absent' %}false
-          {% else %}{{ is_state('binary_sensor.office_presence_radar', 'on') or p in ['motion', 'vision_present'] }}
-          {% endif %}
+        state: "{{ is_state('binary_sensor.office_presence_radar', 'on') }}"
 
 # ───────────────────────── Phase 2: scheduled sleep mode (HC-001…003) ─────────────────────────
 # Matt, 2026-11-18: sleep 02:00 → 08:00. Only acts at the two boundaries, so a manual toggle
