@@ -210,8 +210,9 @@ automation:
         sleep_behavior: skip
         reason: input_text.bedroom_lights_reason
 
-  # ── Laundry room: SONOFF motion sensor (front) plus the SwitchBot back door sensor
-  # (2026-11-24): its motion, and the door itself, which counts while it is open.
+  # ── Laundry room: the SwitchBot back door sensor only (2026-11-24): its motion, and the
+  # door itself, which counts while it is open. The SONOFF motion sensor that used to be
+  # here was moved to the living room on 2026-11-25 and is now binary_sensor.liv_mo_occupancy.
   # Its bright/dim light sensor is NOT an input: it reads "bright" whenever the
   # laundry lights are on, so it would hold the room occupied forever.
   - id: ham_laundry_room_occupancy
@@ -221,7 +222,6 @@ automation:
       input:
         occupied: input_boolean.laundry_room_occupied
         activity_entities:
-          - binary_sensor.lau_mo_occupancy
           - binary_sensor.lau_back_dr_motion
           - binary_sensor.lau_back_dr_contact
         vacancy_hold: input_number.laundry_room_vacancy_hold
