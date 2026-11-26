@@ -34,13 +34,23 @@
 #   CLK -> D15
 #   DT  -> D32
 #   SW  -> D14
-# Clockwise lowers the threshold. If that feels backwards, swap D15 and D32.
+# In Edit, clockwise lowers the threshold. If that feels backwards, swap D15 and D32.
 #
-# Modes, long-press the knob to cycle: Active -> Test -> Edit.
-# Active paints the strip black. Test lights the strip from the sensor's
-# voltage: blue under the threshold, green at or above it. Edit lights it
-# red below the threshold and green at or above it, and the knob moves
-# the threshold.
+# Knob modes (2026-11-25). Hold the knob about 1 s to step to the next one:
+#   Lights      dim blue. Turn = bedroom light brightness, tap = toggle.
+#   Volume      green bar that fills from zero. Turn = volume, tap = next speaker.
+#   Sleep timer pink, breathing. Turn = 0/15/30/45/60 min, tap = confirm.
+#               0 means sleep mode now (or cancel a running timer).
+# Hold 3 s for sensor setup: Test, then a 1 s hold for Edit, then back to Lights.
+#   Test  strip shows the sensor's voltage: blue under the threshold, green over.
+#   Edit  red under the threshold, green over, and the knob moves the threshold.
+# The strip goes dark after 10 s without a touch. Volume and Sleep timer fall
+# back to Lights after 90 s, Test and Edit after 10 min.
+#
+# The board does not control anything itself. It fires the Home Assistant event
+# esphome.bed_knob (mode, action, steps, level) and packages/bed_knob.yaml in
+# ha-config decides what happens. Levels shown on the strip come back from
+# Home Assistant sensors.
 
 substitutions:
   name: bed-presence
@@ -93,11 +103,53 @@ bluetooth_proxy:
   active: true
 
 globals:
-  # 0 Active, 1 Test, 2 Edit. Not restored, so a reboot stays dark.
+  # 0 Lights, 1 Volume, 2 Sleep timer, 3 Test, 4 Edit. Not restored: a reboot starts in Lights.
   - id: mode_lamp
     type: int
     restore_value: false
     initial_value: "0"
+  - id: last_activity_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: last_turn_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: anim_start_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: flash_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: ack_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: pending_steps
+    type: int
+    restore_value: false
+    initial_value: "0"
+  # Local copies of the levels, so the strip follows the knob without waiting for Home Assistant.
+  - id: lights_local
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: vol_local
+    type: int
+    restore_value: false
+    initial_value: "0"
+  # Sleep timer choice: 0 = now, 1..4 = 15..60 minutes.
+  - id: sleep_pick
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: hold_fired
+    type: bool
+    restore_value: false
+    initial_value: "false"
 
 script:
   - id: apply_mode_lamp
@@ -105,7 +157,7 @@ script:
     then:
       - if:
           condition:
-            lambda: "return id(mode_lamp) == 1;"
+            lambda: "return id(mode_lamp) == 3;"
           then:
             - light.turn_on:
                 id: status_led
@@ -116,7 +168,7 @@ script:
           else:
             - if:
                 condition:
-                  lambda: "return id(mode_lamp) == 2;"
+                  lambda: "return id(mode_lamp) == 4;"
                 then:
                   - light.turn_on:
                       id: status_led
@@ -126,23 +178,120 @@ script:
                       blue: 0%
                 else:
                   - light.turn_off: status_led
-  - id: cycle_mode
+  - id: go_mode
+    mode: queued
+    parameters:
+      option: string
     then:
       - lambda: |-
-          std::string next = "Active";
-          if (id(mode_lamp) == 0) next = "Test";
-          else if (id(mode_lamp) == 1) next = "Edit";
           auto call = id(bed_mode).make_call();
-          call.set_option(next);
+          call.set_option(option);
           call.perform();
-          ESP_LOGI("bed", "Mode %s", next.c_str());
+          ESP_LOGI("bed", "Mode %s", option.c_str());
+  - id: send_knob
+    mode: queued
+    parameters:
+      action_name: string
+      steps: int
+      level: int
+    then:
+      - homeassistant.event:
+          event: esphome.bed_knob
+          data:
+            mode: !lambda |-
+              if (id(mode_lamp) == 1) return std::string("volume");
+              if (id(mode_lamp) == 2) return std::string("sleep");
+              return std::string("lights");
+            action: !lambda "return action_name;"
+            steps: !lambda "return std::to_string(steps);"
+            level: !lambda "return std::to_string(level);"
+  # Collects fast clicks for 150 ms, then sends them as one event.
+  - id: flush_turn
+    mode: single
+    then:
+      - delay: 150ms
+      - lambda: |-
+          const int steps = id(pending_steps);
+          id(pending_steps) = 0;
+          if (steps == 0) return;
+          const int level = id(mode_lamp) == 1 ? id(vol_local) : id(lights_local);
+          id(send_knob).execute("turn", steps, level);
+  - id: knob_turn
+    mode: queued
+    parameters:
+      dir: int
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+          id(last_activity_ms) = now;
+          const int m = id(mode_lamp);
+          if (m == 4) {
+            id(nudge_threshold).execute(-0.02f * dir);
+            return;
+          }
+          if (m == 3) return;
+          id(last_turn_ms) = now;
+          if (m == 2) {
+            int pick = id(sleep_pick) + dir;
+            if (pick < 0) pick = 0;
+            if (pick > 4) pick = 4;
+            id(sleep_pick) = pick;
+            return;
+          }
+          if (m == 0) {
+            int v = id(lights_local) + dir * 8;
+            id(lights_local) = v < 0 ? 0 : (v > 100 ? 100 : v);
+          } else {
+            int v = id(vol_local) + dir * 5;
+            id(vol_local) = v < 0 ? 0 : (v > 100 ? 100 : v);
+          }
+          id(pending_steps) += dir;
+          if (!id(flush_turn).is_running()) id(flush_turn).execute();
+  - id: knob_tap
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+          id(last_activity_ms) = now;
+          const int m = id(mode_lamp);
+          if (m == 0 || m == 1) {
+            id(send_knob).execute("tap", 0, 0);
+          } else if (m == 2) {
+            id(send_knob).execute("confirm", 0, id(sleep_pick) * 15);
+            id(ack_ms) = now;
+            id(sleep_pick) = 0;
+          }
+  # Runs while the knob is held. 0.6 s = next mode, 3 s = sensor setup (Test).
+  - id: hold_watch
+    mode: restart
+    then:
+      - delay: 600ms
+      - if:
+          condition:
+            binary_sensor.is_on: knob_button
+          then:
+            - lambda: |-
+                id(hold_fired) = true;
+                const int m = id(mode_lamp);
+                std::string next = "Lights";
+                if (m == 0) next = "Volume";
+                else if (m == 1) next = "Sleep timer";
+                else if (m == 3) next = "Edit";
+                id(go_mode).execute(next);
+            - delay: 2400ms
+            - if:
+                condition:
+                  binary_sensor.is_on: knob_button
+                then:
+                  - script.execute:
+                      id: go_mode
+                      option: Test
   - id: nudge_threshold
     mode: queued
     parameters:
       step: float
     then:
       - lambda: |-
-          if (id(mode_lamp) != 2) return;
+          if (id(mode_lamp) != 4) return;
           float cur = id(thr_bed).state;
           if (isnan(cur)) cur = 0.60f;
           float next = cur + step;
@@ -187,28 +336,102 @@ light:
     effects:
       - addressable_lambda:
           name: Zones
-          update_interval: 50ms
+          update_interval: 30ms
           lambda: |-
+            const uint32_t now = millis();
             const int mode = id(mode_lamp);
-            float v = id(bed_adc).state;
-            float thr = id(thr_bed).state;
-            if (isnan(v)) v = 0.0f;
-            if (isnan(thr)) thr = 0.60f;
-            float span = (v - 0.05f) / 2.2f;
-            if (span < 0.0f) span = 0.0f;
-            if (span > 1.0f) span = 1.0f;
-            int level = (int) (span * 140.0f);
-            const bool hot = v >= thr;
-            Color c = Color(0, 0, 0);
-            if (mode == 1) {
-              if (level < 4) c = Color(0, 0, 0);
-              else if (hot) c = Color(0, level, 0);
-              else c = Color(level / 3, level / 2, level);
-            } else if (mode == 2) {
-              if (level < 40) level = 40;
-              c = hot ? Color(0, level, 0) : Color(level, 0, 0);
+            const uint32_t idle = now - id(last_activity_ms);
+            // Dimmer while the house is in sleep mode.
+            const float dim = id(ha_sleep_mode).state ? 0.45f : 1.0f;
+            auto px = [&](int i, float r, float g, float b) {
+              it[i] = Color((uint8_t) (r * dim), (uint8_t) (g * dim), (uint8_t) (b * dim));
+            };
+            // Level 0..100 across four pixels. The leading pixel fades in, so the bar grows smoothly.
+            auto bar = [&](float level, float r, float g, float b, float fr, float fg, float fb) {
+              const float f = level / 25.0f;
+              for (int i = 0; i < 4; i++) {
+                float k = f - i;
+                if (k < 0.0f) k = 0.0f;
+                if (k > 1.0f) k = 1.0f;
+                k = k * k;
+                px(i, fr + (r - fr) * k, fg + (g - fg) * k, fb + (b - fb) * k);
+              }
+            };
+
+            if (mode >= 3) {
+              // Sensor setup. All four pixels show the one sensor.
+              float v = id(bed_adc).state;
+              float thr = id(thr_bed).state;
+              if (isnan(v)) v = 0.0f;
+              if (isnan(thr)) thr = 0.60f;
+              float span = (v - 0.05f) / 2.2f;
+              if (span < 0.0f) span = 0.0f;
+              if (span > 1.0f) span = 1.0f;
+              int level = (int) (span * 140.0f);
+              const bool hot = v >= thr;
+              Color c = Color(0, 0, 0);
+              if (mode == 3) {
+                if (level < 4) c = Color(0, 0, 0);
+                else if (hot) c = Color(0, level, 0);
+                else c = Color(level / 3, level / 2, level);
+              } else {
+                if (level < 40) level = 40;
+                c = hot ? Color(0, level, 0) : Color(level, 0, 0);
+              }
+              for (int i = 0; i < 4; i++) it[i] = c;
+              return;
             }
-            for (int i = 0; i < 4; i++) it[i] = c;
+
+            if (idle > 10000) {
+              for (int i = 0; i < 4; i++) it[i] = Color(0, 0, 0);
+              return;
+            }
+
+            if (mode == 0) {
+              // Lights: dim blue, or a brightness bar just after a turn.
+              if (now - id(last_turn_ms) < 2500) bar((float) id(lights_local), 50, 80, 170, 0, 0, 6);
+              else for (int i = 0; i < 4; i++) px(i, 0, 0, 14);
+              return;
+            }
+
+            if (mode == 1) {
+              // Volume: a flash shows which speaker is selected, then the bar fills from zero.
+              if (now - id(flash_ms) < 700) {
+                const float s = id(ha_speaker_index).state;
+                const int idx = isnan(s) ? 0 : (int) s;
+                const float pulse = 0.5f + 0.5f * cosf((now - id(flash_ms)) * 0.018f);
+                for (int i = 0; i < 4; i++) {
+                  if (idx == 0) px(i, 40 * pulse, 170 * pulse, 70 * pulse);
+                  else if (i == idx - 1) px(i, 110, 255, 170);
+                  else px(i, 0, 0, 0);
+                }
+                return;
+              }
+              const int32_t t = (int32_t) (now - id(anim_start_ms));
+              float grow = t <= 0 ? 0.0f : (t >= 1200 ? 1.0f : t / 1200.0f);
+              grow = grow * grow * (3.0f - 2.0f * grow);
+              bar((float) id(vol_local) * grow, 0, 150, 20, 0, 4, 0);
+              return;
+            }
+
+            // Sleep timer: pink, breathing.
+            if (now - id(ack_ms) < 450) {
+              const bool on = ((now - id(ack_ms)) / 150) % 2 == 0;
+              for (int i = 0; i < 4; i++) px(i, on ? 150 : 0, on ? 150 : 0, on ? 150 : 0);
+              return;
+            }
+            const float breath = 0.22f + 0.78f * (0.5f - 0.5f * cosf(now * 0.0018f));
+            int n = id(sleep_pick);
+            const float mins = id(ha_sleep_minutes).state;
+            if (n == 0 && now - id(last_turn_ms) > 4000 && !isnan(mins) && mins > 0.0f) {
+              // A timer is running: show what is left, one pixel per 15 minutes.
+              n = (int) ((mins + 14.0f) / 15.0f);
+              if (n > 4) n = 4;
+            }
+            for (int i = 0; i < 4; i++) {
+              if (n == 0 || i < n) px(i, 255 * breath, 40 * breath, 110 * breath);
+              else px(i, 7, 0, 3);
+            }
 
 select:
   - platform: template
@@ -217,17 +440,46 @@ select:
     icon: mdi:tune-variant
     optimistic: true
     restore_value: false
-    initial_option: Active
+    initial_option: Lights
     options:
-      - Active
+      - Lights
+      - Volume
+      - Sleep timer
       - Test
       - Edit
     set_action:
       - lambda: |-
-          if (x == "Test") id(mode_lamp) = 1;
-          else if (x == "Edit") id(mode_lamp) = 2;
-          else id(mode_lamp) = 0;
+          const uint32_t now = millis();
+          int m = 0;
+          if (x == "Volume") m = 1;
+          else if (x == "Sleep timer") m = 2;
+          else if (x == "Test") m = 3;
+          else if (x == "Edit") m = 4;
+          id(mode_lamp) = m;
+          id(last_activity_ms) = now;
+          id(sleep_pick) = 0;
+          if (m == 1) id(anim_start_ms) = now;
       - script.execute: apply_mode_lamp
+
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+          const uint32_t idle = now - id(last_activity_ms);
+          const int m = id(mode_lamp);
+          // Left alone, the knob goes back to Lights.
+          if (((m == 1 || m == 2) && idle > 90000) || (m >= 3 && idle > 600000)) {
+            id(go_mode).execute("Lights");
+          }
+          // When the knob is still, take the real levels from Home Assistant.
+          if (now - id(last_turn_ms) > 2500) {
+            const float l = id(ha_lights_level).state;
+            const float v = id(ha_volume_level).state;
+            if (!isnan(l)) id(lights_local) = (int) l;
+            if (!isnan(v)) id(vol_local) = (int) v;
+          }
+          if (idle > 10000) id(sleep_pick) = 0;
 
 number:
   - platform: template
@@ -281,6 +533,27 @@ sensor:
     name: "Wi-Fi signal"
     update_interval: 60s
     entity_category: diagnostic
+  # Values read back from Home Assistant, for the strip.
+  - platform: homeassistant
+    id: ha_lights_level
+    entity_id: sensor.bed_knob_lights_level
+    internal: true
+  - platform: homeassistant
+    id: ha_volume_level
+    entity_id: sensor.bed_knob_volume_level
+    internal: true
+  - platform: homeassistant
+    id: ha_speaker_index
+    entity_id: sensor.bed_knob_speaker_index
+    internal: true
+    on_value:
+      - lambda: |-
+          id(flash_ms) = millis();
+          id(anim_start_ms) = millis() + 700;
+  - platform: homeassistant
+    id: ha_sleep_minutes
+    entity_id: sensor.bed_sleep_timer_minutes
+    internal: true
   - platform: rotary_encoder
     id: knob
     name: "Knob"
@@ -300,14 +573,18 @@ sensor:
     restore_mode: ALWAYS_ZERO
     on_clockwise:
       - script.execute:
-          id: nudge_threshold
-          step: -0.02
+          id: knob_turn
+          dir: 1
     on_anticlockwise:
       - script.execute:
-          id: nudge_threshold
-          step: 0.02
+          id: knob_turn
+          dir: -1
 
 binary_sensor:
+  - platform: homeassistant
+    id: ha_sleep_mode
+    entity_id: input_boolean.sleep_mode
+    internal: true
   - platform: gpio
     id: knob_button
     name: "Knob button"
@@ -321,11 +598,18 @@ binary_sensor:
     filters:
       - delayed_on: 20ms
       - delayed_off: 20ms
-    on_click:
-      - min_length: 600ms
-        max_length: 4s
-        then:
-          - script.execute: cycle_mode
+    on_press:
+      - lambda: |-
+          id(hold_fired) = false;
+          id(last_activity_ms) = millis();
+      - script.execute: hold_watch
+    on_release:
+      - script.stop: hold_watch
+      - if:
+          condition:
+            lambda: "return !id(hold_fired);"
+          then:
+            - script.execute: knob_tap
 
   - platform: gpio
     id: baseline_button

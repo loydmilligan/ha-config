@@ -1,0 +1,191 @@
+# Bed knob — the KY-040 knob and four LEDs on the bed-presence board (ha-manager, 2026-11-25).
+#
+# The board decides nothing. It fires the event esphome.bed_knob with:
+#   mode:   lights | volume | sleep
+#   action: turn | tap | confirm
+#   steps:  clicks turned since the last event (negative = anticlockwise)
+#   level:  the level the knob is asking for, 0-100 (for sleep: minutes)
+# This package turns those into actions, and publishes the levels the board shows on its LEDs.
+#
+#   Lights       turn = bedroom light brightness, tap = toggle
+#   Volume       turn = volume of the selected speaker (or all, relative), tap = next speaker
+#   Sleep timer  confirm with 0 = cancel a running timer, otherwise toggle sleep mode
+#                confirm with 15/30/45/60 = start a timer that turns sleep mode on
+#
+# To change which speakers the knob reaches, edit the option list below AND the two
+# `speakers:` maps (template sensor + automation). The first four after "All" map to
+# LED 1-4 on the board.
+
+input_select:
+  bed_knob_speaker:
+    name: Bed knob speaker
+    icon: mdi:speaker-multiple
+    options:
+      - All
+      - Bedroom clock
+      - Bedroom display
+      - Living room
+      - Kitchen
+
+timer:
+  bed_sleep_timer:
+    name: Bed sleep timer
+    icon: mdi:sleep
+    restore: true
+
+template:
+  - sensor:
+      - name: Bed knob lights level
+        unique_id: bed_knob_lights_level
+        icon: mdi:brightness-6
+        unit_of_measurement: "%"
+        state: >-
+          {{ ((state_attr('light.bed_lt', 'brightness') or 0) / 255 * 100) | round(0) | int
+             if is_state('light.bed_lt', 'on') else 0 }}
+      - name: Bed knob volume level
+        unique_id: bed_knob_volume_level
+        icon: mdi:volume-high
+        unit_of_measurement: "%"
+        # Average of the selected speakers that report a volume. Speakers that are off report none.
+        state: >-
+          {% set speakers = {
+            'Bedroom clock': 'media_player.bedroom_clock',
+            'Bedroom display': 'media_player.bedroom_display',
+            'Living room': 'media_player.family_room_speaker',
+            'Kitchen': 'media_player.kitchen_nest'} %}
+          {% set everything = speakers.values() | list + ['media_player.biggie', 'media_player.office'] %}
+          {% set t = states('input_select.bed_knob_speaker') %}
+          {% set ents = [speakers[t]] if t in speakers else everything %}
+          {% set v = ents | map('state_attr', 'volume_level') | select('number') | list %}
+          {{ (v | sum / v | count * 100) | round(0) | int if v else 0 }}
+      - name: Bed knob speaker index
+        unique_id: bed_knob_speaker_index
+        icon: mdi:numeric
+        # 0 = All, 1-4 = the LED that flashes for that speaker.
+        state: >-
+          {% set order = ['All', 'Bedroom clock', 'Bedroom display', 'Living room', 'Kitchen'] %}
+          {% set t = states('input_select.bed_knob_speaker') %}
+          {{ order.index(t) if t in order else 0 }}
+  - trigger:
+      - trigger: time_pattern
+        seconds: "/30"
+      - trigger: state
+        entity_id: timer.bed_sleep_timer
+      - trigger: homeassistant
+        event: start
+    sensor:
+      - name: Bed sleep timer minutes
+        unique_id: bed_sleep_timer_minutes
+        icon: mdi:timer-sand
+        unit_of_measurement: min
+        state: >-
+          {% set f = state_attr('timer.bed_sleep_timer', 'finishes_at') %}
+          {{ ((as_timestamp(f) - as_timestamp(now())) / 60) | round(0, 'ceil') | int
+             if is_state('timer.bed_sleep_timer', 'active') and f else 0 }}
+
+automation:
+  - id: bed_knob_events
+    alias: "[Bedroom] Bed knob → lights / speaker volume / sleep timer"
+    mode: queued
+    max: 6
+    max_exceeded: silent
+    triggers:
+      - trigger: event
+        event_type: esphome.bed_knob
+    variables:
+      knob_mode: "{{ trigger.event.data.mode | default('') }}"
+      act: "{{ trigger.event.data.action | default('') }}"
+      steps: "{{ trigger.event.data.steps | default(0) | int(0) }}"
+      level: "{{ trigger.event.data.level | default(0) | int(0) }}"
+      speakers:
+        Bedroom clock: media_player.bedroom_clock
+        Bedroom display: media_player.bedroom_display
+        Living room: media_player.family_room_speaker
+        Kitchen: media_player.kitchen_nest
+      everything: "{{ speakers.values() | list + ['media_player.biggie', 'media_player.office'] }}"
+      target: "{{ states('input_select.bed_knob_speaker') }}"
+    actions:
+      - choose:
+          # ── Lights ──
+          - conditions: "{{ knob_mode == 'lights' and act == 'turn' }}"
+            sequence:
+              - if: "{{ level <= 0 }}"
+                then:
+                  - action: light.turn_off
+                    target: { entity_id: light.bed_lt }
+                    data: { transition: 0.3 }
+                else:
+                  - action: light.turn_on
+                    target: { entity_id: light.bed_lt }
+                    data:
+                      brightness_pct: "{{ [level, 100] | min }}"
+                      transition: 0.3
+          - conditions: "{{ knob_mode == 'lights' and act == 'tap' }}"
+            sequence:
+              - action: light.toggle
+                target: { entity_id: light.bed_lt }
+
+          # ── Volume ──
+          - conditions: "{{ knob_mode == 'volume' and act == 'turn' }}"
+            sequence:
+              - variables:
+                  single: "{{ target in speakers }}"
+                  ents: "{{ [speakers[target]] if target in speakers else everything }}"
+                  live: >-
+                    {% set ns = namespace(l=[]) %}
+                    {% for e in ents if state_attr(e, 'volume_level') is number %}
+                      {% set ns.l = ns.l + [e] %}
+                    {% endfor %}
+                    {{ ns.l }}
+                  reachable: "{{ ents | reject('is_state', 'unavailable') | reject('is_state', 'unknown') | list }}"
+              - if: "{{ live | count > 0 }}"
+                then:
+                  # Speakers that report a volume: one speaker goes to the knob's level,
+                  # "All" moves each one by the same amount from where it is.
+                  - repeat:
+                      for_each: "{{ live }}"
+                      sequence:
+                        - action: media_player.volume_set
+                          target: { entity_id: "{{ repeat.item }}" }
+                          data:
+                            volume_level: >-
+                              {% set cur = state_attr(repeat.item, 'volume_level') | float(0) %}
+                              {% set want = (level / 100) if single else (cur + steps * 0.05) %}
+                              {{ [[want, 0] | max, 1] | min | round(2) }}
+                else:
+                  # Speakers that are off report no volume, so nudge them one step instead.
+                  - if: "{{ reachable | count > 0 and steps != 0 }}"
+                    then:
+                      - action: "media_player.volume_{{ 'up' if steps > 0 else 'down' }}"
+                        target: { entity_id: "{{ reachable }}" }
+          - conditions: "{{ knob_mode == 'volume' and act == 'tap' }}"
+            sequence:
+              - action: input_select.select_next
+                target: { entity_id: input_select.bed_knob_speaker }
+
+          # ── Sleep timer ──
+          - conditions: "{{ knob_mode == 'sleep' and act == 'confirm' and level > 0 }}"
+            sequence:
+              - action: timer.start
+                target: { entity_id: timer.bed_sleep_timer }
+                data: { duration: "{{ level * 60 }}" }
+          - conditions: "{{ knob_mode == 'sleep' and act == 'confirm' }}"
+            sequence:
+              - if: "{{ is_state('timer.bed_sleep_timer', 'active') }}"
+                then:
+                  - action: timer.cancel
+                    target: { entity_id: timer.bed_sleep_timer }
+                else:
+                  - action: input_boolean.toggle
+                    target: { entity_id: input_boolean.sleep_mode }
+
+  - id: bed_sleep_timer_finished
+    alias: "[Bedroom] Bed sleep timer finished → sleep mode on"
+    mode: single
+    triggers:
+      - trigger: event
+        event_type: timer.finished
+        event_data: { entity_id: timer.bed_sleep_timer }
+    actions:
+      - action: input_boolean.turn_on
+        target: { entity_id: input_boolean.sleep_mode }
