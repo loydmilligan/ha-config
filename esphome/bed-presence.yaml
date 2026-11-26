@@ -1,8 +1,8 @@
 # Bed presence — Adafruit ESP32 Feather V2 + one force-sensitive resistor.
 #
-# One sensor is wired (2026-11-25): a long SF15-600 strip on A2 (GPIO34,
-# socket hole C7 on the protoboard). The firmware reads only that pin.
-# A3, A4 and D33 are not read, so an empty or floating pad cannot report
+# One sensor is wired (2026-11-25): a long SF15-600 strip on D33 (GPIO33,
+# socket hole I11 on the protoboard). The firmware reads only that pin.
+# A2, A3 and A4 are not read, so an empty or floating pad cannot report
 # someone in bed. To add a sensor later, wire it with its own 47k and
 # bring its channel back from git history (the commit before this change).
 # A mattress spreads weight, so this reports occupied or not, not weight.
@@ -503,9 +503,10 @@ number:
     mode: slider
 
 sensor:
-  # A2 (GPIO34, protoboard socket hole C7) — the one SF15-600.
+  # D33 (GPIO33, protoboard socket hole I11) — the one SF15-600. Found by probing
+  # every analog pin on 2026-11-26: only D33 moved when someone lay on the bed.
   - platform: adc
-    pin: GPIO34
+    pin: GPIO33
     id: bed_adc
     name: "Voltage"
     attenuation: 12db
