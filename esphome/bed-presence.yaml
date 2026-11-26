@@ -34,18 +34,21 @@
 #   CLK -> D15
 #   DT  -> D32
 #   SW  -> D14
-# In Edit, clockwise lowers the threshold. If that feels backwards, swap D15 and D32.
-#
 # Knob modes (2026-11-25). Hold the knob about 1 s to step to the next one:
 #   Lights      dim blue. Turn = bedroom light brightness, tap = toggle.
 #   Volume      green bar that fills from zero. Turn = volume, tap = next speaker.
 #   Sleep timer pink, breathing. Turn = 0/15/30/45/60 min, tap = confirm.
 #               0 means sleep mode now (or cancel a running timer).
-# Hold 3 s for sensor setup: Test, then a 1 s hold for Edit, then back to Lights.
-#   Test  strip shows the sensor's voltage: blue under the threshold, green over.
-#   Edit  red under the threshold, green over, and the knob moves the threshold.
 # The strip goes dark after 10 s without a touch. Volume and Sleep timer fall
-# back to Lights after 90 s, Test and Edit after 10 min.
+# back to Lights after 90 s.
+#
+# The bed sensor is set up from Home Assistant only (device page, Configuration):
+#   Threshold           the voltage that counts as someone in bed
+#   Calibration LEDs    strip shows the sensor: blue under the threshold, green
+#                       over. Turns itself off after 10 minutes.
+#   Capture empty bed   sets the threshold just above the current reading.
+#                       The SW38 button on the board does the same.
+# The knob never changes the threshold.
 #
 # The board does not control anything itself. It fires the Home Assistant event
 # esphome.bed_knob (mode, action, steps, level) and packages/bed_knob.yaml in
@@ -103,7 +106,7 @@ bluetooth_proxy:
   active: true
 
 globals:
-  # 0 Lights, 1 Volume, 2 Sleep timer, 3 Test, 4 Edit. Not restored: a reboot starts in Lights.
+  # 0 Lights, 1 Volume, 2 Sleep timer. Not restored: a reboot starts in Lights.
   - id: mode_lamp
     type: int
     restore_value: false
@@ -146,6 +149,10 @@ globals:
     type: int
     restore_value: false
     initial_value: "0"
+  - id: calib_on_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
   - id: hold_fired
     type: bool
     restore_value: false
@@ -157,7 +164,7 @@ script:
     then:
       - if:
           condition:
-            lambda: "return id(mode_lamp) == 3;"
+            switch.is_on: calib_leds
           then:
             - light.turn_on:
                 id: status_led
@@ -166,18 +173,37 @@ script:
                 green: 15%
                 blue: 100%
           else:
-            - if:
-                condition:
-                  lambda: "return id(mode_lamp) == 4;"
-                then:
-                  - light.turn_on:
-                      id: status_led
-                      brightness: 20%
-                      red: 100%
-                      green: 45%
-                      blue: 0%
-                else:
-                  - light.turn_off: status_led
+            - light.turn_off: status_led
+  - id: capture_baseline
+    mode: single
+    then:
+      - logger.log:
+          level: INFO
+          format: "Empty-bed capture %.3f V"
+          args: ['id(bed_adc).state']
+      - number.set:
+          id: thr_bed
+          value: !lambda |-
+            const float v = id(bed_adc).state;
+            if (isnan(v)) return isnan(id(thr_bed).state) ? 0.60f : id(thr_bed).state;
+            return std::min(2.80f, std::max(0.10f, v + ${baseline_margin}f));
+      - light.turn_on:
+          id: status_led
+          brightness: 15%
+          red: 0%
+          green: 100%
+          blue: 0%
+      - delay: 200ms
+      - light.turn_off: status_led
+      - delay: 150ms
+      - light.turn_on:
+          id: status_led
+          brightness: 15%
+          red: 0%
+          green: 100%
+          blue: 0%
+      - delay: 200ms
+      - script.execute: apply_mode_lamp
   - id: go_mode
     mode: queued
     parameters:
@@ -225,11 +251,6 @@ script:
           const uint32_t now = millis();
           id(last_activity_ms) = now;
           const int m = id(mode_lamp);
-          if (m == 4) {
-            id(nudge_threshold).execute(-0.02f * dir);
-            return;
-          }
-          if (m == 3) return;
           id(last_turn_ms) = now;
           if (m == 2) {
             int pick = id(sleep_pick) + dir;
@@ -260,7 +281,7 @@ script:
             id(ack_ms) = now;
             id(sleep_pick) = 0;
           }
-  # Runs while the knob is held. 0.6 s = next mode, 3 s = sensor setup (Test).
+  # Runs while the knob is held. After 0.6 s it steps to the next mode.
   - id: hold_watch
     mode: restart
     then:
@@ -275,34 +296,21 @@ script:
                 std::string next = "Lights";
                 if (m == 0) next = "Volume";
                 else if (m == 1) next = "Sleep timer";
-                else if (m == 3) next = "Edit";
                 id(go_mode).execute(next);
-            - delay: 2400ms
-            - if:
-                condition:
-                  binary_sensor.is_on: knob_button
-                then:
-                  - script.execute:
-                      id: go_mode
-                      option: Test
-  - id: nudge_threshold
-    mode: queued
-    parameters:
-      step: float
-    then:
-      - lambda: |-
-          if (id(mode_lamp) != 4) return;
-          float cur = id(thr_bed).state;
-          if (isnan(cur)) cur = 0.60f;
-          float next = cur + step;
-          if (next < 0.05f) next = 0.05f;
-          if (next > 2.80f) next = 2.80f;
-          auto call = id(thr_bed).make_call();
-          call.set_value(next);
-          call.perform();
 
-# GPIO2 powers the onboard NeoPixel. High = on. GPIO0 is its data line.
 switch:
+  - platform: template
+    name: "Calibration LEDs"
+    id: calib_leds
+    icon: mdi:led-strip-variant
+    entity_category: config
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - lambda: "id(calib_on_ms) = millis();"
+      - script.execute: apply_mode_lamp
+    on_turn_off:
+      - script.execute: apply_mode_lamp
   - platform: gpio
     pin:
       number: GPIO2
@@ -358,8 +366,8 @@ light:
               }
             };
 
-            if (mode >= 3) {
-              // Sensor setup. All four pixels show the one sensor.
+            if (id(calib_leds).state) {
+              // Calibration: all four pixels show the one sensor.
               float v = id(bed_adc).state;
               float thr = id(thr_bed).state;
               if (isnan(v)) v = 0.0f;
@@ -368,16 +376,8 @@ light:
               if (span < 0.0f) span = 0.0f;
               if (span > 1.0f) span = 1.0f;
               int level = (int) (span * 140.0f);
-              const bool hot = v >= thr;
-              Color c = Color(0, 0, 0);
-              if (mode == 3) {
-                if (level < 4) c = Color(0, 0, 0);
-                else if (hot) c = Color(0, level, 0);
-                else c = Color(level / 3, level / 2, level);
-              } else {
-                if (level < 40) level = 40;
-                c = hot ? Color(0, level, 0) : Color(level, 0, 0);
-              }
+              if (level < 12) level = 12;
+              const Color c = v >= thr ? Color(0, level, 0) : Color(level / 3, level / 2, level);
               for (int i = 0; i < 4; i++) it[i] = c;
               return;
             }
@@ -445,16 +445,12 @@ select:
       - Lights
       - Volume
       - Sleep timer
-      - Test
-      - Edit
     set_action:
       - lambda: |-
           const uint32_t now = millis();
           int m = 0;
           if (x == "Volume") m = 1;
           else if (x == "Sleep timer") m = 2;
-          else if (x == "Test") m = 3;
-          else if (x == "Edit") m = 4;
           id(mode_lamp) = m;
           id(last_activity_ms) = now;
           id(sleep_pick) = 0;
@@ -469,7 +465,7 @@ interval:
           const uint32_t idle = now - id(last_activity_ms);
           const int m = id(mode_lamp);
           // Left alone, the knob goes back to Lights.
-          if (((m == 1 || m == 2) && idle > 90000) || (m >= 3 && idle > 600000)) {
+          if ((m == 1 || m == 2) && idle > 90000) {
             id(go_mode).execute("Lights");
           }
           // When the knob is still, take the real levels from Home Assistant.
@@ -480,6 +476,16 @@ interval:
             if (!isnan(v)) id(vol_local) = (int) v;
           }
           if (idle > 10000) id(sleep_pick) = 0;
+          // Calibration LEDs switch themselves off after 10 minutes.
+          if (id(calib_leds).state && now - id(calib_on_ms) > 600000) id(calib_leds).turn_off();
+
+button:
+  - platform: template
+    name: "Capture empty bed"
+    icon: mdi:bed-empty
+    entity_category: config
+    on_press:
+      - script.execute: capture_baseline
 
 number:
   - platform: template
@@ -613,7 +619,8 @@ binary_sensor:
 
   - platform: gpio
     id: baseline_button
-    name: "Set empty baseline"
+    name: "Empty-bed button (SW38)"
+    entity_category: diagnostic
     # Input-only pad. The Feather has its own pull-up; the chip cannot.
     pin:
       number: GPIO38
@@ -623,34 +630,7 @@ binary_sensor:
       - delayed_on: 30ms
       - delayed_off: 30ms
     on_press:
-      then:
-        - logger.log:
-            level: INFO
-            format: "Empty-bed capture %.3f V"
-            args: ['id(bed_adc).state']
-        - number.set:
-            id: thr_bed
-            value: !lambda |-
-              const float v = id(bed_adc).state;
-              if (isnan(v)) return isnan(id(thr_bed).state) ? 0.60f : id(thr_bed).state;
-              return std::min(2.80f, std::max(0.10f, v + ${baseline_margin}f));
-        - light.turn_on:
-            id: status_led
-            brightness: 15%
-            red: 0%
-            green: 100%
-            blue: 0%
-        - delay: 200ms
-        - light.turn_off: status_led
-        - delay: 150ms
-        - light.turn_on:
-            id: status_led
-            brightness: 15%
-            red: 0%
-            green: 100%
-            blue: 0%
-        - delay: 200ms
-        - script.execute: apply_mode_lamp
+      - script.execute: capture_baseline
 
   - platform: analog_threshold
     id: bed_occupied
