@@ -1,13 +1,13 @@
-# Bed presence — Adafruit ESP32 Feather V2 + force-sensitive resistors.
+# Bed presence — Adafruit ESP32 Feather V2 + one force-sensitive resistor.
 #
-# People: one SF15-600 (600 mm) under each sleeper's hips.
-# Dog: two FSR408 (105 mm) wherever the dog actually lies.
-# A mattress spreads weight, so this reports zones, not body weight.
-# "Dog only" is true when a dog spot is loaded and both sides are clear.
-# A dog on a pillow looks like that side. Feet can load a dog spot
-# while someone is in bed; that shows as the side plus the dog spot.
+# One sensor is wired (2026-11-25): a long SF15-600 strip on A2 (GPIO34,
+# socket hole C7 on the protoboard). The firmware reads only that pin.
+# A3, A4 and D33 are not read, so an empty or floating pad cannot report
+# someone in bed. To add a sensor later, wire it with its own 47k and
+# bring its channel back from git history (the commit before this change).
+# A mattress spreads weight, so this reports occupied or not, not weight.
 #
-# Per channel, unloaded voltage sits near 0 V and rises as force increases:
+# Unloaded voltage sits near 0 V and rises as force increases:
 #
 #   3V ---- FSR ----+---- ADC pin
 #                   |
@@ -20,16 +20,12 @@
 # starts. GPIO35 is the onboard battery divider. Leave both alone.
 # D13 is the onboard red LED. Leave it alone.
 #
-# Spare ADC1 pad, after the same divider is wired. A floating pad will
-# false-trigger, so do not add it before then:
-#   D37 / GPIO37  (input only, the pad beside TX)
-#
 # Four WS2812B pixels cut from the roll (color order GRB, 5 V). Do not
 # connect the rest of the roll, and do not feed a 6 A supply into the Feather.
 #   USB ---- strip 5V
 #   GND ---- strip GND
 #   D27 ---- 330 ohm ---- DIN, arrow pointing away from the board
-# Pixel 0 (closest to the board) is Left, then Right, Dog spot A, Dog spot B.
+# All four pixels show the one sensor.
 #
 # KY-040 encoder. Power it from 3V, not USB. The switches are 5 V on the
 # label, but the ESP32 pins are not 5 V tolerant.
@@ -38,12 +34,13 @@
 #   CLK -> D15
 #   DT  -> D32
 #   SW  -> D14
-# Clockwise lowers the selected threshold. If that feels backwards, swap D15 and D32.
+# Clockwise lowers the threshold. If that feels backwards, swap D15 and D32.
 #
 # Modes, long-press the knob to cycle: Active -> Test -> Edit.
-# Short-press in Edit moves to the next sensor. Active paints the strip black.
-# Test lights each pixel from that sensor's voltage. Edit lights only the
-# selected pixel: red below the threshold, green at or above it.
+# Active paints the strip black. Test lights the strip from the sensor's
+# voltage: blue under the threshold, green at or above it. Edit lights it
+# red below the threshold and green at or above it, and the knob moves
+# the threshold.
 
 substitutions:
   name: bed-presence
@@ -101,11 +98,6 @@ globals:
     type: int
     restore_value: false
     initial_value: "0"
-  # Which sensor Edit is adjusting. 0 Left, 1 Right, 2 Dog A, 3 Dog B.
-  - id: edit_index
-    type: int
-    restore_value: false
-    initial_value: "0"
 
 script:
   - id: apply_mode_lamp
@@ -144,13 +136,6 @@ script:
           call.set_option(next);
           call.perform();
           ESP_LOGI("bed", "Mode %s", next.c_str());
-  - id: cycle_zone
-    then:
-      - lambda: |-
-          if (id(mode_lamp) != 2) return;
-          int next = id(edit_index) + 1;
-          if (next > 3) next = 0;
-          id(edit_index) = next;
   - id: nudge_threshold
     mode: queued
     parameters:
@@ -158,33 +143,14 @@ script:
     then:
       - lambda: |-
           if (id(mode_lamp) != 2) return;
-          const int idx = id(edit_index);
-          float cur;
-          if (idx == 0) cur = id(thr_left).state;
-          else if (idx == 1) cur = id(thr_right).state;
-          else if (idx == 2) cur = id(thr_dog_a).state;
-          else cur = id(thr_dog_b).state;
+          float cur = id(thr_bed).state;
           if (isnan(cur)) cur = 0.60f;
           float next = cur + step;
           if (next < 0.05f) next = 0.05f;
           if (next > 2.80f) next = 2.80f;
-          if (idx == 0) {
-            auto call = id(thr_left).make_call();
-            call.set_value(next);
-            call.perform();
-          } else if (idx == 1) {
-            auto call = id(thr_right).make_call();
-            call.set_value(next);
-            call.perform();
-          } else if (idx == 2) {
-            auto call = id(thr_dog_a).make_call();
-            call.set_value(next);
-            call.perform();
-          } else {
-            auto call = id(thr_dog_b).make_call();
-            call.set_value(next);
-            call.perform();
-          }
+          auto call = id(thr_bed).make_call();
+          call.set_value(next);
+          call.perform();
 
 # GPIO2 powers the onboard NeoPixel. High = on. GPIO0 is its data line.
 switch:
@@ -224,48 +190,25 @@ light:
           update_interval: 50ms
           lambda: |-
             const int mode = id(mode_lamp);
-            const int selected = id(edit_index);
-            for (int i = 0; i < 4; i++) {
-              float v;
-              float thr;
-              if (i == 0) {
-                v = id(left_adc).state;
-                thr = id(thr_left).state;
-              } else if (i == 1) {
-                v = id(right_adc).state;
-                thr = id(thr_right).state;
-              } else if (i == 2) {
-                v = id(dog_a_adc).state;
-                thr = id(thr_dog_a).state;
-              } else {
-                v = id(dog_b_adc).state;
-                thr = id(thr_dog_b).state;
-              }
-              if (isnan(v)) v = 0.0f;
-              if (isnan(thr)) thr = 0.60f;
-              if (mode == 0) {
-                it[i] = Color(0, 0, 0);
-                continue;
-              }
-              float span = (v - 0.05f) / 2.2f;
-              if (span < 0.0f) span = 0.0f;
-              if (span > 1.0f) span = 1.0f;
-              int level = (int) (span * 140.0f);
-              const bool hot = v >= thr;
-              if (mode == 1) {
-                if (level < 4) it[i] = Color(0, 0, 0);
-                else if (hot) it[i] = Color(0, level, 0);
-                else it[i] = Color(level / 3, level / 2, level);
-                continue;
-              }
-              if (i != selected) {
-                it[i] = Color(0, 0, 0);
-                continue;
-              }
+            float v = id(bed_adc).state;
+            float thr = id(thr_bed).state;
+            if (isnan(v)) v = 0.0f;
+            if (isnan(thr)) thr = 0.60f;
+            float span = (v - 0.05f) / 2.2f;
+            if (span < 0.0f) span = 0.0f;
+            if (span > 1.0f) span = 1.0f;
+            int level = (int) (span * 140.0f);
+            const bool hot = v >= thr;
+            Color c = Color(0, 0, 0);
+            if (mode == 1) {
+              if (level < 4) c = Color(0, 0, 0);
+              else if (hot) c = Color(0, level, 0);
+              else c = Color(level / 3, level / 2, level);
+            } else if (mode == 2) {
               if (level < 40) level = 40;
-              if (hot) it[i] = Color(0, level, 0);
-              else it[i] = Color(level, 0, 0);
+              c = hot ? Color(0, level, 0) : Color(level, 0, 0);
             }
+            for (int i = 0; i < 4; i++) it[i] = c;
 
 select:
   - platform: template
@@ -288,47 +231,8 @@ select:
 
 number:
   - platform: template
-    name: "Left threshold"
-    id: thr_left
-    icon: mdi:tune
-    entity_category: config
-    optimistic: true
-    restore_value: true
-    initial_value: 0.60
-    min_value: 0.05
-    max_value: 2.80
-    step: 0.01
-    unit_of_measurement: V
-    mode: slider
-  - platform: template
-    name: "Right threshold"
-    id: thr_right
-    icon: mdi:tune
-    entity_category: config
-    optimistic: true
-    restore_value: true
-    initial_value: 0.60
-    min_value: 0.05
-    max_value: 2.80
-    step: 0.01
-    unit_of_measurement: V
-    mode: slider
-  - platform: template
-    name: "Dog spot A threshold"
-    id: thr_dog_a
-    icon: mdi:tune
-    entity_category: config
-    optimistic: true
-    restore_value: true
-    initial_value: 0.60
-    min_value: 0.05
-    max_value: 2.80
-    step: 0.01
-    unit_of_measurement: V
-    mode: slider
-  - platform: template
-    name: "Dog spot B threshold"
-    id: thr_dog_b
+    name: "Threshold"
+    id: thr_bed
     icon: mdi:tune
     entity_category: config
     optimistic: true
@@ -341,68 +245,11 @@ number:
     mode: slider
 
 sensor:
-  # A2 — left SF15-600, under the left sleeper's hips.
+  # A2 (GPIO34, protoboard socket hole C7) — the one SF15-600.
   - platform: adc
     pin: GPIO34
-    id: left_adc
-    name: "Left voltage"
-    attenuation: 12db
-    samples: 32
-    sampling_mode: avg
-    update_interval: 250ms
-    unit_of_measurement: V
-    accuracy_decimals: 3
-    device_class: voltage
-    state_class: measurement
-    filters:
-      - median:
-          window_size: 9
-          send_every: 1
-          send_first_at: 1
-      - delta: 0.01
-  # A3 — right SF15-600.
-  - platform: adc
-    pin: GPIO39
-    id: right_adc
-    name: "Right voltage"
-    attenuation: 12db
-    samples: 32
-    sampling_mode: avg
-    update_interval: 250ms
-    unit_of_measurement: V
-    accuracy_decimals: 3
-    device_class: voltage
-    state_class: measurement
-    filters:
-      - median:
-          window_size: 9
-          send_every: 1
-          send_first_at: 1
-      - delta: 0.01
-  # A4 — first FSR408.
-  - platform: adc
-    pin: GPIO36
-    id: dog_a_adc
-    name: "Dog spot A voltage"
-    attenuation: 12db
-    samples: 32
-    sampling_mode: avg
-    update_interval: 250ms
-    unit_of_measurement: V
-    accuracy_decimals: 3
-    device_class: voltage
-    state_class: measurement
-    filters:
-      - median:
-          window_size: 9
-          send_every: 1
-          send_first_at: 1
-      - delta: 0.01
-  # D33 — second FSR408.
-  - platform: adc
-    pin: GPIO33
-    id: dog_b_adc
-    name: "Dog spot B voltage"
+    id: bed_adc
+    name: "Voltage"
     attenuation: 12db
     samples: 32
     sampling_mode: avg
@@ -475,10 +322,6 @@ binary_sensor:
       - delayed_on: 20ms
       - delayed_off: 20ms
     on_click:
-      - min_length: 40ms
-        max_length: 450ms
-        then:
-          - script.execute: cycle_zone
       - min_length: 600ms
         max_length: 4s
         then:
@@ -499,31 +342,13 @@ binary_sensor:
       then:
         - logger.log:
             level: INFO
-            format: "Empty-bed capture left=%.3f right=%.3f dog_a=%.3f dog_b=%.3f"
-            args: ['id(left_adc).state', 'id(right_adc).state', 'id(dog_a_adc).state', 'id(dog_b_adc).state']
+            format: "Empty-bed capture %.3f V"
+            args: ['id(bed_adc).state']
         - number.set:
-            id: thr_left
+            id: thr_bed
             value: !lambda |-
-              const float v = id(left_adc).state;
-              if (isnan(v)) return isnan(id(thr_left).state) ? 0.60f : id(thr_left).state;
-              return std::min(2.80f, std::max(0.10f, v + ${baseline_margin}f));
-        - number.set:
-            id: thr_right
-            value: !lambda |-
-              const float v = id(right_adc).state;
-              if (isnan(v)) return isnan(id(thr_right).state) ? 0.60f : id(thr_right).state;
-              return std::min(2.80f, std::max(0.10f, v + ${baseline_margin}f));
-        - number.set:
-            id: thr_dog_a
-            value: !lambda |-
-              const float v = id(dog_a_adc).state;
-              if (isnan(v)) return isnan(id(thr_dog_a).state) ? 0.60f : id(thr_dog_a).state;
-              return std::min(2.80f, std::max(0.10f, v + ${baseline_margin}f));
-        - number.set:
-            id: thr_dog_b
-            value: !lambda |-
-              const float v = id(dog_b_adc).state;
-              if (isnan(v)) return isnan(id(thr_dog_b).state) ? 0.60f : id(thr_dog_b).state;
+              const float v = id(bed_adc).state;
+              if (isnan(v)) return isnan(id(thr_bed).state) ? 0.60f : id(thr_bed).state;
               return std::min(2.80f, std::max(0.10f, v + ${baseline_margin}f));
         - light.turn_on:
             id: status_led
@@ -544,123 +369,24 @@ binary_sensor:
         - script.execute: apply_mode_lamp
 
   - platform: analog_threshold
-    id: zone_left
-    name: "Left occupied"
-    device_class: occupancy
-    icon: mdi:bed
-    sensor_id: left_adc
-    threshold:
-      upper: !lambda |-
-        const float t = id(thr_left).state;
-        return isnan(t) ? 0.60f : t;
-      lower: !lambda |-
-        const float t = id(thr_left).state;
-        const float upper = isnan(t) ? 0.60f : t;
-        return std::max(0.02f, upper - 0.05f);
-    filters:
-      - delayed_on: ${on_delay}
-      - delayed_off: ${off_delay}
-
-  - platform: analog_threshold
-    id: zone_right
-    name: "Right occupied"
-    device_class: occupancy
-    icon: mdi:bed
-    sensor_id: right_adc
-    threshold:
-      upper: !lambda |-
-        const float t = id(thr_right).state;
-        return isnan(t) ? 0.60f : t;
-      lower: !lambda |-
-        const float t = id(thr_right).state;
-        const float upper = isnan(t) ? 0.60f : t;
-        return std::max(0.02f, upper - 0.05f);
-    filters:
-      - delayed_on: ${on_delay}
-      - delayed_off: ${off_delay}
-
-  - platform: analog_threshold
-    id: zone_dog_a
-    name: "Dog spot A"
-    device_class: occupancy
-    icon: mdi:paw
-    sensor_id: dog_a_adc
-    threshold:
-      upper: !lambda |-
-        const float t = id(thr_dog_a).state;
-        return isnan(t) ? 0.60f : t;
-      lower: !lambda |-
-        const float t = id(thr_dog_a).state;
-        const float upper = isnan(t) ? 0.60f : t;
-        return std::max(0.02f, upper - 0.05f);
-    filters:
-      - delayed_on: ${on_delay}
-      - delayed_off: ${off_delay}
-
-  - platform: analog_threshold
-    id: zone_dog_b
-    name: "Dog spot B"
-    device_class: occupancy
-    icon: mdi:paw
-    sensor_id: dog_b_adc
-    threshold:
-      upper: !lambda |-
-        const float t = id(thr_dog_b).state;
-        return isnan(t) ? 0.60f : t;
-      lower: !lambda |-
-        const float t = id(thr_dog_b).state;
-        const float upper = isnan(t) ? 0.60f : t;
-        return std::max(0.02f, upper - 0.05f);
-    filters:
-      - delayed_on: ${on_delay}
-      - delayed_off: ${off_delay}
-
-  - platform: template
-    name: "Occupied"
     id: bed_occupied
+    name: "Occupied"
     device_class: occupancy
     icon: mdi:bed
-    lambda: |-
-      return id(zone_left).state || id(zone_right).state || id(zone_dog_a).state || id(zone_dog_b).state;
-
-  - platform: template
-    name: "Dog only"
-    id: dog_only
-    device_class: occupancy
-    icon: mdi:dog
-    lambda: |-
-      const bool foot = id(zone_dog_a).state || id(zone_dog_b).state;
-      return foot && !id(zone_left).state && !id(zone_right).state;
+    sensor_id: bed_adc
+    threshold:
+      upper: !lambda |-
+        const float t = id(thr_bed).state;
+        return isnan(t) ? 0.60f : t;
+      lower: !lambda |-
+        const float t = id(thr_bed).state;
+        const float upper = isnan(t) ? 0.60f : t;
+        return std::max(0.02f, upper - 0.05f);
+    filters:
+      - delayed_on: ${on_delay}
+      - delayed_off: ${off_delay}
 
 text_sensor:
-  - platform: template
-    name: "Who"
-    icon: mdi:account-multiple
-    update_interval: 1s
-    lambda: |-
-      const bool left = id(zone_left).state;
-      const bool right = id(zone_right).state;
-      const bool foot = id(zone_dog_a).state || id(zone_dog_b).state;
-      if (!left && !right && !foot) return {"Empty"};
-      if (left && right && foot) return {"Both sides and dog spot"};
-      if (left && right) return {"Both sides"};
-      if (left && foot) return {"Left side and dog spot"};
-      if (right && foot) return {"Right side and dog spot"};
-      if (left) return {"Left side"};
-      if (right) return {"Right side"};
-      return {"Dog"};
-  - platform: template
-    name: "Editing"
-    icon: mdi:crosshairs
-    update_interval: 250ms
-    lambda: |-
-      if (id(mode_lamp) != 2) return {"-"};
-      switch ((int) id(edit_index)) {
-        case 0: return {"Left"};
-        case 1: return {"Right"};
-        case 2: return {"Dog spot A"};
-        default: return {"Dog spot B"};
-      }
   - platform: wifi_info
     ip_address:
       name: "IP address"
